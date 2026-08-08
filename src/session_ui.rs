@@ -76,12 +76,14 @@ struct Tui {
     include_index: usize,
     /// The torrent source typed in the include dialog.
     include_input: String,
+    /// Cursor position within `include_input` (byte index).
+    input_cursor_pos: usize,
     /// Whether the include dialog is in "typing" mode (entering the source).
     typing: bool,
     /// Transient status/error message.
     notice: Option<String>,
     /// Keys received from the keyboard thread.
-    keys: mpsc::UnboundedReceiver<KeyEvent>,
+    keys: mpsc::UnboundedReceiver<Event>,
     running: bool,
 }
 
@@ -89,7 +91,7 @@ impl Tui {
     fn new(
         session: Arc<Session>,
         output_folder: PathBuf,
-        keys: mpsc::UnboundedReceiver<KeyEvent>,
+        keys: mpsc::UnboundedReceiver<Event>,
     ) -> Self {
         Self {
             session,
@@ -100,6 +102,7 @@ impl Tui {
             row_index: 0,
             include_index: 0,
             include_input: String::new(),
+            input_cursor_pos: 0,
             typing: false,
             notice: None,
             keys,
@@ -216,6 +219,7 @@ impl Tui {
                 0 => {
                     self.typing = true;
                     self.include_input.clear();
+                    self.input_cursor_pos = 0;
                     self.notice = None;
                 }
                 1 => self.view = View::Session,
@@ -239,15 +243,77 @@ impl Tui {
             KeyCode::Esc => {
                 self.typing = false;
                 self.include_input.clear();
+                self.input_cursor_pos = 0;
             }
             KeyCode::Backspace => {
-                self.include_input.pop();
+                if self.input_cursor_pos > 0 {
+                    // Remove character before cursor
+                    let before = &self.include_input[..self.input_cursor_pos];
+                    let after = &self.include_input[self.input_cursor_pos..];
+                    // Find the previous character boundary
+                    if let Some((new_pos, _)) = before.char_indices().next_back() {
+                        self.include_input = format!("{}{}", &before[..new_pos], after);
+                        self.input_cursor_pos = new_pos;
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if self.input_cursor_pos < self.include_input.len() {
+                    // Remove character at cursor
+                    let before = &self.include_input[..self.input_cursor_pos];
+                    let after = &self.include_input[self.input_cursor_pos..];
+                    if let Some((next_pos, _)) = after.char_indices().next() {
+                        self.include_input = format!("{}{}", before, &after[next_pos..]);
+                    } else {
+                        self.include_input = before.to_string();
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if self.input_cursor_pos > 0 {
+                    // Move cursor one character left
+                    let before = &self.include_input[..self.input_cursor_pos];
+                    if let Some((new_pos, _)) = before.char_indices().next_back() {
+                        self.input_cursor_pos = new_pos;
+                    } else {
+                        self.input_cursor_pos = 0;
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if self.input_cursor_pos < self.include_input.len() {
+                    // Move cursor one character right
+                    let after = &self.include_input[self.input_cursor_pos..];
+                    if let Some((next_pos, _)) = after.char_indices().next() {
+                        self.input_cursor_pos += next_pos;
+                    } else {
+                        self.input_cursor_pos = self.include_input.len();
+                    }
+                }
+            }
+            KeyCode::Home => {
+                self.input_cursor_pos = 0;
+            }
+            KeyCode::End => {
+                self.input_cursor_pos = self.include_input.len();
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.running = false;
             }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+A = Home
+                self.input_cursor_pos = 0;
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+E = End
+                self.input_cursor_pos = self.include_input.len();
+            }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.include_input.push(c);
+                // Insert character at cursor position
+                let before = &self.include_input[..self.input_cursor_pos];
+                let after = &self.include_input[self.input_cursor_pos..];
+                self.include_input = format!("{}{}{}", before, c, after);
+                self.input_cursor_pos += c.len_utf8();
                 self.notice = None;
             }
             _ => {}
@@ -264,6 +330,52 @@ impl Tui {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Wrap text to fit within the given width (soft wrap by words).
+    /// Returns a vector of visual lines.
+    fn wrap_text(text: &str, width: usize) -> Vec<String> {
+        if width == 0 {
+            return vec![String::new()];
+        }
+        let mut lines = Vec::new();
+        let mut current_line = String::new();
+
+        for word in text.split_inclusive(' ') {
+            // If adding this word would exceed width, start a new line
+            if current_line.chars().count() + word.chars().count() > width {
+                if !current_line.is_empty() {
+                    lines.push(current_line);
+                    current_line = String::new();
+                }
+                // If a single word is longer than width, hard-break it
+                if word.chars().count() > width {
+                    let mut remaining = word;
+                    while remaining.chars().count() > width {
+                        let (line_part, rest) = remaining.split_at(
+                            remaining
+                                .char_indices()
+                                .nth(width)
+                                .map(|(i, _)| i)
+                                .unwrap_or(remaining.len()),
+                        );
+                        lines.push(line_part.to_string());
+                        remaining = rest;
+                    }
+                    current_line = remaining.to_string();
+                } else {
+                    current_line.push_str(word);
+                }
+            } else {
+                current_line.push_str(word);
+            }
+        }
+
+        if !current_line.is_empty() || lines.is_empty() {
+            lines.push(current_line);
+        }
+
+        lines
     }
 
     fn move_row(&mut self, delta: isize) {
@@ -562,8 +674,33 @@ impl Tui {
         }
 
         lines.push(String::new());
+
+        // Calculate available width for the input field (leave margins)
+        let prompt = "origem: ";
+        let prompt_width = prompt.chars().count();
+        let max_input_width = cols.saturating_sub(prompt_width as u16 + 4).max(20) as usize;
+
         if self.typing {
-            lines.push(format!("origem: {}", self.include_input));
+            // Wrap the input text
+            let wrapped_lines = Self::wrap_text(&self.include_input, max_input_width);
+            let _input_line_count = wrapped_lines.len().max(1);
+
+            // Render the prompt + first line (or empty)
+            if wrapped_lines.is_empty() {
+                lines.push(prompt.to_string());
+            } else {
+                for (i, wrapped) in wrapped_lines.iter().enumerate() {
+                    if i == 0 {
+                        lines.push(format!("{prompt}{wrapped}"));
+                    } else {
+                        // Continuation lines: indent to align with prompt
+                        let indent = " ".repeat(prompt_width);
+                        lines.push(format!("{indent}{wrapped}"));
+                    }
+                }
+            }
+
+            lines.push(String::new());
             lines.push("Enter para confirmar, Esc para cancelar".into());
         } else {
             lines.push("Enter para selecionar, Esc para voltar".into());
@@ -573,9 +710,115 @@ impl Tui {
             lines.push(notice.clone());
         }
 
+        // Highlight the title and the selected option
         let mut highlighted = vec![0usize];
         highlighted.push(2 + self.include_index);
-        self.centered_write(w, lines, cols, rows, &highlighted)?;
+
+        // Render the base lines first
+        self.render_include_base(w, cols, rows, &lines, &highlighted)?;
+
+        // If typing, position the cursor at the correct position in the wrapped input
+        if self.typing {
+            self.render_input_cursor(w, cols, rows, &lines)?;
+        }
+
+        Ok(())
+    }
+
+    /// Render the base lines for include view (without cursor positioning)
+    fn render_include_base(
+        &self,
+        w: &mut impl Write,
+        cols: u16,
+        rows: u16,
+        lines: &[String],
+        highlighted: &[usize],
+    ) -> anyhow::Result<()> {
+        let width = lines
+            .iter()
+            .map(|l| l.chars().count() as u16)
+            .max()
+            .unwrap_or(0);
+        let top = (rows.saturating_sub(lines.len() as u16)) / 2;
+        let left = cols.saturating_sub(width) / 2;
+
+        for (idx, line) in lines.iter().enumerate() {
+            queue!(w, cursor::MoveTo(left, top.saturating_add(idx as u16)),)?;
+            if highlighted.contains(&idx) {
+                queue!(
+                    w,
+                    style::SetForegroundColor(Color::Cyan),
+                    style::Print(line),
+                    style::ResetColor,
+                )?;
+            } else {
+                queue!(w, style::Print(line))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Render the cursor at the correct position within the wrapped input field
+    fn render_input_cursor(
+        &self,
+        w: &mut impl Write,
+        cols: u16,
+        rows: u16,
+        lines: &[String],
+    ) -> anyhow::Result<()> {
+        let prompt = "origem: ";
+        let prompt_width = prompt.chars().count();
+        let max_input_width = cols.saturating_sub(prompt_width as u16 + 4).max(20) as usize;
+
+        // Find the line index where the input starts (after options + blank lines)
+        // lines structure:
+        // 0: "adicionar torrent a fila"
+        // 1: ""
+        // 2: option 0
+        // 3: option 1
+        // 4: ""
+        // 5+: wrapped input lines (starts at line 5)
+        let input_start_line = 5;
+
+        // Calculate cursor position within the wrapped text
+        let wrapped = Self::wrap_text(&self.include_input, max_input_width);
+        let input_line_count = wrapped.len().max(1);
+
+        // Find which visual line and column the cursor is on
+        let mut cursor_line = 0;
+        let mut cursor_col = prompt_width;
+        let mut chars_before_cursor = self.input_cursor_pos;
+
+        for (i, wrapped_line) in wrapped.iter().enumerate() {
+            let line_len = wrapped_line.chars().count();
+            if chars_before_cursor <= line_len {
+                cursor_line = i;
+                cursor_col = prompt_width + chars_before_cursor;
+                break;
+            }
+            chars_before_cursor -= line_len;
+        }
+
+        // If cursor is past all wrapped lines, put it at the end of the last line
+        if cursor_line >= input_line_count {
+            cursor_line = input_line_count - 1;
+            let last_line = wrapped.last().map(|l| l.chars().count()).unwrap_or(0);
+            cursor_col = prompt_width + last_line.min(chars_before_cursor);
+        }
+
+        let width = lines
+            .iter()
+            .map(|l| l.chars().count() as u16)
+            .max()
+            .unwrap_or(0);
+        let top = (rows.saturating_sub(lines.len() as u16)) / 2;
+        let left = cols.saturating_sub(width) / 2;
+
+        let cursor_row = top.saturating_add((input_start_line + cursor_line) as u16);
+        let cursor_col = left.saturating_add(cursor_col as u16);
+
+        queue!(w, cursor::MoveTo(cursor_col, cursor_row), cursor::Show,)?;
+
         Ok(())
     }
 
@@ -666,11 +909,16 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-fn key_reader(tx: mpsc::UnboundedSender<KeyEvent>) {
+fn key_reader(tx: mpsc::UnboundedSender<Event>) {
     loop {
         match event::read() {
             Ok(Event::Key(key)) => {
-                if tx.send(key).is_err() {
+                if tx.send(Event::Key(key)).is_err() {
+                    break;
+                }
+            }
+            Ok(Event::Paste(text)) => {
+                if tx.send(Event::Paste(text)).is_err() {
                     break;
                 }
             }
@@ -683,10 +931,14 @@ fn key_reader(tx: mpsc::UnboundedSender<KeyEvent>) {
 /// Run the interactive TUI. Expects the terminal to be in a clean state.
 pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> anyhow::Result<()> {
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
-    let _guard = RawModeGuard;
-
     let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+    execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        cursor::Hide,
+        event::EnableBracketedPaste
+    )?;
+    let _guard = RawModeGuard;
 
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || key_reader(tx));
@@ -697,9 +949,23 @@ pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> a
 
         // Process all pending keys, then refresh the screen periodically.
         let mut handled = false;
-        while let Ok(key) = tui.keys.try_recv() {
+        while let Ok(event) = tui.keys.try_recv() {
             handled = true;
-            let keep = tui.handle_key(key).await.unwrap_or(false);
+            let keep = match event {
+                Event::Key(key) => tui.handle_key(key).await.unwrap_or(false),
+                Event::Paste(text) => {
+                    if tui.typing {
+                        // Insert pasted text at cursor position
+                        let before = &tui.include_input[..tui.input_cursor_pos];
+                        let after = &tui.include_input[tui.input_cursor_pos..];
+                        tui.include_input = format!("{}{}{}", before, text, after);
+                        tui.input_cursor_pos += text.len();
+                        tui.notice = None;
+                    }
+                    true
+                }
+                _ => true,
+            };
             if !keep {
                 break;
             }
@@ -712,7 +978,12 @@ pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> a
         }
     };
 
-    execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show)?;
+    execute!(
+        stdout,
+        terminal::LeaveAlternateScreen,
+        cursor::Show,
+        event::DisableBracketedPaste
+    )?;
     result
 }
 
@@ -722,6 +993,7 @@ struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), event::DisableBracketedPaste);
     }
 }
 
@@ -739,5 +1011,40 @@ mod tests {
     fn strips_multiple_sequences() {
         let s = "\u{1b}[1;32ma\u{1b}[0m\u{1b}[31mb\u{1b}[0m";
         assert_eq!(strip_ansi(s), "ab");
+    }
+
+    #[test]
+    fn wrap_text_keeps_short_lines_untouched() {
+        let lines = Tui::wrap_text("olá mundo", 30);
+        assert_eq!(lines, vec!["olá mundo"]);
+    }
+
+    #[test]
+    fn wrap_text_breaks_long_lines_on_spaces() {
+        let lines = Tui::wrap_text("aaaa bbbb cccc", 6);
+        assert_eq!(lines, vec!["aaaa ", "bbbb ", "cccc"]);
+    }
+
+    #[test]
+    fn wrap_text_hard_breaks_single_long_word() {
+        let lines = Tui::wrap_text("abcdefghij", 4);
+        assert_eq!(lines, vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn wrap_text_handles_width_zero() {
+        let lines = Tui::wrap_text("qualquer coisa", 0);
+        assert_eq!(lines, vec![""]);
+    }
+
+    #[test]
+    fn wrap_text_preserves_whole_text_when_wrapped() {
+        let source =
+            "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01&dn=arquivo+de+teste";
+        let width = 30;
+        let lines = Tui::wrap_text(source, width);
+        let joined: String = lines.join("");
+        assert_eq!(joined, source);
+        assert!(lines.iter().all(|l| l.chars().count() <= width));
     }
 }
