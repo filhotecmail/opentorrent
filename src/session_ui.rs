@@ -2,7 +2,7 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -126,6 +126,119 @@ struct Layout {
     show_actions: bool,
 }
 
+/// Uma célula do buffer de tela (double buffering): um caractere + se está
+/// destacado em ciano.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Cell {
+    ch: char,
+    cyan: bool,
+}
+
+impl Cell {
+    fn blank() -> Self {
+        Cell {
+            ch: ' ',
+            cyan: false,
+        }
+    }
+}
+
+/// Buffer de tela (US-016): o render desenha o estado atual neste buffer e, ao
+/// aplicar o frame, apenas as células alteradas em relação ao frame anterior
+/// são reescritas no terminal (diff-rendering / double buffering).
+struct Frame {
+    grid: Vec<Cell>,
+    cols: u16,
+    rows: u16,
+    /// Posição desejada do cursor do terminal (ex.: campo de entrada).
+    cursor: Option<(u16, u16)>,
+}
+
+impl Frame {
+    fn new(cols: u16, rows: u16) -> Self {
+        Frame {
+            grid: vec![Cell::blank(); cols as usize * rows as usize],
+            cols,
+            rows,
+            cursor: None,
+        }
+    }
+
+    fn index(&self, row: u16, col: u16) -> usize {
+        row as usize * self.cols as usize + col as usize
+    }
+
+    fn cell(&self, row: u16, col: u16) -> Cell {
+        if row >= self.rows || col >= self.cols {
+            return Cell::blank();
+        }
+        self.grid[self.index(row, col)]
+    }
+
+    /// Escreve um texto a partir de `(row, col)`, fora dos limites é ignorado.
+    fn put(&mut self, row: u16, col: u16, text: &str, cyan: bool) {
+        for (col, ch) in (col..).zip(text.chars()) {
+            if row >= self.rows || col >= self.cols {
+                return;
+            }
+            let idx = self.index(row, col);
+            let cell = &mut self.grid[idx];
+            cell.ch = ch;
+            cell.cyan = cyan;
+        }
+    }
+
+    /// Registra a posição desejada do cursor do terminal (para exibir durante
+    /// a digitação). `None` indica cursor oculto.
+    fn set_cursor(&mut self, row: u16, col: u16) {
+        self.cursor = Some((row, col));
+    }
+
+    /// Quantas células diferem do frame anterior.
+    fn diff_count(&self, prev: &Frame) -> usize {
+        self.grid
+            .iter()
+            .zip(prev.grid.iter())
+            .filter(|(a, b)| a != b)
+            .count()
+    }
+
+    /// Reescreve apenas as células alteradas em relação a `prev`, agrupando
+    /// runs contíguos na mesma linha para minimizar escapes emitidos.
+    fn apply_diff(&self, w: &mut impl Write, prev: &Frame) -> anyhow::Result<()> {
+        for row in 0..self.rows {
+            let mut col = 0u16;
+            while col < self.cols {
+                let cur = self.cell(row, col);
+                if cur == prev.cell(row, col) {
+                    col += 1;
+                    continue;
+                }
+                // run contíguo de células alteradas com a mesma cor
+                let start = col;
+                let mut run = String::new();
+                while col < self.cols {
+                    let c = self.cell(row, col);
+                    if c == prev.cell(row, col) || c.cyan != cur.cyan {
+                        break;
+                    }
+                    run.push(c.ch);
+                    col += 1;
+                }
+                queue!(w, cursor::MoveTo(start, row))?;
+                if cur.cyan {
+                    queue!(w, style::SetForegroundColor(Color::Cyan))?;
+                }
+                queue!(w, style::Print(run))?;
+                if cur.cyan {
+                    queue!(w, style::ResetColor)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 struct Tui {
     session: Arc<Session>,
     output_folder: PathBuf,
@@ -152,6 +265,8 @@ struct Tui {
     layout: Option<Layout>,
     /// Origens adicionadas em segundo plano, compartilhadas com as tasks.
     pending: Arc<Mutex<Vec<PendingTorrent>>>,
+    /// Frame anterior renderizado (double buffering / diff-rendering).
+    prev_frame: Option<Frame>,
     running: bool,
 }
 
@@ -176,7 +291,38 @@ impl Tui {
             keys,
             layout: None,
             pending: Arc::new(Mutex::new(Vec::new())),
+            prev_frame: None,
             running: true,
+        }
+    }
+
+    /// Processa um evento de entrada (teclado, paste ou mouse). Retorna
+    /// `(continuar, redesenhar)`: o primeiro indica se a UI segue aberta; o
+    /// segundo, se o evento exigiu redesenho (movimentos de mouse não
+    /// redesenham — evitam floods de render no diff-rendering).
+    async fn handle_event(&mut self, event: Event) -> (bool, bool) {
+        match event {
+            Event::Key(key) => (self.handle_key(key).await.unwrap_or(false), true),
+            Event::Paste(text) => {
+                if self.typing {
+                    // Insert pasted text at cursor position
+                    let before = &self.include_input[..self.input_cursor_pos];
+                    let after = &self.include_input[self.input_cursor_pos..];
+                    self.include_input = format!("{before}{text}{after}");
+                    self.input_cursor_pos += text.len();
+                    self.notice = None;
+                }
+                (true, true)
+            }
+            Event::Mouse(mouse) => {
+                if let Err(err) = self.handle_mouse(mouse).await {
+                    self.notice = Some(format!("erro no clique: {err:#}"));
+                }
+                // Apenas cliques alteram o estado; movimentos não redesenham.
+                let click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+                (true, click)
+            }
+            _ => (true, false),
         }
     }
 
@@ -721,30 +867,52 @@ impl Tui {
     fn render(&mut self, w: &mut impl Write) -> anyhow::Result<()> {
         self.drain_pending_notices();
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        queue!(w, terminal::Clear(terminal::ClearType::All), cursor::Hide)?;
 
+        // US-016 (double buffering): o estado atual é desenhado no buffer e,
+        // ao aplicar, apenas as células alteradas em relação ao frame anterior
+        // são reescritas no terminal. O clear total só acontece no primeiro
+        // frame, em redimensionamento ou quando quase tudo mudou (troca de
+        // view) — nunca a cada iteração do laço.
+        let mut frame = Frame::new(cols, rows);
         match self.view {
-            View::Title => self.render_title(w, cols, rows)?,
-            View::Menu => self.render_menu(w, cols, rows)?,
-            View::Session => self.render_session(w, cols, rows)?,
-            View::Include => self.render_include(w, cols, rows)?,
-            View::Completed => self.render_completed(w, cols, rows)?,
+            View::Title => self.render_title(&mut frame, cols, rows),
+            View::Menu => self.render_menu(&mut frame, cols, rows),
+            View::Session => self.render_session(&mut frame, cols, rows),
+            View::Include => self.render_include(&mut frame, cols, rows),
+            View::Completed => self.render_completed(&mut frame, cols, rows),
         }
 
         if let Some(notice) = &self.notice {
-            queue!(
-                w,
-                cursor::MoveTo(1, rows.saturating_sub(1)),
-                style::SetForegroundColor(Color::DarkYellow),
-                style::Print(notice),
-                style::ResetColor,
-            )?;
+            frame.put(rows.saturating_sub(1), 1, notice, false);
+        }
+
+        let total = cols as usize * rows as usize;
+        let needs_full = match &self.prev_frame {
+            None => true,
+            Some(prev) => {
+                prev.cols != cols || prev.rows != rows || frame.diff_count(prev) > total / 2
+            }
+        };
+
+        if needs_full {
+            queue!(w, terminal::Clear(terminal::ClearType::All), cursor::Hide)?;
+            frame.apply_diff(w, &Frame::new(cols, rows))?;
+        } else if let Some(prev) = &self.prev_frame {
+            frame.apply_diff(w, prev)?;
+        }
+
+        // Cursor do terminal: visível apenas durante a digitação (include).
+        match frame.cursor {
+            Some((row, col)) => queue!(w, cursor::MoveTo(col, row), cursor::Show)?,
+            None => queue!(w, cursor::Hide)?,
         }
         w.flush()?;
+
+        self.prev_frame = Some(frame);
         Ok(())
     }
 
-    fn render_title(&self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+    fn render_title(&mut self, frame: &mut Frame, cols: u16, rows: u16) {
         let mut lines: Vec<String> = Vec::new();
         for line in BANNER.iter() {
             lines.push(line.to_string());
@@ -760,11 +928,10 @@ impl Tui {
         lines.push("atalhos: A adicionar | C acompanhar | L listar | S sair".into());
 
         let highlighted: Vec<usize> = (0..5).collect();
-        self.centered_write(w, lines, cols, rows, &highlighted)?;
-        Ok(())
+        self.centered_write(frame, lines, cols, rows, &highlighted);
     }
 
-    fn render_menu(&mut self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+    fn render_menu(&mut self, frame: &mut Frame, cols: u16, rows: u16) {
         // Interface de navegação delimitada pelo quadro com bordas duplas.
         let (left, top, width, height) = frame_rect(cols, rows);
         let content_left = left + 2;
@@ -792,8 +959,15 @@ impl Tui {
         let mut highlighted = vec![0usize];
         highlighted.push(MENU_ITEMS_OFFSET + self.menu_index);
 
-        draw_box(w, left, top, width, height)?;
-        write_boxed_lines(w, content_left, content_top, &lines, &highlighted, height)?;
+        draw_box(frame, left, top, width, height);
+        write_boxed_lines(
+            frame,
+            content_left,
+            content_top,
+            &lines,
+            &highlighted,
+            height,
+        );
 
         self.layout = Some(Layout {
             top: content_top,
@@ -803,10 +977,9 @@ impl Tui {
             info_width: 0,
             show_actions: false,
         });
-        Ok(())
     }
 
-    fn render_session(&mut self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+    fn render_session(&mut self, frame: &mut Frame, cols: u16, rows: u16) {
         let rows_data = self.session_rows();
         let pending = self.pending.lock().unwrap().clone();
         let mut lines: Vec<String> = Vec::new();
@@ -919,7 +1092,7 @@ impl Tui {
         if !rows_data.is_empty() || !pending.is_empty() {
             highlighted.push(2 + self.row_index);
         }
-        let (left, top) = self.centered_write(w, lines, cols, rows, &highlighted)?;
+        let (left, top) = self.centered_write(frame, lines, cols, rows, &highlighted);
 
         // Registra a geometria para o mapeamento de cliques do mouse.
         let total_rows = rows_data.len() + pending.len();
@@ -935,10 +1108,9 @@ impl Tui {
                 show_actions,
             });
         }
-        Ok(())
     }
 
-    fn render_include(&mut self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+    fn render_include(&mut self, frame: &mut Frame, cols: u16, rows: u16) {
         // Interface de entrada delimitada pelo quadro com bordas duplas, com a
         // área amostrada fixada na equivalência de 1024x768 (128x48 células).
         let (left, top, width, height) = frame_rect(cols, rows);
@@ -1009,12 +1181,19 @@ impl Tui {
         let mut highlighted = vec![0usize];
         highlighted.push(2 + self.include_index);
 
-        draw_box(w, left, top, width, height)?;
-        write_boxed_lines(w, content_left, content_top, &lines, &highlighted, height)?;
+        draw_box(frame, left, top, width, height);
+        write_boxed_lines(
+            frame,
+            content_left,
+            content_top,
+            &lines,
+            &highlighted,
+            height,
+        );
 
         // If typing, position the cursor at the correct position in the wrapped input
         if self.typing {
-            self.render_input_cursor(w, content_left, content_top, max_input_width, height)?;
+            self.render_input_cursor(frame, content_left, content_top, max_input_width, height);
         } else {
             // Registra a geometria para cliques do mouse nas opções.
             self.layout = Some(Layout {
@@ -1026,21 +1205,19 @@ impl Tui {
                 show_actions: false,
             });
         }
-
-        Ok(())
     }
 
-    /// Render the cursor at the correct position within the wrapped input field,
-    /// relativo ao interior do quadro (bordas duplas). O cursor nunca ultrapassa
-    /// a área visível do conteúdo mesmo com texto colado muito longo.
+    /// Registra a posição do cursor dentro do campo de entrada, relativo ao
+    /// interior do quadro (bordas duplas). O cursor nunca ultrapassa a área
+    /// visível do conteúdo mesmo com texto colado muito longo.
     fn render_input_cursor(
         &self,
-        w: &mut impl Write,
+        frame: &mut Frame,
         content_left: u16,
         content_top: u16,
         max_input_width: usize,
         frame_height: u16,
-    ) -> anyhow::Result<()> {
+    ) {
         let prompt = "origem: ";
         let prompt_width = prompt.chars().count();
 
@@ -1085,12 +1262,10 @@ impl Tui {
         let cursor_row = content_top.saturating_add((input_start_line + cursor_line) as u16);
         let cursor_col = content_left.saturating_add(cursor_col as u16);
 
-        queue!(w, cursor::MoveTo(cursor_col, cursor_row), cursor::Show,)?;
-
-        Ok(())
+        frame.set_cursor(cursor_row, cursor_col);
     }
 
-    fn render_completed(&self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+    fn render_completed(&mut self, frame: &mut Frame, cols: u16, rows: u16) {
         // Consistência visual: a listagem também fica dentro do quadro.
         let (left, top, width, height) = frame_rect(cols, rows);
         let content_left = left + 2;
@@ -1129,20 +1304,27 @@ impl Tui {
         if items.is_empty() {
             highlighted.push(2);
         }
-        draw_box(w, left, top, width, height)?;
-        write_boxed_lines(w, content_left, content_top, &lines, &highlighted, height)?;
-        Ok(())
+        draw_box(frame, left, top, width, height);
+        write_boxed_lines(
+            frame,
+            content_left,
+            content_top,
+            &lines,
+            &highlighted,
+            height,
+        );
     }
 
-    /// Desenha as linhas centralizadas e retorna a geometria usada `(left, top)`.
+    /// Desenha as linhas centralizadas no buffer e retorna a geometria usada
+    /// `(left, top)` (para o mapeamento de cliques).
     fn centered_write(
         &self,
-        w: &mut impl Write,
+        frame: &mut Frame,
         lines: Vec<String>,
         cols: u16,
         rows: u16,
         highlighted: &[usize],
-    ) -> anyhow::Result<(u16, u16)> {
+    ) -> (u16, u16) {
         let width = lines
             .iter()
             .map(|l| l.chars().count() as u16)
@@ -1152,19 +1334,14 @@ impl Tui {
         let left = cols.saturating_sub(width) / 2;
 
         for (idx, line) in lines.iter().enumerate() {
-            queue!(w, cursor::MoveTo(left, top.saturating_add(idx as u16)),)?;
-            if highlighted.contains(&idx) {
-                queue!(
-                    w,
-                    style::SetForegroundColor(Color::Cyan),
-                    style::Print(line),
-                    style::ResetColor,
-                )?;
-            } else {
-                queue!(w, style::Print(line))?;
-            }
+            frame.put(
+                top.saturating_add(idx as u16),
+                left,
+                line,
+                highlighted.contains(&idx),
+            );
         }
-        Ok((left, top))
+        (left, top)
     }
 }
 
@@ -1253,57 +1430,36 @@ fn center_content_top(frame_top: u16, frame_height: u16, line_count: usize) -> u
     frame_top + 1 + (spare / 2) as u16
 }
 
-/// Desenha o quadro com bordas duplas, centralizado.
-fn draw_box(
-    w: &mut impl Write,
-    left: u16,
-    top: u16,
-    width: u16,
-    height: u16,
-) -> anyhow::Result<()> {
+/// Desenha o quadro com bordas duplas no buffer, centralizado.
+fn draw_box(frame: &mut Frame, left: u16, top: u16, width: u16, height: u16) {
     let (top_line, bottom_line) = frame_top_bottom(width);
-    queue!(w, cursor::MoveTo(left, top), style::Print(top_line))?;
+    frame.put(top, left, &top_line, false);
     for row in top + 1..top + height - 1 {
-        queue!(
-            w,
-            cursor::MoveTo(left, row),
-            style::Print("║"),
-            cursor::MoveTo(left + width - 1, row),
-            style::Print("║"),
-        )?;
+        frame.put(row, left, "║", false);
+        frame.put(row, left + width - 1, "║", false);
     }
-    queue!(
-        w,
-        cursor::MoveTo(left, top + height - 1),
-        style::Print(bottom_line)
-    )?;
-    Ok(())
+    frame.put(top + height - 1, left, &bottom_line, false);
 }
 
-/// Escreve linhas de conteúdo dentro do quadro, destacando as selecionadas.
+/// Escreve linhas de conteúdo dentro do quadro no buffer, destacando as
+/// selecionadas.
 fn write_boxed_lines(
-    w: &mut impl Write,
+    frame: &mut Frame,
     content_left: u16,
     content_top: u16,
     lines: &[String],
     highlighted: &[usize],
     frame_height: u16,
-) -> anyhow::Result<()> {
+) {
     let max_lines = (frame_height as usize).saturating_sub(3);
     for (idx, line) in lines.iter().take(max_lines).enumerate() {
-        queue!(w, cursor::MoveTo(content_left, content_top + idx as u16))?;
-        if highlighted.contains(&idx) {
-            queue!(
-                w,
-                style::SetForegroundColor(Color::Cyan),
-                style::Print(line),
-                style::ResetColor,
-            )?;
-        } else {
-            queue!(w, style::Print(line))?;
-        }
+        frame.put(
+            content_top + idx as u16,
+            content_left,
+            line,
+            highlighted.contains(&idx),
+        );
     }
-    Ok(())
 }
 
 /// Remove ANSI escape sequences added by crossterm style helpers.
@@ -1367,43 +1523,51 @@ pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> a
     std::thread::spawn(move || key_reader(tx));
 
     let mut tui = Tui::new(session, output_folder, rx);
-    let result = loop {
-        tui.render(&mut stdout)?;
 
-        // Process all pending keys, then refresh the screen periodically.
-        let mut handled = false;
-        while let Ok(event) = tui.keys.try_recv() {
-            handled = true;
-            let keep = match event {
-                Event::Key(key) => tui.handle_key(key).await.unwrap_or(false),
-                Event::Paste(text) => {
-                    if tui.typing {
-                        // Insert pasted text at cursor position
-                        let before = &tui.include_input[..tui.input_cursor_pos];
-                        let after = &tui.include_input[tui.input_cursor_pos..];
-                        tui.include_input = format!("{}{}{}", before, text, after);
-                        tui.input_cursor_pos += text.len();
-                        tui.notice = None;
-                    }
-                    true
-                }
-                Event::Mouse(mouse) => {
-                    if let Err(err) = tui.handle_mouse(mouse).await {
-                        tui.notice = Some(format!("erro no clique: {err:#}"));
-                    }
-                    true
-                }
-                _ => true,
-            };
-            if !keep {
-                break;
+    // US-016: laço com redesenho sob demanda (eventos) e limite de taxa.
+    // Em vez de redesenhar em loop desimpedido, o laço aguarda um evento de
+    // entrada OU o fim do orçamento de frame (~30 FPS) para atualizar as
+    // métricas de progresso. Com o diff-rendering, um frame sem alterações
+    // não emite praticamente nenhuma sequência para o terminal.
+    const FRAME_BUDGET: Duration = Duration::from_millis(33); // ~30 FPS
+    let mut last_frame = Instant::now();
+
+    let result = loop {
+        // Aguarda um evento de entrada ou o fim do orçamento do frame atual.
+        let elapsed = last_frame.elapsed();
+        let wait = FRAME_BUDGET.saturating_sub(elapsed);
+        let event = if wait.is_zero() {
+            tui.keys.try_recv().ok()
+        } else {
+            match tokio::time::timeout(wait, tui.keys.recv()).await {
+                Ok(Some(ev)) => Some(ev),
+                Ok(None) | Err(_) => None,
             }
+        };
+
+        // Processa todos os eventos pendentes (drenagem), marcando se houve
+        // algum que exija redesenho (tecla, paste, clique).
+        let mut dirty = false;
+        let mut keep = true;
+        if let Some(first) = event {
+            let (k, d) = tui.handle_event(first).await;
+            keep = k;
+            dirty |= d;
         }
-        if !tui.running {
+        while let Ok(ev) = tui.keys.try_recv() {
+            let (k, d) = tui.handle_event(ev).await;
+            keep = keep && k;
+            dirty |= d;
+        }
+        if !keep || !tui.running {
             break Ok(());
         }
-        if !handled {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Redesenha apenas se houve evento relevante ou o orçamento expirou
+        // (para atualizar progresso em tempo real). Sem loop desimpedido.
+        if dirty || last_frame.elapsed() >= FRAME_BUDGET {
+            tui.render(&mut stdout)?;
+            last_frame = Instant::now();
         }
     };
 
@@ -1558,6 +1722,82 @@ mod tests {
         assert_eq!(bottom.chars().last(), Some('╝'));
         assert_eq!(top.chars().count(), 78);
         assert!(top.chars().all(|c| matches!(c, '╔' | '═' | '╗')));
+    }
+
+    #[test]
+    fn frame_put_writes_cells_in_bounds() {
+        let mut f = Frame::new(5, 3);
+        f.put(1, 1, "abc", false);
+        assert_eq!(f.cell(1, 1).ch, 'a');
+        assert_eq!(f.cell(1, 2).ch, 'b');
+        assert_eq!(f.cell(1, 3).ch, 'c');
+        // fora dos limites é ignorado (sem panic)
+        f.put(9, 0, "x", false);
+        f.put(0, 9, "y", false);
+        assert_eq!(f.cell(9, 0).ch, ' ');
+    }
+
+    #[test]
+    fn frame_put_marks_cyan_cells() {
+        let mut f = Frame::new(10, 2);
+        f.put(0, 0, "hi", true);
+        assert!(f.cell(0, 0).cyan);
+        assert!(f.cell(0, 1).cyan);
+        assert!(!f.cell(1, 0).cyan);
+    }
+
+    #[test]
+    fn frame_diff_counts_only_changed_cells() {
+        let mut a = Frame::new(10, 3);
+        a.put(0, 0, "hello", false);
+        let mut b = Frame::new(10, 3);
+        b.put(0, 0, "hella", false);
+        // apenas o último caractere difere
+        assert_eq!(a.diff_count(&b), 1);
+        // frames idênticos não têm diferenças
+        let mut c = Frame::new(10, 3);
+        c.put(0, 0, "hello", false);
+        assert_eq!(a.diff_count(&c), 0);
+    }
+
+    #[test]
+    fn frame_apply_diff_rewrites_only_changed_run() {
+        let mut prev = Frame::new(20, 2);
+        prev.put(0, 0, "status: ok", false);
+        let mut cur = Frame::new(20, 2);
+        cur.put(0, 0, "status: 42", false);
+        let mut out = Vec::new();
+        cur.apply_diff(&mut out, &prev).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        // a parte inalterada não é reescrita
+        assert!(!s.contains("status:"));
+        // apenas a célula alterada é emitida
+        assert!(s.contains('4'));
+        assert!(s.contains('2'));
+    }
+
+    #[test]
+    fn frame_apply_diff_clears_removed_cells() {
+        let mut prev = Frame::new(10, 2);
+        prev.put(0, 0, "abcdef", false);
+        let mut cur = Frame::new(10, 2);
+        cur.put(0, 0, "abc", false);
+        let mut out = Vec::new();
+        cur.apply_diff(&mut out, &prev).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        // as células removidas viram espaço (limpeza) e são reescritas
+        assert!(s.contains(' '));
+    }
+
+    #[test]
+    fn frame_apply_diff_identical_frames_emit_nothing() {
+        let mut prev = Frame::new(10, 2);
+        prev.put(0, 0, "abc", false);
+        let mut cur = Frame::new(10, 2);
+        cur.put(0, 0, "abc", false);
+        let mut out = Vec::new();
+        cur.apply_diff(&mut out, &prev).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
