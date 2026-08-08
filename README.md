@@ -1,5 +1,8 @@
 # OpenTorrent
 
+[![CI](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
+[![Cobertura](https://codecov.io/gh/filhotecmail/opentorrent/branch/master/graph/badge.svg)](https://codecov.io/gh/filhotecmail/opentorrent)
+
 Um cliente BitTorrent de **linha de comando (CLI)** para **Ubuntu/Linux** que
 baixa **torrents** e **magnet links** diretamente do terminal, sem interface
 gráfica.
@@ -219,6 +222,21 @@ cargo audit                    # verifica vulnerabilidades
 cargo machete                  # detecta dependências não usadas
 cargo tree --duplicate         # consolida duplicações de versão
 ```
+
+### Integração contínua (CI)
+
+O repositório usa **GitHub Actions** em `.github/workflows/`, executado a cada
+`push` para `master` e em cada **Pull Request**:
+
+| Workflow | Arquivo | Verificações |
+| --- | --- | --- |
+| **CI** | `ci.yml` | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, `cargo machete` |
+| **Cobertura** | `coverage.yml` | `cargo tarpaulin` → relatório XML (artefato + Codecov) |
+
+Benefícios: PRs são bloqueados se qualquer verificação falhar; métricas de
+cobertura ficam visíveis no badge do README e no Codecov. Para ativar o badge
+de cobertura, configure o token do Codecov em `Settings → Secrets →
+CODECOV_TOKEN` (o passo de CI não falha sem ele).
 
 ## Diretrizes de desenvolvimento
 

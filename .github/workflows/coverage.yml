@@ -1,0 +1,45 @@
+name: Cobertura
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Cobertura de código (cargo tarpaulin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Instalar cargo-tarpaulin
+        uses: taiki-e/install-action@cargo-tarpaulin
+
+      - name: Medir cobertura
+        run: cargo tarpaulin --engine llvm --out Xml --output-dir ./coverage --all-targets
+
+      - name: Subir relatório de cobertura (artefato)
+        uses: actions/upload-artifact@v4
+        with:
+          name: cobertura-xml
+          path: ./coverage/cobertura.xml
+          if-no-files-found: error
+
+      - name: Publicar cobertura no Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/cobertura.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
