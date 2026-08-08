@@ -8,7 +8,10 @@ use std::{
 use anyhow::Context;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    },
     execute, queue,
     style::{self, Color},
     terminal,
@@ -16,7 +19,6 @@ use crossterm::{
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, TorrentStatsState,
 };
-use size_format::SizeFormatterBinary as SF;
 use tokio::sync::mpsc;
 
 use crate::downloads::{format_completed, list_completed_downloads};
@@ -37,6 +39,19 @@ const MENU_ITEMS: [&str; 4] = [
 ];
 
 const MENU_SHORTCUTS: [char; 4] = ['a', 'c', 'l', 's'];
+
+/// Largura de cada botão de ação renderizado nas linhas da sessão (ex.: `[Pausar ]`).
+const ACTION_BTN_WIDTH: u16 = 9;
+/// Espaço entre botões de ação.
+const ACTION_GAP: u16 = 1;
+/// Largura total ocupada pelos três botões de ação.
+const ACTIONS_WIDTH: u16 = 3 * ACTION_BTN_WIDTH + 2 * ACTION_GAP;
+/// Início da área do botão "parar" (após o primeiro botão + espaço).
+const ACTION_1_START: u16 = ACTION_BTN_WIDTH + ACTION_GAP;
+/// Início da área do botão "excluir" (após dois botões + dois espaços).
+const ACTION_2_START: u16 = 2 * (ACTION_BTN_WIDTH + ACTION_GAP);
+/// Largura máxima da parte informativa da linha da sessão (antes dos botões).
+const ROW_INFO_WIDTH: u16 = 60;
 
 /// The state machine driving the interactive UI.
 enum View {
@@ -62,6 +77,24 @@ struct SessionRow {
     handle: Arc<ManagedTorrent>,
 }
 
+/// Geometria do último render, usada para mapear cliques do mouse para ações.
+/// Recalculada a cada frame, considerando o tamanho atual do terminal.
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    /// Linha da tela onde o bloco de conteúdo começa.
+    top: u16,
+    /// Coluna da tela onde o bloco de conteúdo começa.
+    left: u16,
+    /// Deslocamento (em linhas) entre o topo do bloco e a primeira entrada.
+    rows_offset: u16,
+    /// Número de entradas renderizadas.
+    row_count: usize,
+    /// Largura da parte informativa da linha (define a coluna dos botões).
+    info_width: u16,
+    /// Se a sessão exibe botões de ação clicáveis.
+    show_actions: bool,
+}
+
 struct Tui {
     session: Arc<Session>,
     output_folder: PathBuf,
@@ -84,6 +117,8 @@ struct Tui {
     notice: Option<String>,
     /// Keys received from the keyboard thread.
     keys: mpsc::UnboundedReceiver<Event>,
+    /// Geometria do último render (usada para mapear cliques do mouse).
+    layout: Option<Layout>,
     running: bool,
 }
 
@@ -106,6 +141,7 @@ impl Tui {
             typing: false,
             notice: None,
             keys,
+            layout: None,
             running: true,
         }
     }
@@ -332,6 +368,101 @@ impl Tui {
         Ok(())
     }
 
+    /// Handle one mouse event, dispatching clicks to the active view.
+    async fn handle_mouse(&mut self, me: MouseEvent) -> anyhow::Result<()> {
+        if me.kind != MouseEventKind::Down(MouseButton::Left) {
+            return Ok(());
+        }
+        match self.view {
+            View::Session => self.mouse_session(me.column, me.row).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Maps a click on the session view to the clicked row and action button.
+    ///
+    /// The coordinates are relative to the `Layout` stored by the last render,
+    /// so window resizes are reflected on the very next frame.
+    async fn mouse_session(&mut self, col: u16, row: u16) -> anyhow::Result<()> {
+        let Some(layout) = self.layout else {
+            return Ok(());
+        };
+        let first_row = layout.top.saturating_add(layout.rows_offset);
+        let end = first_row.saturating_add(layout.row_count as u16);
+        if row < first_row || row >= end {
+            return Ok(());
+        }
+        let idx = (row - first_row) as usize;
+
+        // Sem botões renderizados (terminal estreito) ou clique fora da área
+        // dos botões: apenas move a seleção para a linha clicada.
+        let actions_col = layout.left.saturating_add(layout.info_width + 1);
+        if !layout.show_actions || col < actions_col || col >= actions_col + ACTIONS_WIDTH {
+            self.row_index = idx;
+            return Ok(());
+        }
+
+        let rows = self.session_rows();
+        let Some(row_data) = rows.get(idx) else {
+            return Ok(());
+        };
+
+        let Some(button) = action_button_at(col - actions_col) else {
+            return Ok(());
+        };
+        match button {
+            0 => {
+                let paused = matches!(
+                    row_data.state,
+                    TorrentStatsState::Paused | TorrentStatsState::Error
+                );
+                if paused {
+                    self.session.clone().unpause(&row_data.handle).await?;
+                    self.notice = Some(format!("retomado: {}", row_data.name));
+                } else {
+                    self.session.pause(&row_data.handle).await?;
+                    self.notice = Some(format!("pausado: {}", row_data.name));
+                }
+            }
+            1 => {
+                self.session
+                    .delete(librqbit::api::TorrentIdOrHash::Id(row_data.id), false)
+                    .await?;
+                self.notice = Some(format!("parado: {}", row_data.name));
+                self.clamp_row_index();
+            }
+            2 => {
+                self.session
+                    .delete(librqbit::api::TorrentIdOrHash::Id(row_data.id), true)
+                    .await?;
+                self.notice = Some(format!("excluído: {}", row_data.name));
+                self.clamp_row_index();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Mantém `row_index` dentro dos limites após remoção de linhas.
+    fn clamp_row_index(&mut self) {
+        let remaining = self.session_rows().len();
+        if remaining == 0 {
+            self.row_index = 0;
+        } else if self.row_index >= remaining {
+            self.row_index = remaining - 1;
+        }
+    }
+
+    /// Trunca o texto para caber em `max` caracteres, adicionando "…" se necessário.
+    fn truncate(s: &str, max: usize) -> String {
+        if s.chars().count() <= max {
+            return s.to_string();
+        }
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+
     /// Wrap text to fit within the given width (soft wrap by words).
     /// Returns a vector of visual lines.
     fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -532,7 +663,7 @@ impl Tui {
         Ok(())
     }
 
-    fn render(&self, w: &mut impl Write) -> anyhow::Result<()> {
+    fn render(&mut self, w: &mut impl Write) -> anyhow::Result<()> {
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         queue!(w, terminal::Clear(terminal::ClearType::All), cursor::Hide)?;
 
@@ -604,11 +735,23 @@ impl Tui {
         Ok(())
     }
 
-    fn render_session(&self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+    fn render_session(&mut self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
         let rows_data = self.session_rows();
         let mut lines: Vec<String> = Vec::new();
         lines.push("sessão de downloads".into());
         lines.push(String::new());
+
+        // Largura da parte informativa de cada linha. Os botões de ação são
+        // renderizados à direita em colunas fixas apenas quando o terminal é
+        // largo o suficiente — em terminais estreitos as linhas ficam sem
+        // botões para evitar estouro (que desalinharia o mapeamento do clique).
+        let show_actions = cols >= ROW_INFO_WIDTH + 1 + ACTIONS_WIDTH;
+        let info_width = if show_actions {
+            ROW_INFO_WIDTH.min(cols.saturating_sub(1 + ACTIONS_WIDTH)) as usize
+        } else {
+            ROW_INFO_WIDTH.min(cols.saturating_sub(2)) as usize
+        };
+        let name_max = info_width.saturating_sub(31);
 
         if rows_data.is_empty() {
             lines.push("nenhum torrent na fila".into());
@@ -630,16 +773,30 @@ impl Tui {
                 } else {
                     row.progress_bytes as f64 / row.total_bytes as f64 * 100.0
                 };
-                let line = format!(
-                    "{} [{:>3}] {:>5.1}%  {:<11}  {} ({}/{})",
+                let paused = matches!(
+                    row.state,
+                    TorrentStatsState::Paused | TorrentStatsState::Error
+                );
+                // Parte informativa com largura fixa (id em 4 dígitos) para que
+                // a coluna dos botões permaneça estável entre as linhas.
+                let info = format!(
+                    "{} [{:>4}] {:>5.1}%  {:<11}  {}",
                     marker,
-                    row.id,
+                    row.id.min(9999),
                     pct,
                     state,
-                    row.name,
-                    SF::new(row.progress_bytes),
-                    SF::new(row.total_bytes),
+                    Self::truncate(&row.name, name_max),
                 );
+                let line = if show_actions {
+                    format!(
+                        "{:<width$} {actions}",
+                        info,
+                        width = info_width,
+                        actions = actions_string(paused),
+                    )
+                } else {
+                    format!("{:<width$}", info, width = info_width)
+                };
                 lines.push(line);
             }
         }
@@ -655,7 +812,21 @@ impl Tui {
         if !rows_data.is_empty() {
             highlighted.push(2 + self.row_index);
         }
-        self.centered_write(w, lines, cols, rows, &highlighted)?;
+        let (left, top) = self.centered_write(w, lines, cols, rows, &highlighted)?;
+
+        // Registra a geometria para o mapeamento de cliques do mouse.
+        if rows_data.is_empty() {
+            self.layout = None;
+        } else {
+            self.layout = Some(Layout {
+                top,
+                left,
+                rows_offset: 2,
+                row_count: rows_data.len(),
+                info_width: info_width as u16,
+                show_actions,
+            });
+        }
         Ok(())
     }
 
@@ -856,6 +1027,7 @@ impl Tui {
         Ok(())
     }
 
+    /// Desenha as linhas centralizadas e retorna a geometria usada `(left, top)`.
     fn centered_write(
         &self,
         w: &mut impl Write,
@@ -863,7 +1035,7 @@ impl Tui {
         cols: u16,
         rows: u16,
         highlighted: &[usize],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<(u16, u16)> {
         let width = lines
             .iter()
             .map(|l| l.chars().count() as u16)
@@ -885,7 +1057,34 @@ impl Tui {
                 queue!(w, style::Print(line))?;
             }
         }
-        Ok(())
+        Ok((left, top))
+    }
+}
+
+/// Texto dos botões de ação de uma linha da sessão.
+fn actions_string(paused: bool) -> String {
+    let toggle = if paused { "[Retomar]" } else { "[Pausar ]" };
+    format!("{toggle} [Parar  ] [Excluir]")
+}
+
+/// Se `offset` cai dentro da área do botão que começa em `start`.
+fn in_action_button(offset: u16, start: u16) -> bool {
+    (start..start + ACTION_BTN_WIDTH).contains(&offset)
+}
+
+/// Mapeia o deslocamento horizontal a partir do início dos botões de ação para
+/// o índice do botão (0 = pausar/retomar, 1 = parar, 2 = excluir).
+/// Retorna `None` quando o clique cai fora da área delimitada (incluindo os
+/// espaços entre botões, que são intencionalmente inertes).
+fn action_button_at(offset: u16) -> Option<usize> {
+    if in_action_button(offset, 0) {
+        Some(0)
+    } else if in_action_button(offset, ACTION_1_START) {
+        Some(1)
+    } else if in_action_button(offset, ACTION_2_START) {
+        Some(2)
+    } else {
+        None
     }
 }
 
@@ -922,6 +1121,11 @@ fn key_reader(tx: mpsc::UnboundedSender<Event>) {
                     break;
                 }
             }
+            Ok(Event::Mouse(mouse)) => {
+                if tx.send(Event::Mouse(mouse)).is_err() {
+                    break;
+                }
+            }
             Ok(_) => continue,
             Err(_) => break,
         }
@@ -936,7 +1140,8 @@ pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> a
         stdout,
         terminal::EnterAlternateScreen,
         cursor::Hide,
-        event::EnableBracketedPaste
+        event::EnableBracketedPaste,
+        event::EnableMouseCapture
     )?;
     let _guard = RawModeGuard;
 
@@ -964,6 +1169,12 @@ pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> a
                     }
                     true
                 }
+                Event::Mouse(mouse) => {
+                    if let Err(err) = tui.handle_mouse(mouse).await {
+                        tui.notice = Some(format!("erro no clique: {err:#}"));
+                    }
+                    true
+                }
                 _ => true,
             };
             if !keep {
@@ -982,7 +1193,8 @@ pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> a
         stdout,
         terminal::LeaveAlternateScreen,
         cursor::Show,
-        event::DisableBracketedPaste
+        event::DisableBracketedPaste,
+        event::DisableMouseCapture
     )?;
     result
 }
@@ -993,7 +1205,11 @@ struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), event::DisableBracketedPaste);
+        let _ = execute!(
+            io::stdout(),
+            event::DisableBracketedPaste,
+            event::DisableMouseCapture
+        );
     }
 }
 
@@ -1046,5 +1262,44 @@ mod tests {
         let joined: String = lines.join("");
         assert_eq!(joined, source);
         assert!(lines.iter().all(|l| l.chars().count() <= width));
+    }
+
+    #[test]
+    fn truncate_keeps_short_text() {
+        assert_eq!(Tui::truncate("curto", 20), "curto");
+    }
+
+    #[test]
+    fn truncate_shortens_long_text() {
+        assert_eq!(
+            Tui::truncate("abcdefghijklmnopqrstuvwxyz", 10),
+            "abcdefghi…"
+        );
+    }
+
+    #[test]
+    fn actions_string_shows_resume_when_paused() {
+        assert_eq!(actions_string(true), "[Retomar] [Parar  ] [Excluir]");
+        assert_eq!(actions_string(false), "[Pausar ] [Parar  ] [Excluir]");
+    }
+
+    #[test]
+    fn action_button_mapping_covers_buttons_only() {
+        // botão pausar/retomar
+        assert_eq!(action_button_at(0), Some(0));
+        assert_eq!(action_button_at(8), Some(0));
+        // espaço entre botões não dispara ação
+        assert_eq!(action_button_at(9), None);
+        // botão parar
+        assert_eq!(action_button_at(10), Some(1));
+        assert_eq!(action_button_at(18), Some(1));
+        // espaço entre botões não dispara ação
+        assert_eq!(action_button_at(19), None);
+        // botão excluir
+        assert_eq!(action_button_at(20), Some(2));
+        assert_eq!(action_button_at(28), Some(2));
+        // fora da área dos botões
+        assert_eq!(action_button_at(29), None);
+        assert_eq!(action_button_at(100), None);
     }
 }
