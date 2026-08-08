@@ -28,6 +28,18 @@
 [PRINCIPLE_5_DESCRIPTION]
 <!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
 
+### VI. Rust-Skills (NON-NEGOTIABLE)
+<!-- Projeto Rust: integra https://github.com/actionbook/rust-skills (vendor/rust-skills/). -->
+Todo planejamento, design ou implementação de código Rust MUST consultar as
+Rust Skills via `rust-router` e aplicar o framework de meta-cognição em 3 camadas
+(Domínio → Design → Mecânica), usando as skills da camada identificada
+(`m01`–`m07` mecânica, `m09`–`m15` design, `domain-*` domínio) e
+`coding-guidelines` antes de propor arquitetura, tipos, ownership/borrowing,
+concorrência ou escolha de crates. Plano SDD/`plan.md` MUST registrar as skills
+consultadas na seção `Rust Skills Check`. Remendos superficiais a sintomas de
+compilação (ex.: `.clone()` sem análise de ownership) são PROIBIDOS sem análise
+cognitiva.
+
 ## [SECTION_2_NAME]
 <!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
 

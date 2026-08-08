@@ -1,7 +1,10 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    cell::RefCell, collections::HashMap, io::Write, path::PathBuf, sync::Arc, time::Duration,
+};
 
 use anyhow::{bail, Context};
 use clap::Parser;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, Session, SessionOptions,
     TorrentStatsState,
@@ -9,6 +12,21 @@ use librqbit::{
 use size_format::SizeFormatterBinary as SF;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+struct MultiProgressWriter(MultiProgress);
+
+impl Write for MultiProgressWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for line in String::from_utf8_lossy(buf).lines() {
+            self.0.println(line).map_err(std::io::Error::other)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// OpenTorrent: download torrents and magnet links from the terminal.
 #[derive(Parser)]
@@ -72,7 +90,13 @@ fn main() -> anyhow::Result<()> {
             opts.log_level, opts.log_level
         ))
     });
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    let multi = MultiProgress::new();
+    let log_multi = multi.clone();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(move || MultiProgressWriter(log_multi.clone()))
+        .init();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_time()
@@ -80,7 +104,7 @@ fn main() -> anyhow::Result<()> {
         .build()
         .context("failed to build tokio runtime")?;
 
-    match runtime.block_on(run(opts)) {
+    match runtime.block_on(run(opts, multi)) {
         Ok(()) => std::process::exit(0),
         Err(err) => {
             error!("{err:#}");
@@ -89,13 +113,13 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run(opts: Opts) -> anyhow::Result<()> {
+async fn run(opts: Opts, multi: MultiProgress) -> anyhow::Result<()> {
     match opts.subcommand {
-        SubCommand::Add(add) => run_add(add).await,
+        SubCommand::Add(add) => run_add(add, multi).await,
     }
 }
 
-async fn run_add(opts: AddOpts) -> anyhow::Result<()> {
+async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
     if opts.list {
         info!("listing torrent contents");
     }
@@ -126,7 +150,7 @@ async fn run_add(opts: AddOpts) -> anyhow::Result<()> {
     librqbit::librqbit_spawn(
         "stats_printer",
         tracing::trace_span!("stats_printer"),
-        stats_printer(session.clone()),
+        stats_printer(session.clone(), multi),
     );
 
     let mut added = false;
@@ -213,20 +237,71 @@ async fn run_add(opts: AddOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn stats_printer(session: Arc<Session>) -> anyhow::Result<()> {
+struct TorrentBars {
+    status: ProgressBar,
+    files: Vec<ProgressBar>,
+}
+
+async fn stats_printer(session: Arc<Session>, multi: MultiProgress) -> anyhow::Result<()> {
+    let bars: RefCell<HashMap<usize, TorrentBars>> = RefCell::new(HashMap::new());
+
     loop {
         session.with_torrents(|torrents| {
             for (idx, torrent) in torrents {
                 let stats = torrent.stats();
+                let name = torrent.name().unwrap_or_else(|| format!("torrent #{idx}"));
+
+                let mut bars = bars.borrow_mut();
+                let tb = bars.entry(idx).or_insert_with(|| {
+                    let status = multi.add(ProgressBar::new_spinner());
+                    status.set_style(
+                        ProgressStyle::with_template("{spinner:.green} {msg}")
+                            .unwrap()
+                            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈"),
+                    );
+                    status.enable_steady_tick(Duration::from_millis(100));
+
+                    let file_infos = torrent
+                        .with_metadata(|m| m.file_infos.clone())
+                        .unwrap_or_default();
+                    let files = file_infos
+                        .into_iter()
+                        .map(|fi| {
+                            let bar = multi.add(ProgressBar::new(fi.len));
+                            bar.set_style(
+                                ProgressStyle::with_template(
+                                    "{msg} [{bar:34.cyan/blue}] {pos}/{len} ({percent}%)",
+                                )
+                                .unwrap()
+                                .progress_chars("=>-"),
+                            );
+                            bar.set_message(format!(
+                                "[{}] {}",
+                                idx,
+                                fi.relative_filename.display()
+                            ));
+                            bar
+                        })
+                        .collect::<Vec<_>>();
+
+                    TorrentBars { status, files }
+                });
+
                 if let TorrentStatsState::Initializing = stats.state {
                     let total = stats.total_bytes;
                     let progress = stats.progress_bytes;
-                    let pct = (progress as f64 / total as f64) * 100.0;
-                    info!("[{idx}] initializing {pct:.2}%");
+                    let pct = if total == 0 {
+                        0.0
+                    } else {
+                        (progress as f64 / total as f64) * 100.0
+                    };
+                    tb.status
+                        .set_message(format!("[{idx}] {name}: inicializando {pct:.2}%"));
                     continue;
                 }
-                let (live, live_stats) = match (torrent.live(), stats.live.as_ref()) {
-                    (Some(live), Some(live_stats)) => (live, live_stats),
+
+                let (live, _live_stats) = match (torrent.live(), stats.live.as_ref()) {
+                    (Some(live), Some(_live_stats)) => (live, _live_stats),
                     _ => continue,
                 };
                 let down_speed = live.down_speed_estimator();
@@ -242,19 +317,33 @@ async fn stats_printer(session: Arc<Session>) -> anyhow::Result<()> {
                     Some(d) => format!(", ETA: {d:?}"),
                     None => String::new(),
                 };
-                let peers = &live_stats.snapshot.peer_stats;
-                info!(
-                    "[{idx}]: {downloaded_pct:.2}% ({}/{}) ↓{:.2} MiB/s ↑{:.2} MiB/s{} {{live: {}, queued: {}, dead: {}, known: {}}}",
-                    SF::new(progress),
-                    SF::new(total),
-                    down_speed.mbps(),
-                    up_speed.mbps(),
-                    eta,
-                    peers.live,
-                    peers.queued + peers.connecting,
-                    peers.dead,
-                    peers.seen,
-                );
+
+                if stats.finished {
+                    tb.status.set_message(format!(
+                        "[{idx}] {name}: concluído — {downloaded_pct:.2}% ({}/{})",
+                        SF::new(progress),
+                        SF::new(total),
+                    ));
+                    tb.status.finish();
+                } else {
+                    tb.status.set_message(format!(
+                        "[{idx}] {name}: {downloaded_pct:.2}% ({}/{}) ↓{:.2} MiB/s ↑{:.2} MiB/s{}",
+                        SF::new(progress),
+                        SF::new(total),
+                        down_speed.mbps(),
+                        up_speed.mbps(),
+                        eta,
+                    ));
+                }
+
+                for (fi, bar) in tb.files.iter().enumerate() {
+                    if let Some(prog) = stats.file_progress.get(fi) {
+                        bar.set_position(*prog);
+                    }
+                    if stats.finished {
+                        bar.finish();
+                    }
+                }
             }
         });
         tokio::time::sleep(Duration::from_secs(1)).await;
