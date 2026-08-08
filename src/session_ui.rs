@@ -515,9 +515,10 @@ impl Tui {
         Ok(())
     }
 
-    /// Mantém `row_index` dentro dos limites após remoção de linhas.
+    /// Mantém `row_index` dentro dos limites após remoção de linhas,
+    /// considerando também as origens pendentes (adição assíncrona).
     fn clamp_row_index(&mut self) {
-        let remaining = self.session_rows().len();
+        let remaining = self.session_rows().len() + self.pending.lock().unwrap().len();
         if remaining == 0 {
             self.row_index = 0;
         } else if self.row_index >= remaining {
@@ -640,12 +641,7 @@ impl Tui {
                 .delete(librqbit::api::TorrentIdOrHash::Id(row.id), false)
                 .await?;
             self.notice = Some(format!("removido da fila: {}", row.name));
-            let remaining = self.session_rows().len();
-            if remaining == 0 {
-                self.row_index = 0;
-            } else if self.row_index >= remaining {
-                self.row_index = remaining - 1;
-            }
+            self.clamp_row_index();
         }
         Ok(())
     }
@@ -656,8 +652,6 @@ impl Tui {
     /// em uma task em background, mantendo a interface responsiva.
     fn submit_include(&mut self) {
         let source = self.include_input.trim().to_string();
-        self.include_input.clear();
-        self.input_cursor_pos = 0;
         self.notice = None;
 
         if source.is_empty() {
@@ -666,10 +660,14 @@ impl Tui {
         }
 
         // Validação síncrona apenas de sintaxe — nenhuma espera de rede aqui.
+        // Em caso de erro o texto digitado é preservado para correção.
         if let Err(err) = AddTorrent::from_cli_argument(&source) {
             self.notice = Some(format!("origem inválida: {err:#}"));
             return;
         }
+
+        self.include_input.clear();
+        self.input_cursor_pos = 0;
 
         // Registra a requisição e exibe a linha imediatamente (AC-2/AC-3).
         self.pending.lock().unwrap().push(PendingTorrent {
@@ -710,10 +708,10 @@ impl Tui {
     fn drain_pending_notices(&mut self) {
         let mut pending = self.pending.lock().unwrap();
         pending.retain(|p| match &p.status {
+            // Aviso mais recente vence: o evento concluiu agora, então sobrescreve
+            // qualquer notice anterior (ex.: "já gerenciado" após um "pausado").
             PendingStatus::Done(msg) => {
-                if self.notice.is_none() {
-                    self.notice = Some(msg.clone());
-                }
+                self.notice = Some(msg.clone());
                 false
             }
             _ => true,
@@ -1016,7 +1014,7 @@ impl Tui {
 
         // If typing, position the cursor at the correct position in the wrapped input
         if self.typing {
-            self.render_input_cursor(w, content_left, content_top, max_input_width)?;
+            self.render_input_cursor(w, content_left, content_top, max_input_width, height)?;
         } else {
             // Registra a geometria para cliques do mouse nas opções.
             self.layout = Some(Layout {
@@ -1033,13 +1031,15 @@ impl Tui {
     }
 
     /// Render the cursor at the correct position within the wrapped input field,
-    /// relativo ao interior do quadro (bordas duplas).
+    /// relativo ao interior do quadro (bordas duplas). O cursor nunca ultrapassa
+    /// a área visível do conteúdo mesmo com texto colado muito longo.
     fn render_input_cursor(
         &self,
         w: &mut impl Write,
         content_left: u16,
         content_top: u16,
         max_input_width: usize,
+        frame_height: u16,
     ) -> anyhow::Result<()> {
         let prompt = "origem: ";
         let prompt_width = prompt.chars().count();
@@ -1079,6 +1079,9 @@ impl Tui {
             cursor_col = prompt_width + last_line.min(chars_before_cursor);
         }
 
+        // Limita o cursor à última linha visível do conteúdo (dentro do quadro).
+        let max_visible = (frame_height as usize).saturating_sub(3).saturating_sub(1);
+        let cursor_line = cursor_line.min(max_visible.saturating_sub(input_start_line));
         let cursor_row = content_top.saturating_add((input_start_line + cursor_line) as u16);
         let cursor_col = content_left.saturating_add(cursor_col as u16);
 
