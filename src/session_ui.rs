@@ -126,20 +126,17 @@ struct Layout {
     show_actions: bool,
 }
 
-/// Uma célula do buffer de tela (double buffering): um caractere + se está
-/// destacado em ciano.
+/// Uma célula do buffer de tela (double buffering): um caractere + cor de
+/// primeiro plano opcional (`None` = cor padrão do terminal).
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Cell {
     ch: char,
-    cyan: bool,
+    fg: Option<Color>,
 }
 
 impl Cell {
     fn blank() -> Self {
-        Cell {
-            ch: ' ',
-            cyan: false,
-        }
+        Cell { ch: ' ', fg: None }
     }
 }
 
@@ -175,8 +172,15 @@ impl Frame {
         self.grid[self.index(row, col)]
     }
 
-    /// Escreve um texto a partir de `(row, col)`, fora dos limites é ignorado.
+    /// Escreve um texto a partir de `(row, col)` com destaque em ciano
+    /// (`cyan = true`); fora dos limites é ignorado.
     fn put(&mut self, row: u16, col: u16, text: &str, cyan: bool) {
+        let fg = if cyan { Some(Color::Cyan) } else { None };
+        self.put_colored(row, col, text, fg);
+    }
+
+    /// Escreve um texto com uma cor de primeiro plano explícita.
+    fn put_colored(&mut self, row: u16, col: u16, text: &str, fg: Option<Color>) {
         for (col, ch) in (col..).zip(text.chars()) {
             if row >= self.rows || col >= self.cols {
                 return;
@@ -184,7 +188,7 @@ impl Frame {
             let idx = self.index(row, col);
             let cell = &mut self.grid[idx];
             cell.ch = ch;
-            cell.cyan = cyan;
+            cell.fg = fg;
         }
     }
 
@@ -219,18 +223,18 @@ impl Frame {
                 let mut run = String::new();
                 while col < self.cols {
                     let c = self.cell(row, col);
-                    if c == prev.cell(row, col) || c.cyan != cur.cyan {
+                    if c == prev.cell(row, col) || c.fg != cur.fg {
                         break;
                     }
                     run.push(c.ch);
                     col += 1;
                 }
                 queue!(w, cursor::MoveTo(start, row))?;
-                if cur.cyan {
-                    queue!(w, style::SetForegroundColor(Color::Cyan))?;
+                if let Some(color) = cur.fg {
+                    queue!(w, style::SetForegroundColor(color))?;
                 }
                 queue!(w, style::Print(run))?;
-                if cur.cyan {
+                if cur.fg.is_some() {
                     queue!(w, style::ResetColor)?;
                 }
             }
@@ -267,6 +271,8 @@ struct Tui {
     pending: Arc<Mutex<Vec<PendingTorrent>>>,
     /// Frame anterior renderizado (double buffering / diff-rendering).
     prev_frame: Option<Frame>,
+    /// Posição do cursor do terminal exibida no último frame (`None` = oculto).
+    prev_cursor: Option<(u16, u16)>,
     running: bool,
 }
 
@@ -292,6 +298,7 @@ impl Tui {
             layout: None,
             pending: Arc::new(Mutex::new(Vec::new())),
             prev_frame: None,
+            prev_cursor: None,
             running: true,
         }
     }
@@ -883,7 +890,7 @@ impl Tui {
         }
 
         if let Some(notice) = &self.notice {
-            frame.put(rows.saturating_sub(1), 1, notice, false);
+            frame.put_colored(rows.saturating_sub(1), 1, notice, Some(Color::DarkYellow));
         }
 
         let total = cols as usize * rows as usize;
@@ -902,9 +909,14 @@ impl Tui {
         }
 
         // Cursor do terminal: visível apenas durante a digitação (include).
-        match frame.cursor {
-            Some((row, col)) => queue!(w, cursor::MoveTo(col, row), cursor::Show)?,
-            None => queue!(w, cursor::Hide)?,
+        // Emite apenas quando a posição/visibilidade muda — frames ociosos
+        // (sem alterações) não reescrevem o cursor.
+        if frame.cursor != self.prev_cursor {
+            match frame.cursor {
+                Some((row, col)) => queue!(w, cursor::MoveTo(col, row), cursor::Show)?,
+                None => queue!(w, cursor::Hide)?,
+            }
+            self.prev_cursor = frame.cursor;
         }
         w.flush()?;
 
@@ -912,7 +924,7 @@ impl Tui {
         Ok(())
     }
 
-    fn render_title(&mut self, frame: &mut Frame, cols: u16, rows: u16) {
+    fn render_title(&self, frame: &mut Frame, cols: u16, rows: u16) {
         let mut lines: Vec<String> = Vec::new();
         for line in BANNER.iter() {
             lines.push(line.to_string());
@@ -1523,6 +1535,8 @@ pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> a
     std::thread::spawn(move || key_reader(tx));
 
     let mut tui = Tui::new(session, output_folder, rx);
+    // Primeiro frame é desenhado imediatamente (sem esperar o orçamento).
+    tui.render(&mut stdout)?;
 
     // US-016: laço com redesenho sob demanda (eventos) e limite de taxa.
     // Em vez de redesenhar em loop desimpedido, o laço aguarda um evento de
@@ -1741,9 +1755,17 @@ mod tests {
     fn frame_put_marks_cyan_cells() {
         let mut f = Frame::new(10, 2);
         f.put(0, 0, "hi", true);
-        assert!(f.cell(0, 0).cyan);
-        assert!(f.cell(0, 1).cyan);
-        assert!(!f.cell(1, 0).cyan);
+        assert_eq!(f.cell(0, 0).fg, Some(Color::Cyan));
+        assert_eq!(f.cell(0, 1).fg, Some(Color::Cyan));
+        assert_eq!(f.cell(1, 0).fg, None);
+    }
+
+    #[test]
+    fn frame_put_colored_uses_given_color() {
+        let mut f = Frame::new(10, 2);
+        f.put_colored(0, 0, "hi", Some(Color::DarkYellow));
+        assert_eq!(f.cell(0, 0).fg, Some(Color::DarkYellow));
+        assert_eq!(f.cell(0, 1).fg, Some(Color::DarkYellow));
     }
 
     #[test]
