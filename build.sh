@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Build helper for OpenTorrent
-# Usage: ./build.sh [release|debug] [verbose|clean|check|test|clippy|fmt]
+# Usage: ./build.sh [release|debug] [build|verbose|clean|check|test|clippy|fmt]
+#
+# A cada build (release ou debug) a versão patch em Cargo.toml é incrementada
+# automaticamente, e a compilação roda em modo verbose para acompanhar o
+# processo (compilação por crate).
 
 set -euo pipefail
 
@@ -18,13 +22,29 @@ case "$MODE" in
     PROFILE=""
     ;;
   *)
-    echo "Uso: $0 [release|debug] [verbose|clean|check|test|clippy|fmt|build]"
+    echo "Uso: $0 [release|debug] [build|verbose|clean|check|test|clippy|fmt]"
     exit 1
     ;;
 esac
 
+# Incrementa a versão patch em Cargo.toml (ex.: 0.1.0 -> 0.1.1).
+bump_version() {
+  local cur major minor patch next
+  cur="$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/^version = "([0-9]+)\.([0-9]+)\.([0-9]+)"/\1.\2.\3/')"
+  IFS=. read -r major minor patch <<< "$cur"
+  patch=$((patch + 1))
+  next="$major.$minor.$patch"
+  sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$next\"/" Cargo.toml
+  echo "OpenTorrent v$next — build em andamento (verbose)"
+}
+
 case "$ACTION" in
+  build|b|"")
+    bump_version
+    cargo build $PROFILE --verbose
+    ;;
   verbose|v)
+    bump_version
     cargo build $PROFILE --verbose
     ;;
   clean|c)
@@ -42,12 +62,9 @@ case "$ACTION" in
   fmt)
     cargo fmt --check
     ;;
-  build|b|"")
-    cargo build $PROFILE
-    ;;
   *)
     echo "Ação desconhecida: $ACTION"
-    echo "Disponíveis: verbose, clean, check, test, clippy, fmt, build"
+    echo "Disponíveis: build, verbose, clean, check, test, clippy, fmt"
     exit 1
     ;;
 esac
