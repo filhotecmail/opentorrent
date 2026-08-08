@@ -29,7 +29,7 @@
 <!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
 
 ### VI. Rust-Skills (NON-NEGOTIABLE)
-<!-- Projeto Rust: integra https://github.com/actionbook/rust-skills (vendor/rust-skills/). -->
+<!-- Projeto Rust: integra https://github.com/actionbook/rust-skills (clone em ~/rust-skills/). -->
 Todo planejamento, design ou implementação de código Rust MUST consultar as
 Rust Skills via `rust-router` e aplicar o framework de meta-cognição em 3 camadas
 (Domínio → Design → Mecânica), usando as skills da camada identificada
@@ -39,6 +39,35 @@ concorrência ou escolha de crates. Plano SDD/`plan.md` MUST registrar as skills
 consultadas na seção `Rust Skills Check`. Remendos superficiais a sintomas de
 compilação (ex.: `.clone()` sem análise de ownership) são PROIBIDOS sem análise
 cognitiva.
+
+### VII. Cargo-Skill (NON-NEGOTIABLE)
+<!-- Projeto Rust: integra https://lib.rs/crates/cargo-skill (contexto ativo por camadas). -->
+O agente MUST usar o `cargo-skill` como fonte de contexto ativo de regras Rust:
+carregar `.skill/context.md` quando existir e invocar `cargo skill lookup`/
+`think`/`write`/`review`/`refactor`/`debug` conforme a tarefa (consulta pontual,
+raciocínio de design ou execução). O índice de regras (Layer 1) da seção
+`# Rust Skill Reference` do `AGENTS.md` é a referência offline obrigatória antes
+de propor regras de estilo, tipos, ownership, performance ou testes.
+
+### VIII. Build Velocity (NON-NEGOTIABLE)
+<!-- Referência: https://corrode.dev/blog/tips-for-faster-rust-compile-times -->
+O loop de desenvolvimento local e o CI MUST seguir as regras mínimas da seção
+`## Otimização de Tempos de Compilação` do `AGENTS.md`. Regras-non-negotiable:
+- `cargo check` no lugar de `cargo build` durante iteração; parar de gerar
+  binário desnecessário.
+- Toolchain atualizada (`rustup update`).
+- Linker acelerado (`mold` em Linux, `lld` em fallback) configurado em
+  `.cargo/config.toml`.
+- `[profile.dev]` com `debug = 0` (e `strip = "debuginfo"` no Linux);
+  `[profile.dev.package."*"] opt-level = 3` para dependências; build-override
+  `opt-level = 3` para proc-macros e build scripts.
+- Remover dependências não usadas periodicamente (`cargo-machete`/`shear`/`udeps`).
+- `cargo-nextest` no lugar de `cargo test` quando houver múltiplos binários de
+  teste; testes lentos atrás de `RUN_SLOW_TESTS`.
+- CI: `CARGO_INCREMENTAL=0`, `RUSTFLAGS=-D warnings`, cache via
+  `Swatinem/rust-cache@v2`, separar step de compile (`--no-run --locked`) do run.
+O detalhamento completo (perfis, ferramentas de profiling, troca de deps,
+Cranelift, frontend paralelo, caches, IDE, macOS/Windows) está no `AGENTS.md`.
 
 ## [SECTION_2_NAME]
 <!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
@@ -58,5 +87,5 @@ cognitiva.
 [GOVERNANCE_RULES]
 <!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
+**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: 2026-08-08
 <!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
