@@ -33,8 +33,14 @@ slug() {
 
 read_state() {
   if [ -f "$STATE_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$STATE_FILE"
+    # Parse seguro de key=value (evita executar conteúdo arbitrário do arquivo).
+    while IFS='=' read -r key value; do
+      case "$key" in
+        BRANCH) BRANCH="$value" ;;
+        ISSUE) ISSUE="$value" ;;
+        US_ID) US_ID="$value" ;;
+      esac
+    done < "$STATE_FILE"
   fi
 }
 
@@ -71,6 +77,11 @@ cmd_start() {
 
   local repo branch issue_number milestone
   repo="$(repo_name)"
+
+  # AC-3: não misturar alterações pendentes na branch da US.
+  if [ -n "$(git status --porcelain)" ]; then
+    die "há alterações não commitadas; commite ou faça stash antes de start"
+  fi
 
   # AC-1: identifica a nova US e cria a branch a partir da principal.
   git fetch origin "$MAIN" >/dev/null
