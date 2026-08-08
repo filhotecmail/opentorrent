@@ -14,11 +14,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Os nomes dos jobs são os contextos exigidos pela proteção da branch
+  # master (fmt, clippy, test, machete) e pelo workflow de auto-merge.
   fmt:
-    name: Formatação (cargo fmt)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -30,10 +31,9 @@ jobs:
         run: cargo fmt --all -- --check
 
   clippy:
-    name: Padrões e convenções (cargo clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -48,12 +48,11 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    name: Testes (cargo test)
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -68,11 +67,10 @@ jobs:
       - name: Rodar testes
         run: cargo test --locked --all-targets
 
-  deps:
-    name: Dependências (cargo machete)
+  machete:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
