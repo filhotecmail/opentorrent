@@ -54,6 +54,11 @@ const ACTION_2_START: u16 = 2 * (ACTION_BTN_WIDTH + ACTION_GAP);
 /// Largura máxima da parte informativa da linha da sessão (antes dos botões).
 const ROW_INFO_WIDTH: u16 = 60;
 
+/// Resolução alvo da área amostrada: 1024x768 pixels. Considerando uma célula
+/// de terminal de ~8x16 px, isso equivale a 128 colunas x 48 linhas.
+const FRAME_WIDTH: u16 = 128;
+const FRAME_HEIGHT: u16 = 48;
+
 /// The state machine driving the interactive UI.
 enum View {
     /// Title screen with ASCII art and the command input field.
@@ -762,6 +767,11 @@ impl Tui {
     }
 
     fn render_menu(&mut self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+        // Interface de navegação delimitada pelo quadro com bordas duplas.
+        let (left, top, width, height) = frame_rect(cols, rows);
+        let content_left = left + 2;
+        let inner_width = (width as usize).saturating_sub(4);
+
         let mut lines: Vec<String> = Vec::new();
         lines.push("OPENTORRENT".into());
         lines.push("menu".into());
@@ -773,14 +783,23 @@ impl Tui {
         lines.push(String::new());
         lines.push("use ↑/↓ + Enter, ou digite a letra do atalho".into());
 
+        for line in &mut lines {
+            *line = Self::truncate(line, inner_width);
+        }
+
+        let content_top = center_content_top(top, height, lines.len());
+
         // O destaque colorido acompanha exatamente a linha com o cursor
         // `> ... <` (itens começam na linha `MENU_ITEMS_OFFSET`).
         let mut highlighted = vec![0usize];
         highlighted.push(MENU_ITEMS_OFFSET + self.menu_index);
-        let (left, top) = self.centered_write(w, lines, cols, rows, &highlighted)?;
+
+        draw_box(w, left, top, width, height)?;
+        write_boxed_lines(w, content_left, content_top, &lines, &highlighted, height)?;
+
         self.layout = Some(Layout {
-            top,
-            left,
+            top: content_top,
+            left: content_left,
             rows_offset: MENU_ITEMS_OFFSET as u16,
             row_count: MENU_ITEMS.len(),
             info_width: 0,
@@ -922,6 +941,12 @@ impl Tui {
     }
 
     fn render_include(&mut self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+        // Interface de entrada delimitada pelo quadro com bordas duplas, com a
+        // área amostrada fixada na equivalência de 1024x768 (128x48 células).
+        let (left, top, width, height) = frame_rect(cols, rows);
+        let content_left = left + 2;
+        let inner_width = (width as usize).saturating_sub(4);
+
         let mut lines: Vec<String> = Vec::new();
         lines.push("adicionar torrent a fila".into());
         lines.push(String::new());
@@ -937,17 +962,14 @@ impl Tui {
 
         lines.push(String::new());
 
-        // Calculate available width for the input field (leave margins)
+        // Largura do campo de entrada respeitando os limites internos do quadro.
         let prompt = "origem: ";
         let prompt_width = prompt.chars().count();
-        let max_input_width = cols.saturating_sub(prompt_width as u16 + 4).max(20) as usize;
+        let max_input_width = inner_width.saturating_sub(prompt_width);
 
         if self.typing {
-            // Wrap the input text
+            // Quebra de linha automática restrita à largura interna do container.
             let wrapped_lines = Self::wrap_text(&self.include_input, max_input_width);
-            let _input_line_count = wrapped_lines.len().max(1);
-
-            // Render the prompt + first line (or empty)
             if wrapped_lines.is_empty() {
                 lines.push(prompt.to_string());
             } else {
@@ -972,21 +994,34 @@ impl Tui {
             lines.push(notice.clone());
         }
 
+        // Nenhum texto ultrapassa as bordas laterais do quadro.
+        for line in &mut lines {
+            *line = Self::truncate(line, inner_width);
+        }
+
+        // No modo de digitação o bloco fica ancorado no topo (cursor estável);
+        // fora dele, o bloco é centralizado verticalmente no interior do quadro.
+        let content_top = if self.typing {
+            top + 2
+        } else {
+            center_content_top(top, height, lines.len())
+        };
+
         // Highlight the title and the selected option
         let mut highlighted = vec![0usize];
         highlighted.push(2 + self.include_index);
 
-        // Render the base lines first
-        let (left, top) = self.render_include_base(w, cols, rows, &lines, &highlighted)?;
+        draw_box(w, left, top, width, height)?;
+        write_boxed_lines(w, content_left, content_top, &lines, &highlighted, height)?;
 
         // If typing, position the cursor at the correct position in the wrapped input
         if self.typing {
-            self.render_input_cursor(w, cols, rows, &lines)?;
+            self.render_input_cursor(w, content_left, content_top, max_input_width)?;
         } else {
             // Registra a geometria para cliques do mouse nas opções.
             self.layout = Some(Layout {
-                top,
-                left,
+                top: content_top,
+                left: content_left,
                 rows_offset: 2,
                 row_count: 2,
                 info_width: 0,
@@ -997,54 +1032,19 @@ impl Tui {
         Ok(())
     }
 
-    /// Render the base lines for include view (without cursor positioning)
-    /// and returns the geometry used `(left, top)`.
-    fn render_include_base(
-        &self,
-        w: &mut impl Write,
-        cols: u16,
-        rows: u16,
-        lines: &[String],
-        highlighted: &[usize],
-    ) -> anyhow::Result<(u16, u16)> {
-        let width = lines
-            .iter()
-            .map(|l| l.chars().count() as u16)
-            .max()
-            .unwrap_or(0);
-        let top = (rows.saturating_sub(lines.len() as u16)) / 2;
-        let left = cols.saturating_sub(width) / 2;
-
-        for (idx, line) in lines.iter().enumerate() {
-            queue!(w, cursor::MoveTo(left, top.saturating_add(idx as u16)),)?;
-            if highlighted.contains(&idx) {
-                queue!(
-                    w,
-                    style::SetForegroundColor(Color::Cyan),
-                    style::Print(line),
-                    style::ResetColor,
-                )?;
-            } else {
-                queue!(w, style::Print(line))?;
-            }
-        }
-        Ok((left, top))
-    }
-
-    /// Render the cursor at the correct position within the wrapped input field
+    /// Render the cursor at the correct position within the wrapped input field,
+    /// relativo ao interior do quadro (bordas duplas).
     fn render_input_cursor(
         &self,
         w: &mut impl Write,
-        cols: u16,
-        rows: u16,
-        lines: &[String],
+        content_left: u16,
+        content_top: u16,
+        max_input_width: usize,
     ) -> anyhow::Result<()> {
         let prompt = "origem: ";
         let prompt_width = prompt.chars().count();
-        let max_input_width = cols.saturating_sub(prompt_width as u16 + 4).max(20) as usize;
 
-        // Find the line index where the input starts (after options + blank lines)
-        // lines structure:
+        // Estrutura das linhas do conteúdo:
         // 0: "adicionar torrent a fila"
         // 1: ""
         // 2: option 0
@@ -1079,16 +1079,8 @@ impl Tui {
             cursor_col = prompt_width + last_line.min(chars_before_cursor);
         }
 
-        let width = lines
-            .iter()
-            .map(|l| l.chars().count() as u16)
-            .max()
-            .unwrap_or(0);
-        let top = (rows.saturating_sub(lines.len() as u16)) / 2;
-        let left = cols.saturating_sub(width) / 2;
-
-        let cursor_row = top.saturating_add((input_start_line + cursor_line) as u16);
-        let cursor_col = left.saturating_add(cursor_col as u16);
+        let cursor_row = content_top.saturating_add((input_start_line + cursor_line) as u16);
+        let cursor_col = content_left.saturating_add(cursor_col as u16);
 
         queue!(w, cursor::MoveTo(cursor_col, cursor_row), cursor::Show,)?;
 
@@ -1220,6 +1212,85 @@ async fn add_torrent_background(
         AddTorrentResponse::AlreadyManaged(_, _) => Ok(AddOutcome::AlreadyManaged),
         _ => unreachable!("add_torrent sem list_only só retorna Added ou AlreadyManaged"),
     }
+}
+
+/// Dimensões do quadro com borda dupla, limitadas ao terminal e centralizadas.
+/// A área interna corresponde à resolução fixa de 1024x768 (128x48 células).
+fn frame_rect(cols: u16, rows: u16) -> (u16, u16, u16, u16) {
+    // O mínimo é apenas o necessário para as duas bordas: em terminais
+    // minúsculos o quadro encolhe em vez de estourar os limites da tela.
+    let width = FRAME_WIDTH.min(cols.saturating_sub(2)).max(2);
+    let height = FRAME_HEIGHT.min(rows.saturating_sub(2)).max(2);
+    let left = cols.saturating_sub(width) / 2;
+    let top = rows.saturating_sub(height) / 2;
+    (left, top, width, height)
+}
+
+/// Linhas superior e inferior do quadro (bordas duplas).
+fn frame_top_bottom(width: u16) -> (String, String) {
+    let inner = "═".repeat(width.saturating_sub(2) as usize);
+    (format!("╔{inner}╗"), format!("╚{inner}╝"))
+}
+
+/// Linha inicial do conteúdo para centralizá-lo verticalmente no quadro
+/// (com margem mínima de 1 linha abaixo da borda superior).
+fn center_content_top(frame_top: u16, frame_height: u16, line_count: usize) -> u16 {
+    let inner = (frame_height as usize).saturating_sub(2);
+    let spare = inner.saturating_sub(line_count);
+    frame_top + 1 + (spare / 2) as u16
+}
+
+/// Desenha o quadro com bordas duplas, centralizado.
+fn draw_box(
+    w: &mut impl Write,
+    left: u16,
+    top: u16,
+    width: u16,
+    height: u16,
+) -> anyhow::Result<()> {
+    let (top_line, bottom_line) = frame_top_bottom(width);
+    queue!(w, cursor::MoveTo(left, top), style::Print(top_line))?;
+    for row in top + 1..top + height - 1 {
+        queue!(
+            w,
+            cursor::MoveTo(left, row),
+            style::Print("║"),
+            cursor::MoveTo(left + width - 1, row),
+            style::Print("║"),
+        )?;
+    }
+    queue!(
+        w,
+        cursor::MoveTo(left, top + height - 1),
+        style::Print(bottom_line)
+    )?;
+    Ok(())
+}
+
+/// Escreve linhas de conteúdo dentro do quadro, destacando as selecionadas.
+fn write_boxed_lines(
+    w: &mut impl Write,
+    content_left: u16,
+    content_top: u16,
+    lines: &[String],
+    highlighted: &[usize],
+    frame_height: u16,
+) -> anyhow::Result<()> {
+    let max_lines = (frame_height as usize).saturating_sub(3);
+    for (idx, line) in lines.iter().take(max_lines).enumerate() {
+        queue!(w, cursor::MoveTo(content_left, content_top + idx as u16))?;
+        if highlighted.contains(&idx) {
+            queue!(
+                w,
+                style::SetForegroundColor(Color::Cyan),
+                style::Print(line),
+                style::ResetColor,
+            )?;
+        } else {
+            queue!(w, style::Print(line))?;
+        }
+    }
+    Ok(())
 }
 
 /// Remove ANSI escape sequences added by crossterm style helpers.
@@ -1428,6 +1499,52 @@ mod tests {
         // O destaque (índice de linha) aponta para a opção selecionada.
         assert_eq!(MENU_ITEMS_OFFSET, 3);
         assert_eq!(MENU_ITEMS.len(), 4);
+    }
+
+    #[test]
+    fn frame_rect_uses_1024x768_equivalence_when_terminal_is_large() {
+        let (left, top, w, h) = frame_rect(200, 60);
+        assert_eq!(w, FRAME_WIDTH);
+        assert_eq!(h, FRAME_HEIGHT);
+        assert_eq!(left, (200 - 128) / 2);
+        assert_eq!(top, (60 - 48) / 2);
+    }
+
+    #[test]
+    fn frame_rect_clamps_and_centers_on_small_terminal() {
+        let (left, top, w, h) = frame_rect(80, 24);
+        assert_eq!(w, 78);
+        assert_eq!(h, 22);
+        assert_eq!(left, 1);
+        assert_eq!(top, 1);
+    }
+
+    #[test]
+    fn frame_rect_never_exceeds_tiny_terminal() {
+        let (left, top, w, h) = frame_rect(15, 7);
+        assert!(w <= 15);
+        assert!(h <= 7);
+        assert!(left + w <= 15);
+        assert!(top + h <= 7);
+    }
+
+    #[test]
+    fn center_content_top_centers_block() {
+        // quadro 22 linhas, conteúdo 7 linhas → interior 20, sobra 13, margem 6
+        assert_eq!(center_content_top(1, 22, 7), 1 + 1 + 6);
+        // conteúdo maior que o interior: fica colado na margem mínima
+        assert_eq!(center_content_top(1, 22, 100), 2);
+    }
+
+    #[test]
+    fn frame_borders_use_double_lines() {
+        let (top, bottom) = frame_top_bottom(78);
+        assert_eq!(top.chars().next(), Some('╔'));
+        assert_eq!(top.chars().last(), Some('╗'));
+        assert_eq!(bottom.chars().next(), Some('╚'));
+        assert_eq!(bottom.chars().last(), Some('╝'));
+        assert_eq!(top.chars().count(), 78);
+        assert!(top.chars().all(|c| matches!(c, '╔' | '═' | '╗')));
     }
 
     #[test]
