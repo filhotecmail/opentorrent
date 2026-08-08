@@ -13,7 +13,13 @@ O **OpenTorrent** é um programa em Rust que:
 - Baixa arquivos a partir de URLs `http(s)` que apontam para `.torrent`;
 - Lista o conteúdo de um torrent sem baixá-lo;
 - Filtra quais arquivos baixar por expressão regular;
-- Mostra progresso, velocidade de download/upload e ETA em tempo real.
+- Mostra progresso, velocidade de download/upload e ETA em tempo real;
+- Interage por **mouse** com as barras de progresso (pausar, retomar, parar e
+  excluir torrents com um clique);
+- Usa **diretório padrão** `~/downloads/torrent-downloads/` quando `-o` não é
+  informado;
+- Faz **retomada inteligente**: torrents já 100% baixados são reportados e
+  pulados; downloads parciais são retomados do ponto onde pararam.
 
 O motor de BitTorrent é o **librqbit** — uma implementação 100% em Rust — o que
 significa que o projeto compila e roda apenas com o ecossistema Rust, sem
@@ -23,13 +29,16 @@ dependências externas de runtime.
 
 ```text
 opentorrent/
-├── Cargo.toml      # Manifesto do projeto: nome, versão e dependências
+├── Cargo.toml      # Manifesto do projeto: nome, versão, dependências e perfis
 ├── Cargo.lock      # Versões exatas das dependências travadas (binário → commitado)
 ├── src/
-│   └── main.rs     # Ponto de entrada: CLI (clap) + sessão de download (librqbit)
+│   └── main.rs     # CLI (clap) + sessão de download (librqbit) + UI (indicatif/crossterm)
 ├── .gitignore      # Arquivos/pastas que não entram no repositório
 └── README.md       # Este arquivo
 ```
+
+> **Nota:** arquivos de governança/automação local como `AGENTS.md` e `.specify/`
+> não são versionados (ver [Diretrizes de desenvolvimento](#diretrizes-de-desenvolvimento)).
 
 ## Dependências
 
@@ -44,6 +53,8 @@ Todas as dependências são resolvidas automaticamente pelo Cargo no build.
 | `clap` | 4.x | Parser da interface de linha de comando (subcomandos e opções) |
 | `anyhow` | 1.x | Tratamento contextual de erros |
 | `futures` | 0.3 | Utilitários de futuro assíncrono (ex: `join_all` para múltiplos downloads) |
+| `indicatif` | 0.18 | Barras de progresso e MultiProgress na UI |
+| `crossterm` | 0.28 | Captura de eventos de mouse e controle do terminal |
 | `size_format` | 1.x | Formatação de tamanhos de bytes (ex: 1.24 GiB) |
 | `tracing` | 0.1 | Log estruturado (macros `info!`, `error!`, `warn!`) |
 | `tracing-subscriber` | 0.3 | Configuração dos logs no console (filtro por nível/`RUST_LOG`) |
@@ -103,11 +114,11 @@ Argumentos:
   <TORRENT>...  O magnet link, arquivo .torrent local ou URL http(s) para um .torrent
 
 Opções:
-  -o, --output-folder <PASTA>   Pasta de destino. Padrão: pasta atual
+  -o, --output-folder <PASTA>   Pasta de destino. Padrão: ~/downloads/torrent-downloads/
   -s, --sub-folder <PASTA>      Subpasta dentro da pasta de destino
   -r, --filename-re <REGEX>     Baixar apenas arquivos cujo nome combine com o regex
   -l, --list                    Apenas listar o conteúdo, sem baixar
-      --overwrite               Sobrescrever arquivos existentes
+      --overwrite               Forçar sobrescrita/re-download de arquivos existentes
   -e, --exit-on-finish          Encerrar o programa ao terminar os downloads
       --initial-peers <PEERS>   Lista de peers iniciais separados por vírgula (host:porta)
   -h, --help                    Mostra a ajuda
@@ -119,26 +130,146 @@ Opções:
 # Listar o conteúdo de um magnet link sem baixar
 opentorrent add "magnet:?xt=urn:btih:..." --list
 
-# Baixar apenas arquivos .mp4 em ./videos e encerrar ao concluir
-opentorrent add ./arquivo.torrent -o videos -r '\.mp4$' -e
+# Baixar apenas arquivos .mp4 e encerrar ao concluir (diretório padrão)
+opentorrent add ./arquivo.torrent -r '\.mp4$' -e
 
 # Baixar para uma pasta específica
 opentorrent add "magnet:?xt=urn:btih:..." --output-folder ~/Downloads
+
+# Reexecutar o mesmo comando depois de interrompido: retoma onde parou
+opentorrent add ./arquivo.torrent -o videos
+# - arquivos completos → "torrent already fully downloaded", nada a fazer
+# - arquivos parciais   → "partial files found, resuming download"
 ```
+
+### Interação por mouse
+
+Quando executado em um terminal interativo (TTY), cada barra de progresso exibe
+botões clicáveis à direita:
+
+```text
+[0] debian.iso [======>-----------] [Pausar ] [Parar  ] [Excluir]
+```
+
+| Botão | Ação |
+| --- | --- |
+| `[Pausar ]` / `[Retomar]` | Alterna entre pausar e retomar o torrent |
+| `[Parar  ]` | Para o torrent, mantendo os arquivos em disco |
+| `[Excluir]` | Para o torrent e exclui os arquivos baixados |
 
 ## Desenvolvimento
 
+### Ferramentas de verificação (obrigatórias)
+
+Antes de submeter qualquer alteração, rode:
+
 ```bash
-# Executar em modo debug
-cargo run -- add "magnet:?xt=urn:btih:..."
-
-# Formatação e lint
-cargo fmt
-cargo clippy -- -D warnings
-
-# Testes
-cargo test
+cargo fmt                      # formatação
+cargo clippy -- -D warnings    # lint sem nenhum warning
+cargo test                     # testes
 ```
+
+### Loop de desenvolvimento rápido
+
+O projeto usa perfis de compilação otimizados para velocidade de dev (ver
+[Perfis de compilação](#perfis-de-compilação)). No loop de edição, prefira
+`cargo check` em vez de `cargo build` — faz type/borrow check 2-3x mais rápido:
+
+```bash
+cargo check                    # verificação rápida (sem gerar binário)
+cargo run -- add <torrent>     # executar em modo debug
+cargo watch -c                 # (opcional) re-executa a cada mudança de arquivo
+```
+
+> **Dica:** se `cargo` não estiver no `PATH` do seu shell, adicione
+> `export PATH="$HOME/.cargo/bin:$PATH"`.
+
+### Perfis de compilação
+
+Configurados em `Cargo.toml` para equilibrar velocidade de dev e binários de
+produção otimizados:
+
+```toml
+[profile.dev]
+debug = 0                      # sem debuginfo: builds mais rápidos
+strip = "debuginfo"
+incremental = true
+
+[profile.dev.build-override]
+opt-level = 3                  # acelera proc-macros e build scripts
+
+[profile.dev.package."*"]
+opt-level = 3                  # dependências compiladas com O3 uma vez, cacheadas
+
+[profile.release]
+opt-level = 3
+lto = "fat"                    # otimização em todo o programa
+codegen-units = 1              # máximo de otimização
+panic = "abort"                # elimina overhead de unwinding
+strip = true                   # binário menor
+```
+
+> **Referência:** <https://corrode.dev/blog/tips-for-faster-rust-compile-times>
+
+### Manutenção de dependências
+
+```bash
+cargo update                   # atualiza versões semver-compatíveis
+cargo audit                    # verifica vulnerabilidades
+cargo machete                  # detecta dependências não usadas
+cargo tree --duplicate         # consolida duplicações de versão
+```
+
+## Diretrizes de desenvolvimento
+
+### Padrões e convenções
+
+- **Idioma:** código, mensagens de usuário, documentação e commits em
+  **português do Brasil**.
+- **Código:** Rust com foco em clareza, sem comentários desnecessários e sem
+  `.unwrap()` em caminhos de produção (use `?`/`context()` do `anyhow`).
+- **Erros:** mensagens em letra minúscula, sem pontuação final
+  (`err-10` das convenções Rust).
+- **Async:** nunca segurar `Mutex`/`RwLock` guard atravessando um `.await`;
+  escopos de lock curtos e soltos antes do `.await` (ver `stats_printer`).
+- **UI:** usar `indicatif` para progresso (renderizado em **stderr**) e
+  `crossterm` para eventos de mouse. Linhas impressas fora das barras usam
+  `multi.suspend(|| ...)` via `print_line`.
+- **Build limpo:** `cargo clippy -- -D warnings` deve passar sem warnings.
+
+### Fluxo de trabalho com issues (US)
+
+O projeto usa issues rotuladas como **US (User Stories)** numeradas. Para cada
+US:
+
+1. Criar branch descritiva: `feat/us-NNN-descricao-curta`;
+2. Criar issue com critérios de aceite e testes;
+3. Implementar seguindo os padrões acima e validar com as ferramentas de
+   verificação;
+4. Commit com mensagem descritiva e `Closes #N`;
+5. Push e abrir **Pull Request** com base em `master`;
+6. Merge com squash, mantendo `master` sempre estável.
+
+### API do librqbit (referência rápida)
+
+- `Session::new_with_opts(output_folder, options)` — cria a sessão;
+- `session.add_torrent(AddTorrent, opts)` — adiciona torrent; retorna
+  `AddTorrentResponse::{Added, AlreadyManaged, ListOnly}`;
+- `AddTorrent::from_cli_argument(path)` — aceita magnet, `.torrent` local ou URL;
+- `AddTorrentOptions` — campos chave: `overwrite`, `list_only`, `only_files_regex`,
+  `sub_folder`, `initial_peers`;
+- `ListOnlyResponse` — retorna `info` (metainfo), `only_files`, `output_folder`
+  final e `torrent_bytes` (permite re-adicionar sem re-resolver magnet);
+- `session.with_torrents(|it| ...)` — itera os torrents gerenciados (closure `Fn`);
+- `ManagedTorrent::{id, name, stats, info_hash}` — metadados e estatísticas;
+- `session.pause(&handle)`, `session.clone().unpause(&handle)`,
+  `session.delete(TorrentIdOrHash::Id(id), delete_files)` — controle do torrent.
+
+### Funcionalidades recentes
+
+- **US-006** — Interação por mouse na barra de progresso (`crossterm`).
+- **US-008** — Diretório padrão `~/downloads/torrent-downloads/` e retomada
+  inteligente (completo → reporta; parcial → retoma).
 
 ## Licença
 
