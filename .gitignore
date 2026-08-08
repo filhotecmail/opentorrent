@@ -11,12 +11,11 @@
 # Estado local e credenciais do opencode (Spec Kit)
 .opencode/
 
-# Skills e ferramentas vendorizadas (não versionar)
-/vendor/
+# Spec Kit local (não versionar)
+.specify/
 
-# Estado local do Spec Kit (o restante do .specify é versionado)
-.specify/feature.json
-.specify/extensions/*/local-config.yml
+# Instruções locais do agente (não versionar)
+AGENTS.md
 
 # Logs
 *.log
