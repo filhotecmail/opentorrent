@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     io::{IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -18,8 +18,9 @@ use crossterm::{
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use librqbit::{
-    api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse,
-    ManagedTorrent, Session, SessionOptions, TorrentStatsState,
+    api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, AddTorrentResponse, ByteBufOwned,
+    ListOnlyResponse, ManagedTorrent, Session, SessionOptions, TorrentMetaV1Info,
+    TorrentStatsState,
 };
 use size_format::SizeFormatterBinary as SF;
 use tokio::sync::mpsc;
@@ -52,6 +53,59 @@ fn print_line(multi: &MultiProgress, msg: &str) {
     });
 }
 
+/// The default output folder when `-o` is not provided.
+fn default_output_folder() -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME environment variable is not set")?;
+    Ok(PathBuf::from(home)
+        .join("downloads")
+        .join("torrent-downloads"))
+}
+
+/// Whether the torrent's files already exist in the given output folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingState {
+    /// No file exists on disk yet.
+    Missing,
+    /// At least one file exists, but not all of them are fully downloaded.
+    Partial,
+    /// All files exist and have their expected size.
+    Complete,
+}
+
+fn existing_state(
+    output_folder: &Path,
+    info: &TorrentMetaV1Info<ByteBufOwned>,
+    only_files: Option<&[usize]>,
+) -> anyhow::Result<ExistingState> {
+    let mut any_existing = false;
+    let mut all_complete = true;
+    for (idx, file) in info.iter_file_details()?.enumerate() {
+        if file.attrs().padding {
+            continue;
+        }
+        if let Some(files) = only_files {
+            if !files.contains(&idx) {
+                continue;
+            }
+        }
+        let path = output_folder.join(file.filename.to_pathbuf()?);
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                any_existing = true;
+                if meta.len() < file.len {
+                    all_complete = false;
+                }
+            }
+            Err(_) => all_complete = false,
+        }
+    }
+    Ok(match (any_existing, all_complete) {
+        (false, _) => ExistingState::Missing,
+        (true, true) => ExistingState::Complete,
+        (true, false) => ExistingState::Partial,
+    })
+}
+
 /// OpenTorrent: download torrents and magnet links from the terminal.
 #[derive(Parser)]
 #[command(version, author, about)]
@@ -76,7 +130,7 @@ struct AddOpts {
     #[arg(required = true, value_name = "TORRENT")]
     torrent: Vec<String>,
 
-    /// The output folder to write to. Defaults to the current folder.
+    /// The output folder to write to. Defaults to ~/downloads/torrent-downloads/.
     #[arg(short = 'o', long)]
     output_folder: Option<String>,
 
@@ -177,11 +231,16 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
 
     let session_opts = SessionOptions::default();
 
-    let output_folder = opts
-        .output_folder
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let output_folder = match opts.output_folder.as_deref() {
+        Some(o) => PathBuf::from(o),
+        None => default_output_folder()?,
+    };
+    std::fs::create_dir_all(&output_folder)
+        .with_context(|| format!("error creating output folder {}", output_folder.display()))?;
+    print_line(
+        &multi,
+        &format!("output folder: {}", output_folder.display()),
+    );
     let session = Session::new_with_opts(output_folder, session_opts)
         .await
         .context("error initializing session")?;
@@ -198,24 +257,107 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
     );
 
     let mut added = false;
+    let mut any_handled = false;
     let mut handles = Vec::new();
 
     for torrent in &opts.torrent {
         print_line(&multi, &format!("processing {torrent}..."));
-        let torrent_opts = || AddTorrentOptions {
+        let probe_opts = AddTorrentOptions {
             only_files_regex: opts.only_files_matching_regex.clone(),
-            overwrite: opts.overwrite,
-            list_only: opts.list,
+            list_only: true,
             sub_folder: opts.sub_folder.clone(),
             initial_peers: initial_peers.clone(),
             ..Default::default()
         };
 
+        // Resolve the torrent metainfo (including for magnets, via peers) and
+        // the final output folder, so we can check what already exists on disk.
+        let (info, only_files, output_folder, torrent_bytes) = match session
+            .add_torrent(AddTorrent::from_cli_argument(torrent)?, Some(probe_opts))
+            .await
+        {
+            Ok(AddTorrentResponse::ListOnly(ListOnlyResponse {
+                info,
+                only_files,
+                output_folder,
+                torrent_bytes,
+                ..
+            })) => (info, only_files, output_folder, torrent_bytes),
+            Ok(AddTorrentResponse::AlreadyManaged(id, handle)) => {
+                print_line(
+                    &multi,
+                    &format!("already managed (id={id}, hash={:?})", handle.info_hash()),
+                );
+                any_handled = true;
+                continue;
+            }
+            Ok(_) => unreachable!("list_only can only return ListOnly"),
+            Err(err) => {
+                print_line(&multi, &format!("failed: {err}"));
+                continue;
+            }
+        };
+
+        if opts.list {
+            for (idx, file) in info.iter_file_details()?.enumerate() {
+                let included = match &only_files {
+                    Some(files) => files.contains(&idx),
+                    None => true,
+                };
+                print_line(
+                    &multi,
+                    &format!(
+                        "[{idx}] {:?} ({}){}",
+                        file.filename,
+                        SF::new(file.len),
+                        if included { "" } else { ", will skip" }
+                    ),
+                );
+            }
+            continue;
+        }
+
+        // Smart resume: only start a download when the target files are missing
+        // or incomplete. Fully downloaded torrents are reported and skipped.
+        let existing = existing_state(&output_folder, &info, only_files.as_deref())?;
+        let overwrite = match existing {
+            ExistingState::Complete if opts.overwrite => true,
+            ExistingState::Complete => {
+                print_line(
+                    &multi,
+                    &format!(
+                        "torrent already fully downloaded in {}",
+                        output_folder.display()
+                    ),
+                );
+                any_handled = true;
+                continue;
+            }
+            ExistingState::Partial => {
+                print_line(
+                    &multi,
+                    &format!(
+                        "partial files found in {}, resuming download",
+                        output_folder.display()
+                    ),
+                );
+                true
+            }
+            ExistingState::Missing => opts.overwrite,
+        };
+
+        // Re-add using the already-resolved torrent bytes, so magnets are not
+        // re-resolved, and pin the same output folder that was inspected above.
+        let add_opts = AddTorrentOptions {
+            only_files,
+            overwrite,
+            output_folder: Some(output_folder.to_string_lossy().into_owned()),
+            initial_peers: initial_peers.clone(),
+            ..Default::default()
+        };
+
         match session
-            .add_torrent(
-                AddTorrent::from_cli_argument(torrent)?,
-                Some(torrent_opts()),
-            )
+            .add_torrent(AddTorrent::TorrentFileBytes(torrent_bytes), Some(add_opts))
             .await
         {
             Ok(AddTorrentResponse::AlreadyManaged(id, handle)) => {
@@ -223,36 +365,17 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
                     &multi,
                     &format!("already managed (id={id}, hash={:?})", handle.info_hash()),
                 );
-                continue;
-            }
-            Ok(AddTorrentResponse::ListOnly(ListOnlyResponse {
-                info, only_files, ..
-            })) => {
-                for (idx, file) in info.iter_file_details()?.enumerate() {
-                    let included = match &only_files {
-                        Some(files) => files.contains(&idx),
-                        None => true,
-                    };
-                    print_line(
-                        &multi,
-                        &format!(
-                            "[{idx}] {:?} ({}){}",
-                            file.filename,
-                            SF::new(file.len),
-                            if included { "" } else { ", will skip" }
-                        ),
-                    );
-                }
-                continue;
+                any_handled = true;
             }
             Ok(AddTorrentResponse::Added(_, handle)) => {
                 print_line(&multi, &format!("added, hash={:?}", handle.info_hash()));
                 added = true;
+                any_handled = true;
                 handles.push(handle);
             }
+            Ok(_) => unreachable!("re-add with overwrite can only return Added or AlreadyManaged"),
             Err(err) => {
                 print_line(&multi, &format!("failed: {err}"));
-                continue;
             }
         }
     }
@@ -262,6 +385,10 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
     }
 
     if !added {
+        if any_handled {
+            print_line(&multi, "nothing to download, all torrents already handled");
+            return Ok(());
+        }
         bail!("no torrents were added");
     }
 
