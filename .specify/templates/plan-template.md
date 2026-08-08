@@ -42,6 +42,34 @@
 
 [Gates determined based on constitution file]
 
+## Rust Skills Check
+
+*GATE: Must pass before Phase 0 research (all Rust design/implementation).*
+
+Antes de definir arquitetura, tipos, ownership/borrowing, concorrência ou
+escolha de crates, consulte as **Rust Skills** (`vendor/rust-skills/`, carregadas
+via `.opencode/opencode.json` → `skills.paths`):
+
+1. Rode o `rust-router` e identifique a camada de entrada (Domínio → Design →
+   Mecânica) e a skill correta.
+2. Consulte as skills da camada indicada:
+   - Mecânica: `m01-ownership`, `m02-resource`, `m03-mutability`,
+     `m04-zero-cost`, `m05-type-driven`, `m06-error-handling`, `m07-concurrency`.
+   - Design: `m09-domain`, `m10-performance`, `m11-ecosystem`, `m12-lifecycle`,
+     `m13-domain-error`, `m14-mental-model`, `m15-anti-pattern`.
+   - Domínio: `domain-cli` (este projeto), `domain-web`, `domain-fintech`,
+     `domain-ml`, `domain-iot`, `domain-embedded`, `domain-cloud-native`.
+   - Transversais: `coding-guidelines` (P.NAM/P.FMT/P.ERR), `unsafe-checker`,
+     `rust-learner`.
+3. Aplique o **framework de meta-cognição** (não responda sintomas com remendos
+   superficiais — trace a causa pelas camadas).
+
+Registre abaixo as skills consultadas e as decisões de design derivadas:
+
+| Skill consultada | Camada | Decisão/Impacto no design |
+|------------------|--------|---------------------------|
+| [ex.: m01-ownership] | [1] | [ex.: dados compartilhados via `Arc<T>` em vez de `clone()`] |
+
 ## Project Structure
 
 ### Documentation (this feature)
