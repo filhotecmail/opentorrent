@@ -126,19 +126,65 @@ struct Layout {
     show_actions: bool,
 }
 
-/// Uma célula do buffer de tela (double buffering): um caractere + cor de
-/// primeiro plano opcional (`None` = cor padrão do terminal).
+/// Uma célula do buffer de tela (double buffering): um caractere + cores de
+/// primeiro plano e de fundo opcionais (`None` = cor padrão do terminal).
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Cell {
     ch: char,
     fg: Option<Color>,
+    bg: Option<Color>,
 }
 
 impl Cell {
     fn blank() -> Self {
-        Cell { ch: ' ', fg: None }
+        Cell {
+            ch: ' ',
+            fg: None,
+            bg: None,
+        }
     }
 }
+
+/// Paleta unificada do tema escuro profissional (US-019).
+#[derive(Clone, Copy, Debug)]
+struct Theme {
+    /// Cor das bordas de blocos/quadros.
+    border: Color,
+    /// Texto primário (branco/prata).
+    text: Color,
+    /// Acento/destaque (ciano).
+    accent: Color,
+    /// Sucesso / downloads completos (verde).
+    success: Color,
+    /// Avisos (amarelo).
+    warning: Color,
+    /// Erros (vermelho).
+    error: Color,
+    /// Texto secundário/dicas (cinza).
+    muted: Color,
+    /// Fundo do item ativo selecionado (highlight background).
+    highlight_bg: Color,
+    /// Fundo do Header fixo.
+    header_bg: Color,
+    /// Fundo do Footer fixo.
+    footer_bg: Color,
+    /// Fundo do overlay do modal (escurece a tela principal).
+    overlay_bg: Color,
+}
+
+const THEME: Theme = Theme {
+    border: Color::DarkGrey,
+    text: Color::White,
+    accent: Color::Cyan,
+    success: Color::Green,
+    warning: Color::Yellow,
+    error: Color::Red,
+    muted: Color::DarkGrey,
+    highlight_bg: Color::DarkBlue,
+    header_bg: Color::Blue,
+    footer_bg: Color::DarkGrey,
+    overlay_bg: Color::DarkGrey,
+};
 
 /// Buffer de tela (US-016): o render desenha o estado atual neste buffer e, ao
 /// aplicar o frame, apenas as células alteradas em relação ao frame anterior
@@ -176,11 +222,16 @@ impl Frame {
     /// (`cyan = true`); fora dos limites é ignorado.
     fn put(&mut self, row: u16, col: u16, text: &str, cyan: bool) {
         let fg = if cyan { Some(Color::Cyan) } else { None };
-        self.put_colored(row, col, text, fg);
+        self.put_styled(row, col, text, fg, None);
     }
 
     /// Escreve um texto com uma cor de primeiro plano explícita.
     fn put_colored(&mut self, row: u16, col: u16, text: &str, fg: Option<Color>) {
+        self.put_styled(row, col, text, fg, None);
+    }
+
+    /// Escreve um texto com cores de primeiro plano e de fundo explícitas.
+    fn put_styled(&mut self, row: u16, col: u16, text: &str, fg: Option<Color>, bg: Option<Color>) {
         for (col, ch) in (col..).zip(text.chars()) {
             if row >= self.rows || col >= self.cols {
                 return;
@@ -189,6 +240,49 @@ impl Frame {
             let cell = &mut self.grid[idx];
             cell.ch = ch;
             cell.fg = fg;
+            cell.bg = bg;
+        }
+    }
+
+    /// Preenche uma região retangular do buffer com um caractere e cores.
+    fn fill(
+        &mut self,
+        row: u16,
+        col: u16,
+        width: u16,
+        ch: char,
+        fg: Option<Color>,
+        bg: Option<Color>,
+    ) {
+        if row >= self.rows {
+            return;
+        }
+        // Índice base calculado fora do laço: `self.index` empresta `self`
+        // imutavelmente, então o acesso mutável à grid usa o índice direto.
+        let base = self.index(row, 0);
+        let end = (col as usize + width as usize).min(self.cols as usize);
+        for idx in col as usize..end {
+            let cell = &mut self.grid[base + idx];
+            cell.ch = ch;
+            cell.fg = fg;
+            cell.bg = bg;
+        }
+    }
+
+    /// Preenche uma região retangular (várias linhas) do buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_rect(
+        &mut self,
+        row: u16,
+        col: u16,
+        height: u16,
+        width: u16,
+        ch: char,
+        fg: Option<Color>,
+        bg: Option<Color>,
+    ) {
+        for r in row..row.saturating_add(height) {
+            self.fill(r, col, width, ch, fg, bg);
         }
     }
 
@@ -218,23 +312,26 @@ impl Frame {
                     col += 1;
                     continue;
                 }
-                // run contíguo de células alteradas com a mesma cor
+                // run contíguo de células alteradas com as mesmas cores
                 let start = col;
                 let mut run = String::new();
                 while col < self.cols {
                     let c = self.cell(row, col);
-                    if c == prev.cell(row, col) || c.fg != cur.fg {
+                    if c == prev.cell(row, col) || c.fg != cur.fg || c.bg != cur.bg {
                         break;
                     }
                     run.push(c.ch);
                     col += 1;
                 }
                 queue!(w, cursor::MoveTo(start, row))?;
+                if let Some(bg) = cur.bg {
+                    queue!(w, style::SetBackgroundColor(bg))?;
+                }
                 if let Some(color) = cur.fg {
                     queue!(w, style::SetForegroundColor(color))?;
                 }
                 queue!(w, style::Print(run))?;
-                if cur.fg.is_some() {
+                if cur.bg.is_some() || cur.fg.is_some() {
                     queue!(w, style::ResetColor)?;
                 }
             }
@@ -875,23 +972,22 @@ impl Tui {
         self.drain_pending_notices();
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
 
-        // US-016 (double buffering): o estado atual é desenhado no buffer e,
-        // ao aplicar, apenas as células alteradas em relação ao frame anterior
-        // são reescritas no terminal. O clear total só acontece no primeiro
-        // frame, em redimensionamento ou quando quase tudo mudou (troca de
-        // view) — nunca a cada iteração do laço.
+        // US-019 (redesign): a tela é estruturada em três seções fixas —
+        // Header (topo), Body (conteúdo) e Footer (atalhos/status).
         let mut frame = Frame::new(cols, rows);
+        self.render_header(&mut frame, cols);
+
+        let body_top = 1u16;
+        let body_height = rows.saturating_sub(2).max(1);
         match self.view {
-            View::Title => self.render_title(&mut frame, cols, rows),
-            View::Menu => self.render_menu(&mut frame, cols, rows),
-            View::Session => self.render_session(&mut frame, cols, rows),
-            View::Include => self.render_include(&mut frame, cols, rows),
-            View::Completed => self.render_completed(&mut frame, cols, rows),
+            View::Title => self.render_title(&mut frame, cols, body_top, body_height),
+            View::Menu => self.render_menu(&mut frame, cols, body_top, body_height),
+            View::Session => self.render_session(&mut frame, cols, body_top, body_height),
+            View::Include => self.render_include(&mut frame, cols, body_top, body_height),
+            View::Completed => self.render_completed(&mut frame, cols, body_top, body_height),
         }
 
-        if let Some(notice) = &self.notice {
-            frame.put_colored(rows.saturating_sub(1), 1, notice, Some(Color::DarkYellow));
-        }
+        self.render_footer(&mut frame, cols, rows);
 
         let total = cols as usize * rows as usize;
         let needs_full = match &self.prev_frame {
@@ -928,7 +1024,7 @@ impl Tui {
         Ok(())
     }
 
-    fn render_title(&self, frame: &mut Frame, cols: u16, rows: u16) {
+    fn render_title(&self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
         let mut lines: Vec<String> = Vec::new();
         for line in BANNER.iter() {
             lines.push(line.to_string());
@@ -943,13 +1039,66 @@ impl Tui {
         lines.push(String::new());
         lines.push("atalhos: A adicionar | C acompanhar | L listar | S sair".into());
 
-        let highlighted: Vec<usize> = (0..5).collect();
-        self.centered_write(frame, lines, cols, rows, &highlighted);
+        // Elemento ativo da tela inicial: a linha de boas-vindas recebe o
+        // highlight de fundo (US-019).
+        let highlighted: Vec<usize> = vec![6];
+        self.centered_write(frame, lines, cols, body_top, body_height, &highlighted);
     }
 
-    fn render_menu(&mut self, frame: &mut Frame, cols: u16, rows: u16) {
-        // Interface de navegação delimitada pelo quadro com bordas duplas.
-        let (left, top, width, height) = frame_rect(cols, rows);
+    /// Header fixo (US-019): título + versão à esquerda, view atual à direita.
+    fn render_header(&self, frame: &mut Frame, cols: u16) {
+        let version = env!("CARGO_PKG_VERSION");
+        let title = format!(" OpenTorrent v{version} ");
+        frame.put_styled(0, 0, &title, Some(THEME.text), Some(THEME.header_bg));
+
+        let label = view_label(&self.view);
+        let label_text = format!(" {label} ");
+        let label_col = cols.saturating_sub(label_text.chars().count() as u16);
+        frame.put_styled(
+            0,
+            label_col,
+            &label_text,
+            Some(THEME.accent),
+            Some(THEME.header_bg),
+        );
+
+        // Preenche o restante do header com o fundo do tema (padding padrão).
+        frame.fill(
+            0,
+            title.chars().count() as u16,
+            cols.saturating_sub(title.chars().count() as u16),
+            ' ',
+            None,
+            Some(THEME.header_bg),
+        );
+    }
+
+    /// Footer fixo (US-019): atalhos da view à esquerda e notice/status à
+    /// direita, com fundo do tema.
+    fn render_footer(&self, frame: &mut Frame, cols: u16, rows: u16) {
+        let row = rows.saturating_sub(1);
+        frame.fill(row, 0, cols, ' ', None, Some(THEME.footer_bg));
+
+        let hints = footer_hints(&self.view);
+        frame.put_styled(row, 1, hints, Some(THEME.muted), Some(THEME.footer_bg));
+
+        if let Some(notice) = &self.notice {
+            // Erros em vermelho, avisos em amarelo (paleta unificada).
+            let color = if notice.starts_with("erro") {
+                THEME.error
+            } else {
+                THEME.warning
+            };
+            let text = format!(" {notice} ");
+            let col = cols.saturating_sub(text.chars().count() as u16);
+            frame.put_styled(row, col, &text, Some(color), Some(THEME.footer_bg));
+        }
+    }
+
+    fn render_menu(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
+        // Interface de navegação delimitada pelo quadro com bordas duplas,
+        // contida na região do Body (entre Header e Footer).
+        let (left, top, width, height) = body_frame(cols, body_top, body_height);
         let content_left = left + 2;
         let inner_width = (width as usize).saturating_sub(4);
 
@@ -970,7 +1119,7 @@ impl Tui {
 
         let content_top = center_content_top(top, height, lines.len());
 
-        // O destaque colorido acompanha exatamente a linha com o cursor
+        // O destaque (fundo + texto) acompanha exatamente a linha com o cursor
         // `> ... <` (itens começam na linha `MENU_ITEMS_OFFSET`).
         let mut highlighted = vec![0usize];
         highlighted.push(MENU_ITEMS_OFFSET + self.menu_index);
@@ -995,7 +1144,9 @@ impl Tui {
         });
     }
 
-    fn render_session(&mut self, frame: &mut Frame, cols: u16, rows: u16) {
+    /// Renderiza a sessão como uma tabela estruturada com colunas alinhadas
+    /// (US-019): ID, PROGRESSO, STATUS, NOME e AÇÕES.
+    fn render_session(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
         let rows_data = self.session_rows();
         let pending = self.pending.lock().unwrap().clone();
         let mut lines: Vec<String> = Vec::new();
@@ -1012,13 +1163,24 @@ impl Tui {
         } else {
             ROW_INFO_WIDTH.min(cols.saturating_sub(2)) as usize
         };
-        let name_max = info_width.saturating_sub(31);
+        let name_width = info_width.saturating_sub(31);
+
+        // Cabeçalho + separador da tabela (colunas alinhadas).
+        lines.push(session_table_header(name_width, show_actions));
+        lines.push("─".repeat(
+            info_width
+                + if show_actions {
+                    1 + ACTIONS_WIDTH as usize
+                } else {
+                    0
+                },
+        ));
 
         if rows_data.is_empty() && pending.is_empty() {
             lines.push("nenhum torrent na fila".into());
         } else {
             for (idx, row) in rows_data.iter().enumerate() {
-                let marker = if idx == self.row_index { ">" } else { " " };
+                let marker = if idx == self.row_index { "> " } else { "  " };
                 let state = if row.finished {
                     "concluído"
                 } else {
@@ -1038,77 +1200,57 @@ impl Tui {
                     row.state,
                     TorrentStatsState::Paused | TorrentStatsState::Error
                 );
-                // Parte informativa com largura fixa (id em 4 dígitos) para que
-                // a coluna dos botões permaneça estável entre as linhas.
-                let info = format!(
-                    "{} [{:>4}] {:>5.1}%  {:<11}  {}",
+                let actions = if show_actions {
+                    Some(actions_string(paused))
+                } else {
+                    None
+                };
+                lines.push(session_table_line(
                     marker,
-                    row.id.min(9999),
+                    row.id,
                     pct,
                     state,
-                    Self::truncate(&row.name, name_max),
-                );
-                let line = if show_actions {
-                    format!(
-                        "{:<width$} {actions}",
-                        info,
-                        width = info_width,
-                        actions = actions_string(paused),
-                    )
-                } else {
-                    format!("{:<width$}", info, width = info_width)
-                };
-                lines.push(line);
+                    &row.name,
+                    name_width,
+                    actions.as_deref(),
+                ));
             }
 
             // Origens adicionadas em segundo plano, ainda sem handle.
             let mut idx = rows_data.len();
             for pt in &pending {
-                let marker = if idx == self.row_index { ">" } else { " " };
+                let marker = if idx == self.row_index { "> " } else { "  " };
                 let (state, detail) = match &pt.status {
                     PendingStatus::Resolving => ("inicializando", ""),
                     PendingStatus::Error(err) => ("erro", err.as_str()),
                     PendingStatus::Done(_) => continue, // já consumido no render
                 };
-                let mut info = format!(
-                    "{} [  —] {:>5.1}%  {:<11}  {}",
-                    marker,
-                    0.0,
-                    state,
-                    Self::truncate(&pt.source, name_max),
-                );
+                let mut line =
+                    session_table_line(marker, 0, 0.0, state, &pt.source, name_width, None);
                 if !detail.is_empty() {
-                    info = format!("{info} — {}", Self::truncate(detail, 28));
+                    line = Self::truncate(
+                        &format!("{line} — {}", Self::truncate(detail, 28)),
+                        info_width,
+                    );
                 }
-                // Mantém uma linha por entrada e o alinhamento das colunas.
-                let info = Self::truncate(&info, info_width);
-                let line = if show_actions {
-                    format!(
-                        "{:<pad$}",
-                        info,
-                        pad = info_width + 1 + ACTIONS_WIDTH as usize
-                    )
-                } else {
-                    format!("{:<width$}", info, width = info_width)
-                };
                 lines.push(line);
                 idx += 1;
             }
         }
 
         lines.push(String::new());
-        lines.push("[P] pausar  [R] retomar  [X] remover  [A/+] adicionar  [Esc] voltar".into());
         if let Some(notice) = &self.notice {
             lines.push(notice.clone());
         }
 
-        // Highlight the selected row (index 2 + row_index) and the title. Cada
-        // entrada (sessão ou pendente) ocupa exatamente uma linha.
+        // Highlight a linha selecionada. Estrutura das linhas:
+        // 0 título, 1 vazio, 2 cabeçalho, 3 separador, 4+ entradas.
         let mut highlighted = vec![0usize];
         if !rows_data.is_empty() || !pending.is_empty() {
-            highlighted.push(2 + self.row_index);
+            highlighted.push(4 + self.row_index);
         }
-        let (left, top) = self.centered_write(frame, lines, cols, rows, &highlighted);
+        let (left, top) =
+            self.centered_write(frame, lines, cols, body_top, body_height, &highlighted);
 
         // Registra a geometria para o mapeamento de cliques do mouse.
         let total_rows = rows_data.len() + pending.len();
@@ -1118,7 +1260,7 @@ impl Tui {
             self.layout = Some(Layout {
                 top,
                 left,
-                rows_offset: 2,
+                rows_offset: 4,
                 row_count: total_rows,
                 info_width: info_width as u16,
                 show_actions,
@@ -1126,10 +1268,20 @@ impl Tui {
         }
     }
 
-    fn render_include(&mut self, frame: &mut Frame, cols: u16, rows: u16) {
-        // Interface de entrada delimitada pelo quadro com bordas duplas, com a
-        // área amostrada fixada na equivalência de 1024x768 (128x48 células).
-        let (left, top, width, height) = frame_rect(cols, rows);
+    fn render_include(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
+        // US-019: o formulário de adição é um Modal centralizado sobreposto à
+        // tela principal — o Body é escurecido (overlay) e o diálogo com
+        // bordas duplas é desenhado por cima, contido entre Header e Footer.
+        frame.fill_rect(
+            body_top,
+            0,
+            body_height,
+            cols,
+            ' ',
+            None,
+            Some(THEME.overlay_bg),
+        );
+        let (left, top, width, height) = body_frame(cols, body_top, body_height);
         let content_left = left + 2;
         let inner_width = (width as usize).saturating_sub(4);
 
@@ -1281,9 +1433,10 @@ impl Tui {
         frame.set_cursor(cursor_row, cursor_col);
     }
 
-    fn render_completed(&mut self, frame: &mut Frame, cols: u16, rows: u16) {
-        // Consistência visual: a listagem também fica dentro do quadro.
-        let (left, top, width, height) = frame_rect(cols, rows);
+    fn render_completed(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
+        // Consistência visual: a listagem também fica dentro do quadro,
+        // contida na região do Body (entre Header e Footer).
+        let (left, top, width, height) = body_frame(cols, body_top, body_height);
         let content_left = left + 2;
         let inner_width = (width as usize).saturating_sub(4);
 
@@ -1300,11 +1453,17 @@ impl Tui {
             }
         };
 
-        if items.is_empty() {
+        // Texto de cada download completo (em verde na paleta unificada).
+        let item_texts: Vec<String> = items
+            .iter()
+            .map(|item| Self::truncate(&format_completed(item), inner_width))
+            .collect();
+
+        if item_texts.is_empty() {
             lines.push("nenhum download completo".into());
         } else {
-            for item in &items {
-                lines.push(format_completed(item));
+            for text in &item_texts {
+                lines.push(text.clone());
             }
         }
 
@@ -1318,7 +1477,8 @@ impl Tui {
 
         let mut highlighted = vec![0usize];
         if items.is_empty() {
-            highlighted.push(2);
+            // Destaque o estado vazio (linha 3 = "nenhum download completo").
+            highlighted.push(3);
         }
         draw_box(frame, left, top, width, height);
         write_boxed_lines(
@@ -1329,16 +1489,34 @@ impl Tui {
             &highlighted,
             height,
         );
+
+        // Downloads completos em verde (acento de sucesso da paleta, US-019).
+        let max_lines = (height as usize).saturating_sub(3);
+        let items_start = content_top + 3;
+        for (i, text) in item_texts
+            .iter()
+            .take(max_lines.saturating_sub(3))
+            .enumerate()
+        {
+            frame.put_colored(
+                items_start + i as u16,
+                content_left,
+                text,
+                Some(THEME.success),
+            );
+        }
     }
 
-    /// Desenha as linhas centralizadas no buffer e retorna a geometria usada
-    /// `(left, top)` (para o mapeamento de cliques).
+    /// Desenha as linhas centralizadas no buffer dentro da região do Body e
+    /// retorna a geometria usada `(left, top)` (para o mapeamento de cliques).
+    /// A linha selecionada recebe fundo de destaque (highlight background).
     fn centered_write(
         &self,
         frame: &mut Frame,
         lines: Vec<String>,
         cols: u16,
-        rows: u16,
+        body_top: u16,
+        body_height: u16,
         highlighted: &[usize],
     ) -> (u16, u16) {
         let width = lines
@@ -1346,16 +1524,18 @@ impl Tui {
             .map(|l| l.chars().count() as u16)
             .max()
             .unwrap_or(0);
-        let top = (rows.saturating_sub(lines.len() as u16)) / 2;
+        let top = body_top.saturating_add(body_height.saturating_sub(lines.len() as u16) / 2);
         let left = cols.saturating_sub(width) / 2;
 
         for (idx, line) in lines.iter().enumerate() {
-            frame.put(
-                top.saturating_add(idx as u16),
-                left,
-                line,
-                highlighted.contains(&idx),
-            );
+            let row = top.saturating_add(idx as u16);
+            if highlighted.contains(&idx) {
+                // Highlight background: fundo + texto de alto contraste.
+                frame.fill(row, left, width, ' ', None, Some(THEME.highlight_bg));
+                frame.put_styled(row, left, line, Some(THEME.text), Some(THEME.highlight_bg));
+            } else {
+                frame.put(row, left, line, false);
+            }
         }
         (left, top)
     }
@@ -1382,6 +1562,68 @@ fn menu_item_line(idx: usize, selected: bool) -> String {
             MENU_SHORTCUTS[idx].to_ascii_uppercase(),
             MENU_ITEMS[idx]
         )
+    }
+}
+
+/// Cabeçalho da tabela estruturada da sessão (US-019): colunas alinhadas
+/// ID/PROGRESSO/STATUS/NOME, com a coluna AÇÕES apenas quando há espaço para
+/// renderizar os botões à direita.
+fn session_table_header(name_width: usize, show_actions: bool) -> String {
+    let mut line = format!(
+        "  {:<4} {:<9} {:<13} {:<name_width$}",
+        "ID", "PROGRESSO", "STATUS", "NOME"
+    );
+    if show_actions {
+        line.push_str(&format!(
+            " {:<width$}",
+            "AÇÕES",
+            width = ACTIONS_WIDTH as usize
+        ));
+    }
+    line
+}
+
+/// Linha de dados da tabela estruturada da sessão (US-019). Todas as colunas
+/// permanecem perfeitamente alinhadas entre si: marcador + ID, progresso,
+/// status, nome (truncado para `name_width`) e, opcionalmente, os botões de
+/// ação.
+fn session_table_line(
+    marker: &str,
+    id: usize,
+    pct: f64,
+    state: &str,
+    name: &str,
+    name_width: usize,
+    actions: Option<&str>,
+) -> String {
+    let name = Tui::truncate(name, name_width);
+    let mut line = format!("{marker}{id:>4} {pct:>8.1}% {state:<13} {name:<name_width$}");
+    if let Some(actions) = actions {
+        line.push(' ');
+        line.push_str(actions);
+    }
+    line
+}
+
+/// Rótulo da view atual, exibido no canto direito do Header (US-019).
+fn view_label(view: &View) -> &'static str {
+    match view {
+        View::Title => "INÍCIO",
+        View::Menu => "MENU",
+        View::Session => "SESSÃO",
+        View::Include => "ADICIONAR",
+        View::Completed => "COMPLETOS",
+    }
+}
+
+/// Atalhos da view atual, exibidos no lado esquerdo do Footer (US-019).
+fn footer_hints(view: &View) -> &'static str {
+    match view {
+        View::Title => "digite / para abrir o menu",
+        View::Menu => "↑/↓ ou j/k navegar · Enter selecionar · Esc voltar",
+        View::Session => "[P] pausar  [R] retomar  [X] remover  [A/+] adicionar  [Esc] voltar",
+        View::Include => "Enter confirmar · Esc cancelar",
+        View::Completed => "Esc voltar ao menu",
     }
 }
 
@@ -1432,6 +1674,15 @@ fn frame_rect(cols: u16, rows: u16) -> (u16, u16, u16, u16) {
     (left, top, width, height)
 }
 
+/// Dimensões do quadro do Body (US-019): mesma equivalência 1024x768, porém
+/// contido entre o Header (topo) e o Footer (base), com margem lateral de 2
+/// caracteres e centralizado na área disponível.
+fn body_frame(cols: u16, body_top: u16, body_height: u16) -> (u16, u16, u16, u16) {
+    let (left, rel_top, width, height) = frame_rect(cols, body_height);
+    let top = body_top.saturating_add(rel_top);
+    (left, top, width, height)
+}
+
 /// Linhas superior e inferior do quadro (bordas duplas).
 fn frame_top_bottom(width: u16) -> (String, String) {
     let inner = "═".repeat(width.saturating_sub(2) as usize);
@@ -1446,15 +1697,16 @@ fn center_content_top(frame_top: u16, frame_height: u16, line_count: usize) -> u
     frame_top + 1 + (spare / 2) as u16
 }
 
-/// Desenha o quadro com bordas duplas no buffer, centralizado.
+/// Desenha o quadro com bordas duplas no buffer, centralizado, usando a cor
+/// de borda da paleta unificada (US-019).
 fn draw_box(frame: &mut Frame, left: u16, top: u16, width: u16, height: u16) {
     let (top_line, bottom_line) = frame_top_bottom(width);
-    frame.put(top, left, &top_line, false);
+    frame.put_colored(top, left, &top_line, Some(THEME.border));
     for row in top + 1..top + height - 1 {
-        frame.put(row, left, "║", false);
-        frame.put(row, left + width - 1, "║", false);
+        frame.put_colored(row, left, "║", Some(THEME.border));
+        frame.put_colored(row, left + width - 1, "║", Some(THEME.border));
     }
-    frame.put(top + height - 1, left, &bottom_line, false);
+    frame.put_colored(top + height - 1, left, &bottom_line, Some(THEME.border));
 }
 
 /// Escreve linhas de conteúdo dentro do quadro no buffer, destacando as
@@ -1846,5 +2098,102 @@ mod tests {
         // fora da área dos botões
         assert_eq!(action_button_at(29), None);
         assert_eq!(action_button_at(100), None);
+    }
+
+    #[test]
+    fn body_frame_keeps_box_inside_body_region() {
+        // Body de 46 linhas entre Header e Footer: o quadro usa a equivalência
+        // 1024x768 limitada ao corpo e centralizada.
+        let (left, top, width, height) = body_frame(128, 1, 46);
+        assert_eq!(width, 126); // 128 - 2 (margem lateral de 1 char)
+        assert_eq!(height, 44); // 46 - 2 (margens do Body)
+        assert_eq!(left, 1);
+        assert_eq!(top, 2); // centralizado: 1 + (46 - 44) / 2
+        assert!(top + height <= 1 + 46);
+    }
+
+    #[test]
+    fn body_frame_shrinks_on_tiny_terminal() {
+        let (left, top, width, height) = body_frame(40, 1, 20);
+        assert!(width <= 38);
+        assert!(height <= 18);
+        assert!(top >= 1);
+        assert!(left + width <= 40);
+    }
+
+    #[test]
+    fn session_table_line_aligns_columns() {
+        let line = session_table_line("> ", 1, 42.5, "em andamento", "arquivo.iso", 12, None);
+        // marcador + ID
+        assert_eq!(&line[0..6], ">    1");
+        // progresso right-aligned em 8 chars + %
+        assert_eq!(&line[7..16], "    42.5%");
+        // status alinhado à esquerda em 13 (com o padding)
+        assert_eq!(&line[17..30], "em andamento ");
+        // nome truncado para name_width
+        assert_eq!(line.chars().count(), 31 + 12);
+        assert!(line.contains("arquivo.iso"));
+    }
+
+    #[test]
+    fn session_table_line_truncates_long_names() {
+        let line = session_table_line("  ", 2, 100.0, "concluído", "nome-muito-longo", 8, None);
+        assert!(line.contains("nome-mu…"));
+        assert_eq!(line.chars().count(), 31 + 8);
+    }
+
+    #[test]
+    fn session_table_line_appends_actions_when_provided() {
+        let line = session_table_line(
+            "  ",
+            3,
+            0.0,
+            "pausado",
+            "x",
+            10,
+            Some("[Retomar] [Parar  ] [Excluir]"),
+        );
+        assert_eq!(line.chars().count(), 31 + 10 + 1 + ACTIONS_WIDTH as usize);
+        assert!(line.ends_with("[Excluir]"));
+    }
+
+    #[test]
+    fn session_table_header_matches_data_width() {
+        let header = session_table_header(12, true);
+        let data = session_table_line(
+            "  ",
+            1,
+            0.0,
+            "erro",
+            "abc",
+            12,
+            Some("[Pausar ] [Parar  ] [Excluir]"),
+        );
+        assert_eq!(header.chars().count(), data.chars().count());
+        assert!(header.starts_with("  ID"));
+        assert!(header.contains("AÇÕES"));
+    }
+
+    #[test]
+    fn frame_fill_sets_cells_and_colors() {
+        let mut f = Frame::new(10, 4);
+        f.fill(2, 3, 5, ' ', None, Some(Color::DarkGrey));
+        assert_eq!(f.cell(2, 2).bg, None);
+        assert_eq!(f.cell(2, 3).bg, Some(Color::DarkGrey));
+        assert_eq!(f.cell(2, 7).bg, Some(Color::DarkGrey));
+        assert_eq!(f.cell(2, 8).bg, None);
+    }
+
+    #[test]
+    fn frame_fill_rect_covers_multiple_rows() {
+        let mut f = Frame::new(8, 6);
+        f.fill_rect(1, 1, 3, 4, 'x', None, Some(Color::DarkGrey));
+        for row in 1..4 {
+            for col in 1..5 {
+                assert_eq!(f.cell(row, col).ch, 'x');
+            }
+        }
+        assert_eq!(f.cell(0, 1).ch, ' ');
+        assert_eq!(f.cell(4, 1).ch, ' ');
     }
 }
