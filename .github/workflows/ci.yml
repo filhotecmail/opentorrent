@@ -41,6 +41,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Instalar dependências de sistema
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev
+
       - name: Lint com clippy (-D warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -55,6 +58,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Instalar dependências de sistema
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev
 
       - name: Compilar testes (sem rodar)
         run: cargo test --locked --all-targets --no-run
@@ -71,6 +77,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Instalar dependências de sistema
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev
 
       - name: Instalar cargo-machete
         uses: taiki-e/install-action@cargo-machete
