@@ -1,7 +1,7 @@
 use std::{
     io::{self, Write},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -16,9 +16,7 @@ use crossterm::{
     style::{self, Color},
     terminal,
 };
-use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, TorrentStatsState,
-};
+use librqbit::{AddTorrent, AddTorrentResponse, ManagedTorrent, Session, TorrentStatsState};
 use tokio::sync::mpsc;
 
 use crate::downloads::{format_completed, list_completed_downloads};
@@ -80,6 +78,31 @@ struct SessionRow {
     handle: Arc<ManagedTorrent>,
 }
 
+/// Status de uma origem adicionada em segundo plano (US-014).
+#[derive(Clone, Debug)]
+enum PendingStatus {
+    /// A origem está sendo resolvida/adicionada em background.
+    Resolving,
+    /// Falhou ao resolver/adicionar; a mensagem é exibida na linha.
+    Error(String),
+    /// Terminou com um aviso (ex.: já gerenciado); consumido como notice.
+    Done(String),
+}
+
+/// Uma origem adicionada de forma assíncrona, ainda não presente na sessão.
+#[derive(Clone, Debug)]
+struct PendingTorrent {
+    source: String,
+    status: PendingStatus,
+}
+
+/// Resultado da adição em segundo plano.
+#[derive(Debug)]
+enum AddOutcome {
+    Added,
+    AlreadyManaged,
+}
+
 /// Geometria do último render, usada para mapear cliques do mouse para ações.
 /// Recalculada a cada frame, considerando o tamanho atual do terminal.
 #[derive(Clone, Copy, Debug)]
@@ -122,6 +145,8 @@ struct Tui {
     keys: mpsc::UnboundedReceiver<Event>,
     /// Geometria do último render (usada para mapear cliques do mouse).
     layout: Option<Layout>,
+    /// Origens adicionadas em segundo plano, compartilhadas com as tasks.
+    pending: Arc<Mutex<Vec<PendingTorrent>>>,
     running: bool,
 }
 
@@ -145,6 +170,7 @@ impl Tui {
             notice: None,
             keys,
             layout: None,
+            pending: Arc::new(Mutex::new(Vec::new())),
             running: true,
         }
     }
@@ -280,7 +306,7 @@ impl Tui {
         match key.code {
             KeyCode::Enter => {
                 self.typing = false;
-                self.add_included().await?;
+                self.submit_include();
             }
             KeyCode::Esc => {
                 self.typing = false;
@@ -551,13 +577,15 @@ impl Tui {
     }
 
     fn move_row(&mut self, delta: isize) {
+        // A navegação considera também as origens pendentes (adição assíncrona).
         let rows = self.session_rows();
-        if rows.is_empty() {
+        let pending = self.pending.lock().unwrap().len();
+        let total = rows.len() + pending;
+        if total == 0 {
             self.row_index = 0;
             return;
         }
-        let len = rows.len() as isize;
-        let next = (self.row_index as isize + delta).rem_euclid(len);
+        let next = (self.row_index as isize + delta).rem_euclid(total as isize);
         self.row_index = next as usize;
     }
 
@@ -617,94 +645,78 @@ impl Tui {
         Ok(())
     }
 
-    async fn add_included(&mut self) -> anyhow::Result<()> {
+    /// Submete a origem digitada de forma assíncrona (US-014): valida apenas a
+    /// sintaxe, registra a requisição e transiciona imediatamente para a tela
+    /// de acompanhamento. A resolução de metadados e as conexões de rede rodam
+    /// em uma task em background, mantendo a interface responsiva.
+    fn submit_include(&mut self) {
         let source = self.include_input.trim().to_string();
+        self.include_input.clear();
+        self.input_cursor_pos = 0;
+        self.notice = None;
+
         if source.is_empty() {
             self.notice = Some("informe uma origem (magnet, .torrent ou URL)".into());
-            return Ok(());
+            return;
         }
 
-        self.notice = Some("resolvendo origem...".into());
-        let add = AddTorrent::from_cli_argument(&source)
-            .with_context(|| format!("origem inválida: {source}"));
-        let add = match add {
-            Ok(add) => add,
-            Err(err) => {
-                self.notice = Some(format!("origem inválida: {err:#}"));
-                return Ok(());
-            }
-        };
-
-        // Probe with list_only to resolve magnets and learn the output folder.
-        let probe_opts = AddTorrentOptions {
-            list_only: true,
-            ..Default::default()
-        };
-
-        let result = self.session.add_torrent(add, Some(probe_opts)).await;
-
-        let (info, only_files, output_folder, torrent_bytes) = match result {
-            Ok(AddTorrentResponse::ListOnly(l)) => {
-                (l.info, l.only_files, l.output_folder, l.torrent_bytes)
-            }
-            Ok(AddTorrentResponse::AlreadyManaged(id, handle)) => {
-                self.notice = Some(format!(
-                    "já gerenciado (id={id}, hash={:?})",
-                    handle.info_hash()
-                ));
-                return Ok(());
-            }
-            Ok(_) => unreachable!("list_only can only return ListOnly"),
-            Err(err) => {
-                self.notice = Some(format!("falha ao resolver: {err:#}"));
-                return Ok(());
-            }
-        };
-
-        // Skip fully downloaded torrents; resume partials.
-        let overwrite = crate::existing_state(&output_folder, &info, only_files.as_deref())?;
-        let overwrite = match overwrite {
-            crate::ExistingState::Complete => {
-                self.notice = Some("torrent já completamente baixado".into());
-                return Ok(());
-            }
-            crate::ExistingState::Partial => true,
-            crate::ExistingState::Missing => false,
-        };
-
-        let add_opts = AddTorrentOptions {
-            only_files,
-            overwrite,
-            output_folder: Some(output_folder.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-
-        match self
-            .session
-            .add_torrent(AddTorrent::TorrentFileBytes(torrent_bytes), Some(add_opts))
-            .await
-        {
-            Ok(AddTorrentResponse::Added(_, handle)) => {
-                self.notice = Some(format!("adicionado, hash={:?}", handle.info_hash()));
-                self.view = View::Session;
-                self.row_index = self.session_rows().len().saturating_sub(1);
-                self.include_input.clear();
-            }
-            Ok(AddTorrentResponse::AlreadyManaged(id, handle)) => {
-                self.notice = Some(format!(
-                    "já gerenciado (id={id}, hash={:?})",
-                    handle.info_hash()
-                ));
-            }
-            Ok(_) => unreachable!("re-add can only return Added or AlreadyManaged"),
-            Err(err) => {
-                self.notice = Some(format!("falha ao adicionar: {err:#}"));
-            }
+        // Validação síncrona apenas de sintaxe — nenhuma espera de rede aqui.
+        if let Err(err) = AddTorrent::from_cli_argument(&source) {
+            self.notice = Some(format!("origem inválida: {err:#}"));
+            return;
         }
-        Ok(())
+
+        // Registra a requisição e exibe a linha imediatamente (AC-2/AC-3).
+        self.pending.lock().unwrap().push(PendingTorrent {
+            source: source.clone(),
+            status: PendingStatus::Resolving,
+        });
+        self.view = View::Session;
+        self.row_index =
+            (self.session_rows().len() + self.pending.lock().unwrap().len()).saturating_sub(1);
+
+        let session = self.session.clone();
+        let pending = self.pending.clone();
+        tokio::spawn(async move {
+            let outcome = add_torrent_background(session, source.clone()).await;
+            let mut guard = pending.lock().unwrap();
+            let Some(entry) = guard.iter_mut().find(|p| p.source == source) else {
+                return;
+            };
+            match outcome {
+                Ok(AddOutcome::Added) => {
+                    // O torrent real já está na sessão: remove a entrada pendente.
+                    guard.retain(|p| p.source != source);
+                }
+                Ok(AddOutcome::AlreadyManaged) => {
+                    entry.status = PendingStatus::Done("origem já gerenciada".into());
+                }
+                Err(err) => {
+                    // AC-5: falha assíncrona → status de erro na lista, sem
+                    // bloquear a navegação.
+                    entry.status = PendingStatus::Error(format!("{err:#}"));
+                }
+            }
+        });
+    }
+
+    /// Consome avisos de entradas pendentes concluídas (ex.: "já gerenciado")
+    /// e remove a entrada, exibindo o aviso como notice.
+    fn drain_pending_notices(&mut self) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|p| match &p.status {
+            PendingStatus::Done(msg) => {
+                if self.notice.is_none() {
+                    self.notice = Some(msg.clone());
+                }
+                false
+            }
+            _ => true,
+        });
     }
 
     fn render(&mut self, w: &mut impl Write) -> anyhow::Result<()> {
+        self.drain_pending_notices();
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         queue!(w, terminal::Clear(terminal::ClearType::All), cursor::Hide)?;
 
@@ -779,6 +791,7 @@ impl Tui {
 
     fn render_session(&mut self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
         let rows_data = self.session_rows();
+        let pending = self.pending.lock().unwrap().clone();
         let mut lines: Vec<String> = Vec::new();
         lines.push("sessão de downloads".into());
         lines.push(String::new());
@@ -795,7 +808,7 @@ impl Tui {
         };
         let name_max = info_width.saturating_sub(31);
 
-        if rows_data.is_empty() {
+        if rows_data.is_empty() && pending.is_empty() {
             lines.push("nenhum torrent na fila".into());
         } else {
             for (idx, row) in rows_data.iter().enumerate() {
@@ -841,6 +854,40 @@ impl Tui {
                 };
                 lines.push(line);
             }
+
+            // Origens adicionadas em segundo plano, ainda sem handle.
+            let mut idx = rows_data.len();
+            for pt in &pending {
+                let marker = if idx == self.row_index { ">" } else { " " };
+                let (state, detail) = match &pt.status {
+                    PendingStatus::Resolving => ("inicializando", ""),
+                    PendingStatus::Error(err) => ("erro", err.as_str()),
+                    PendingStatus::Done(_) => continue, // já consumido no render
+                };
+                let mut info = format!(
+                    "{} [  —] {:>5.1}%  {:<11}  {}",
+                    marker,
+                    0.0,
+                    state,
+                    Self::truncate(&pt.source, name_max),
+                );
+                if !detail.is_empty() {
+                    info = format!("{info} — {}", Self::truncate(detail, 28));
+                }
+                // Mantém uma linha por entrada e o alinhamento das colunas.
+                let info = Self::truncate(&info, info_width);
+                let line = if show_actions {
+                    format!(
+                        "{:<pad$}",
+                        info,
+                        pad = info_width + 1 + ACTIONS_WIDTH as usize
+                    )
+                } else {
+                    format!("{:<width$}", info, width = info_width)
+                };
+                lines.push(line);
+                idx += 1;
+            }
         }
 
         lines.push(String::new());
@@ -849,22 +896,24 @@ impl Tui {
             lines.push(notice.clone());
         }
 
-        // Highlight the selected row (index 2 + row_index) and the title.
+        // Highlight the selected row (index 2 + row_index) and the title. Cada
+        // entrada (sessão ou pendente) ocupa exatamente uma linha.
         let mut highlighted = vec![0usize];
-        if !rows_data.is_empty() {
+        if !rows_data.is_empty() || !pending.is_empty() {
             highlighted.push(2 + self.row_index);
         }
         let (left, top) = self.centered_write(w, lines, cols, rows, &highlighted)?;
 
         // Registra a geometria para o mapeamento de cliques do mouse.
-        if rows_data.is_empty() {
+        let total_rows = rows_data.len() + pending.len();
+        if total_rows == 0 {
             self.layout = None;
         } else {
             self.layout = Some(Layout {
                 top,
                 left,
                 rows_offset: 2,
-                row_count: rows_data.len(),
+                row_count: total_rows,
                 info_width: info_width as u16,
                 show_actions,
             });
@@ -1156,6 +1205,20 @@ fn action_button_at(offset: u16) -> Option<usize> {
         Some(2)
     } else {
         None
+    }
+}
+
+/// Resolve e adiciona uma origem em segundo plano (US-014). Para magnet links a
+/// resolução de metadados via DHT/trackers ocorre aqui, fora da interface.
+async fn add_torrent_background(
+    session: Arc<Session>,
+    source: String,
+) -> anyhow::Result<AddOutcome> {
+    let add = AddTorrent::from_cli_argument(&source)?;
+    match session.add_torrent(add, None).await? {
+        AddTorrentResponse::Added(_, _) => Ok(AddOutcome::Added),
+        AddTorrentResponse::AlreadyManaged(_, _) => Ok(AddOutcome::AlreadyManaged),
+        _ => unreachable!("add_torrent sem list_only só retorna Added ou AlreadyManaged"),
     }
 }
 
