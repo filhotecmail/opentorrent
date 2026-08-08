@@ -104,6 +104,40 @@ Necessárias apenas para **compilar** (gerar o binário):
 
 ## Instalação (Ubuntu)
 
+### Opção 1 — Instalar a partir do Release (recomendado)
+
+Cada release do GitHub publica o binário compilado para **Linux x86_64**. Para
+instalar, basta baixar o binário e colocá-lo no `PATH`:
+
+```bash
+# Baixa o binário da última release (troque v0.1.5 pela versão desejada)
+curl -L -o opentorrent https://github.com/filhotecmail/opentorrent/releases/download/v0.1.5/opentorrent-v0.1.5-linux-x86_64
+
+# Torna o binário executável
+chmod +x opentorrent
+
+# Instala no PATH do sistema (todos os usuários)
+sudo mv opentorrent /usr/local/bin/
+
+# Verifica a instalação
+opentorrent --version
+```
+
+> **Alternativa sem `sudo`:** mova o binário para `~/.local/bin` (garanta que
+> esse diretório esteja no seu `PATH`):
+>
+> ```bash
+> mkdir -p ~/.local/bin
+> mv opentorrent ~/.local/bin/
+> export PATH="$HOME/.local/bin:$PATH"
+> ```
+
+**Para atualizar:** basta repetir o download com a versão mais recente —
+consulte a página de [Releases](https://github.com/filhotecmail/opentorrent/releases)
+para ver as versões disponíveis.
+
+### Opção 2 — Compilar a partir do código-fonte
+
 ```bash
 # 1. Dependências de sistema (apenas para compilar)
 sudo apt-get update
