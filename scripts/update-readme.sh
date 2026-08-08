@@ -8,15 +8,18 @@ REPO="${GITHUB_REPOSITORY:-filhotecmail/opentorrent}"
 FILE="README.md"
 [ -f "$FILE" ] || { echo "ERRO: $FILE não encontrado" >&2; exit 1; }
 
-gh api "repos/$REPO" > /tmp/opencode/repo.json 2>/dev/null || exit 1
-open_issues=$(jq -r '.open_issues_count' /tmp/opencode/repo.json)
-default_branch=$(jq -r '.default_branch' /tmp/opencode/repo.json)
+TMPDIR_C="${TMPDIR:-/tmp}/opencode"
+mkdir -p "$TMPDIR_C"
 
-gh api "repos/$REPO/milestones?state=open" > /tmp/opencode/mils.json 2>/dev/null || exit 1
-milestone=$(jq -r '.[0].title // "—"' /tmp/opencode/mils.json)
+gh api "repos/$REPO" > "$TMPDIR_C/repo.json" 2>/dev/null || exit 1
+open_issues=$(jq -r '.open_issues_count' "$TMPDIR_C/repo.json")
+default_branch=$(jq -r '.default_branch' "$TMPDIR_C/repo.json")
 
-gh api "repos/$REPO/labels" > /tmp/opencode/labels.json 2>/dev/null || exit 1
-nlabels=$(jq -r 'length' /tmp/opencode/labels.json)
+gh api "repos/$REPO/milestones?state=open" > "$TMPDIR_C/mils.json" 2>/dev/null || exit 1
+milestone=$(jq -r '.[0].title // "—"' "$TMPDIR_C/mils.json")
+
+gh api "repos/$REPO/labels" > "$TMPDIR_C/labels.json" 2>/dev/null || exit 1
+nlabels=$(jq -r 'length' "$TMPDIR_C/labels.json")
 
 latest_tag=$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || echo "—")
 

@@ -43,7 +43,7 @@ dependências externas de runtime.
 | Branch principal | `master` |
 | Última release | `—` |
 | Milestone atual | v1.0 |
-| Issues abertas | 0 |
+| Issues abertas | 5 |
 | Labels do projeto | 18 |
 <!-- ESTADO_END -->
 
@@ -268,27 +268,6 @@ Benefícios: PRs são bloqueados se qualquer verificação falhar; métricas de
 cobertura ficam visíveis no badge do README e no Codecov. Para ativar o badge
 de cobertura, configure o token do Codecov em `Settings → Secrets →
 CODECOV_TOKEN` (o passo de CI não falha sem ele).
-
-### Notificações por email
-
-O workflow `notify.yml` envia emails para `filhotecmail@gmail.com` sempre que
-acontece: novos commits em `master`, criação/edição/fechamento de **issues** e
-comentários, abertura/fechamento/merge de **PRs**, **discussões**, conclusão de
-**CI/CD** e **releases**.
-
-Para ativar, configure as variáveis SMTP (Gmail com senha de app) em
-`Settings → Secrets and variables → Actions`:
-
-| Secret | Exemplo |
-| --- | --- |
-| `SMTP_SERVER` | `smtp.gmail.com` |
-| `SMTP_PORT` | `465` |
-| `SMTP_USERNAME` | `filhotecmail@gmail.com` |
-| `SMTP_PASSWORD` | senha de app do Gmail |
-
-> **Como gerar a senha de app no Gmail:** Conta do Google → Segurança →
-> Verificação em 2 etapas (ativar) → Senhas de app → criar para "Mail".
-> O email da conta deve ser `filhotecmail@gmail.com`.
 
 ## Diretrizes de desenvolvimento
 
