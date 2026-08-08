@@ -1,0 +1,29 @@
+# Build do Rust
+/target
+**/*.rs.bk
+
+# Pastas de download criadas pela aplicação
+/downloads
+
+# Arquivos .torrent baixados/gerados
+*.torrent
+
+# Estado local e credenciais do opencode (Spec Kit)
+.opencode/
+
+# Estado local do Spec Kit (o restante do .specify é versionado)
+.specify/feature.json
+.specify/extensions/*/local-config.yml
+
+# Logs
+*.log
+
+# Editores/IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
