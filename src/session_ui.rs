@@ -904,6 +904,10 @@ impl Tui {
         if needs_full {
             queue!(w, terminal::Clear(terminal::ClearType::All), cursor::Hide)?;
             frame.apply_diff(w, &Frame::new(cols, rows))?;
+            // Após o clear total o cursor é sempre reemitido abaixo, mesmo que
+            // a posição não tenha mudado (evita cursor oculto durante a
+            // digitação após redimensionamento/troca de view).
+            self.prev_cursor = None;
         } else if let Some(prev) = &self.prev_frame {
             frame.apply_diff(w, prev)?;
         }
@@ -1555,7 +1559,9 @@ pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> a
         } else {
             match tokio::time::timeout(wait, tui.keys.recv()).await {
                 Ok(Some(ev)) => Some(ev),
-                Ok(None) | Err(_) => None,
+                // Canal de entrada encerrado (thread do teclado morreu): sai.
+                Ok(None) => return Ok(()),
+                Err(_) => None,
             }
         };
 
