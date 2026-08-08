@@ -40,6 +40,9 @@ const MENU_ITEMS: [&str; 4] = [
 
 const MENU_SHORTCUTS: [char; 4] = ['a', 'c', 'l', 's'];
 
+/// Índice (na lista de linhas renderizadas) da primeira opção do menu.
+const MENU_ITEMS_OFFSET: usize = 3;
+
 /// Largura de cada botão de ação renderizado nas linhas da sessão (ex.: `[Pausar ]`).
 const ACTION_BTN_WIDTH: u16 = 9;
 /// Espaço entre botões de ação.
@@ -186,13 +189,16 @@ impl Tui {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.menu_index = (self.menu_index + 1) % MENU_ITEMS.len();
             }
-            KeyCode::Enter => self.select_menu_item(self.menu_index),
+            KeyCode::Enter => self.select_menu_item(),
             KeyCode::Char(c) => {
                 if let Some(idx) = MENU_SHORTCUTS
                     .iter()
                     .position(|&s| s == c.to_ascii_lowercase())
                 {
-                    self.select_menu_item(idx);
+                    // AC-4: o destaque visual acompanha a opção acionada antes
+                    // de executar o comando correspondente.
+                    self.menu_index = idx;
+                    self.select_menu_item();
                 }
                 // FR: unknown commands are silently ignored, field stays clean.
             }
@@ -205,8 +211,8 @@ impl Tui {
         Ok(())
     }
 
-    fn select_menu_item(&mut self, idx: usize) {
-        match idx {
+    fn select_menu_item(&mut self) {
+        match self.menu_index {
             0 => {
                 self.include_index = 0;
                 self.include_input.clear();
@@ -375,8 +381,43 @@ impl Tui {
         }
         match self.view {
             View::Session => self.mouse_session(me.column, me.row).await,
+            View::Menu => {
+                self.mouse_menu(me.row);
+                Ok(())
+            }
+            View::Include if !self.typing => {
+                self.mouse_include(me.row);
+                Ok(())
+            }
             _ => Ok(()),
         }
+    }
+
+    /// Clique no menu: move o cursor de seleção (indicador + destaque) para a
+    /// opção clicada, em tempo real (AC-3).
+    fn mouse_menu(&mut self, row: u16) {
+        let Some(layout) = self.layout else {
+            return;
+        };
+        let first_row = layout.top.saturating_add(layout.rows_offset);
+        let end = first_row.saturating_add(layout.row_count as u16);
+        if row < first_row || row >= end {
+            return;
+        }
+        self.menu_index = (row - first_row) as usize;
+    }
+
+    /// Clique nas opções do diálogo de inclusão (fora do modo de digitação).
+    fn mouse_include(&mut self, row: u16) {
+        let Some(layout) = self.layout else {
+            return;
+        };
+        let first_row = layout.top.saturating_add(layout.rows_offset);
+        let end = first_row.saturating_add(layout.row_count as u16);
+        if row < first_row || row >= end {
+            return;
+        }
+        self.include_index = (row - first_row) as usize;
     }
 
     /// Maps a click on the session view to the clicked row and action button.
@@ -708,30 +749,31 @@ impl Tui {
         Ok(())
     }
 
-    fn render_menu(&self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+    fn render_menu(&mut self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
         let mut lines: Vec<String> = Vec::new();
         lines.push("OPENTORRENT".into());
         lines.push("menu".into());
         lines.push(String::new());
 
-        for (idx, item) in MENU_ITEMS.iter().enumerate() {
-            let label = if idx == self.menu_index {
-                format!(
-                    "> [{}] {} <",
-                    MENU_SHORTCUTS[idx].to_ascii_uppercase(),
-                    item
-                )
-            } else {
-                format!("  [{}] {}", MENU_SHORTCUTS[idx].to_ascii_uppercase(), item)
-            };
-            lines.push(label);
+        for idx in 0..MENU_ITEMS.len() {
+            lines.push(menu_item_line(idx, idx == self.menu_index));
         }
         lines.push(String::new());
         lines.push("use ↑/↓ + Enter, ou digite a letra do atalho".into());
 
+        // O destaque colorido acompanha exatamente a linha com o cursor
+        // `> ... <` (itens começam na linha `MENU_ITEMS_OFFSET`).
         let mut highlighted = vec![0usize];
-        highlighted.push(2 + self.menu_index);
-        self.centered_write(w, lines, cols, rows, &highlighted)?;
+        highlighted.push(MENU_ITEMS_OFFSET + self.menu_index);
+        let (left, top) = self.centered_write(w, lines, cols, rows, &highlighted)?;
+        self.layout = Some(Layout {
+            top,
+            left,
+            rows_offset: MENU_ITEMS_OFFSET as u16,
+            row_count: MENU_ITEMS.len(),
+            info_width: 0,
+            show_actions: false,
+        });
         Ok(())
     }
 
@@ -830,7 +872,7 @@ impl Tui {
         Ok(())
     }
 
-    fn render_include(&self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+    fn render_include(&mut self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
         let mut lines: Vec<String> = Vec::new();
         lines.push("adicionar torrent a fila".into());
         lines.push(String::new());
@@ -886,17 +928,28 @@ impl Tui {
         highlighted.push(2 + self.include_index);
 
         // Render the base lines first
-        self.render_include_base(w, cols, rows, &lines, &highlighted)?;
+        let (left, top) = self.render_include_base(w, cols, rows, &lines, &highlighted)?;
 
         // If typing, position the cursor at the correct position in the wrapped input
         if self.typing {
             self.render_input_cursor(w, cols, rows, &lines)?;
+        } else {
+            // Registra a geometria para cliques do mouse nas opções.
+            self.layout = Some(Layout {
+                top,
+                left,
+                rows_offset: 2,
+                row_count: 2,
+                info_width: 0,
+                show_actions: false,
+            });
         }
 
         Ok(())
     }
 
     /// Render the base lines for include view (without cursor positioning)
+    /// and returns the geometry used `(left, top)`.
     fn render_include_base(
         &self,
         w: &mut impl Write,
@@ -904,7 +957,7 @@ impl Tui {
         rows: u16,
         lines: &[String],
         highlighted: &[usize],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<(u16, u16)> {
         let width = lines
             .iter()
             .map(|l| l.chars().count() as u16)
@@ -926,7 +979,7 @@ impl Tui {
                 queue!(w, style::Print(line))?;
             }
         }
-        Ok(())
+        Ok((left, top))
     }
 
     /// Render the cursor at the correct position within the wrapped input field
@@ -1065,6 +1118,24 @@ impl Tui {
 fn actions_string(paused: bool) -> String {
     let toggle = if paused { "[Retomar]" } else { "[Pausar ]" };
     format!("{toggle} [Parar  ] [Excluir]")
+}
+
+/// Linha de uma opção do menu. A opção selecionada recebe o cursor `> ... <`
+/// e o destaque de cor (renderizado pelo mesmo `menu_index`).
+fn menu_item_line(idx: usize, selected: bool) -> String {
+    if selected {
+        format!(
+            "> [{}] {} <",
+            MENU_SHORTCUTS[idx].to_ascii_uppercase(),
+            MENU_ITEMS[idx]
+        )
+    } else {
+        format!(
+            "  [{}] {}",
+            MENU_SHORTCUTS[idx].to_ascii_uppercase(),
+            MENU_ITEMS[idx]
+        )
+    }
 }
 
 /// Se `offset` cai dentro da área do botão que começa em `start`.
@@ -1281,6 +1352,19 @@ mod tests {
     fn actions_string_shows_resume_when_paused() {
         assert_eq!(actions_string(true), "[Retomar] [Parar  ] [Excluir]");
         assert_eq!(actions_string(false), "[Pausar ] [Parar  ] [Excluir]");
+    }
+
+    #[test]
+    fn menu_item_line_marks_selected_only() {
+        assert_eq!(menu_item_line(0, true), "> [A] Adicionar torrent a lista <");
+        assert_eq!(menu_item_line(0, false), "  [A] Adicionar torrent a lista");
+        assert!(menu_item_line(1, true).starts_with('>'));
+        assert!(menu_item_line(2, true).ends_with('<'));
+        assert!(!menu_item_line(3, false).starts_with('>'));
+        assert!(!menu_item_line(3, false).ends_with('<'));
+        // O destaque (índice de linha) aponta para a opção selecionada.
+        assert_eq!(MENU_ITEMS_OFFSET, 3);
+        assert_eq!(MENU_ITEMS.len(), 4);
     }
 
     #[test]
