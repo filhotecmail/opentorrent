@@ -319,6 +319,18 @@ US:
 - **US-006** — Interação por mouse na barra de progresso (`crossterm`).
 - **US-008** — Diretório padrão `~/downloads/torrent-downloads/` e retomada
   inteligente (completo → reporta; parcial → retoma).
+- **US-009/US-010** — Interface interativa com sessão persistente (menu, fila de
+  downloads e listagem de completos).
+- **US-011** — Entrada de origem com cursor, colar (bracketed paste) e quebra de
+  linha automática.
+- **US-012** — Cliques do mouse nos botões de ação das linhas da sessão
+  (pausar/retomar, parar e excluir) com mapeamento dinâmico de coordenadas.
+- **US-013** — Destaque de seleção sincronizado com o cursor nos menus (teclas,
+  atalhos e mouse).
+- **US-014** — Adição assíncrona de torrents: transição imediata para a fila com
+  resolução em background e status de erro sem bloquear a interface.
+- **US-015** — Telas delimitadas por quadro de bordas duplas com área limitada
+  na equivalência de 1024x768 (128×48 células) e quebra de linha interna.
 
 ## Licença
 

@@ -1088,6 +1088,11 @@ impl Tui {
     }
 
     fn render_completed(&self, w: &mut impl Write, cols: u16, rows: u16) -> anyhow::Result<()> {
+        // Consistência visual: a listagem também fica dentro do quadro.
+        let (left, top, width, height) = frame_rect(cols, rows);
+        let content_left = left + 2;
+        let inner_width = (width as usize).saturating_sub(4);
+
         let mut lines: Vec<String> = Vec::new();
         lines.push("downloads completos".into());
         lines.push(format!("pasta: {}", self.output_folder.display()));
@@ -1097,8 +1102,7 @@ impl Tui {
             Ok(items) => items,
             Err(err) => {
                 lines.push(format!("erro ao listar: {err:#}"));
-                self.centered_write(w, lines, cols, rows, &[])?;
-                return Ok(());
+                Vec::new()
             }
         };
 
@@ -1113,11 +1117,17 @@ impl Tui {
         lines.push(String::new());
         lines.push("Esc para voltar ao menu".into());
 
+        for line in &mut lines {
+            *line = Self::truncate(line, inner_width);
+        }
+        let content_top = center_content_top(top, height, lines.len());
+
         let mut highlighted = vec![0usize];
         if items.is_empty() {
             highlighted.push(2);
         }
-        self.centered_write(w, lines, cols, rows, &highlighted)?;
+        draw_box(w, left, top, width, height)?;
+        write_boxed_lines(w, content_left, content_top, &lines, &highlighted, height)?;
         Ok(())
     }
 
