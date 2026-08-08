@@ -108,6 +108,7 @@ jobs:
 
       - name: Enviar email
         uses: dawidd6/action-send-mail@v3
+        continue-on-error: true
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
