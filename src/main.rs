@@ -1,15 +1,35 @@
 use std::{
-    cell::RefCell, collections::HashMap, io::Write, path::PathBuf, sync::Arc, time::Duration,
+    cell::RefCell,
+    collections::HashMap,
+    io::{IsTerminal, Write},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{bail, Context};
 use clap::Parser;
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEvent,
+        MouseEventKind,
+    },
+    execute, terminal,
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, Session, SessionOptions,
+    api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse,
+    ManagedTorrent, Session, SessionOptions, TorrentStatsState,
 };
 use size_format::SizeFormatterBinary as SF;
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
+
+const MSG_WIDTH: u16 = 40;
+const BAR_WIDTH: u16 = 20;
+const ACTION_BTN_WIDTH: u16 = 9;
+const ACTION_GAP: u16 = ACTION_BTN_WIDTH + 1;
+const ACTIONS_COL: u16 = MSG_WIDTH + 1 + 1 + BAR_WIDTH + 1 + 1;
 
 struct MultiProgressWriter(MultiProgress);
 
@@ -102,6 +122,11 @@ fn main() -> anyhow::Result<()> {
         .with_writer(move || MultiProgressWriter(log_multi.clone()))
         .init();
 
+    let mouse_enabled = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if mouse_enabled {
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_time()
         .enable_io()
@@ -109,11 +134,21 @@ fn main() -> anyhow::Result<()> {
         .context("failed to build tokio runtime")?;
 
     match runtime.block_on(run(opts, multi)) {
-        Ok(()) => std::process::exit(0),
-        Err(err) => {
-            eprintln!("error: {err}");
-            std::process::exit(1)
+        Ok(()) => {
+            disable_mouse(mouse_enabled);
+            std::process::exit(0);
         }
+        Err(err) => {
+            disable_mouse(mouse_enabled);
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn disable_mouse(mouse_enabled: bool) {
+    if mouse_enabled {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
 }
 
@@ -151,10 +186,15 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
         .await
         .context("error initializing session")?;
 
+    let (mouse_tx, mouse_rx) = mpsc::unbounded_channel();
+    if std::io::stdin().is_terminal() {
+        std::thread::spawn(move || mouse_reader(mouse_tx));
+    }
+
     librqbit::librqbit_spawn(
         "stats_printer",
         tracing::trace_span!("stats_printer"),
-        stats_printer(session.clone(), multi.clone()),
+        stats_printer(session.clone(), multi.clone(), mouse_rx),
     );
 
     let mut added = false;
@@ -246,41 +286,156 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn mouse_reader(tx: mpsc::UnboundedSender<MouseEvent>) {
+    loop {
+        match event::read() {
+            Ok(Event::Mouse(event)) => {
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn actions_string(paused: bool) -> String {
+    let toggle = if paused { "[Retomar]" } else { "[Pausar ]" };
+    format!("{toggle} [Parar  ] [Excluir]")
+}
+
 struct TorrentBar {
+    handle: Arc<ManagedTorrent>,
     bar: ProgressBar,
     main_file: Option<(usize, u64)>,
 }
 
-async fn stats_printer(session: Arc<Session>, multi: MultiProgress) -> anyhow::Result<()> {
-    let bars: RefCell<HashMap<usize, TorrentBar>> = RefCell::new(HashMap::new());
+fn build_bar(multi: &MultiProgress, id: usize, total_bytes: u64, name: &str) -> ProgressBar {
+    let bar = multi.add(ProgressBar::new(total_bytes.max(1)));
+    bar.set_style(
+        ProgressStyle::with_template(&format!(
+            "{{msg:<{MSG_WIDTH}!}} [{{bar:{BAR_WIDTH}.cyan/blue}}] {{prefix}}"
+        ))
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    bar.set_message(format!("[{id}] {name}"));
+    bar.set_prefix(actions_string(false));
+    bar
+}
+
+async fn handle_click(
+    session: &Arc<Session>,
+    bars: &Mutex<HashMap<usize, TorrentBar>>,
+    bar_order: &Mutex<Vec<usize>>,
+    row: u16,
+    column: u16,
+    term_rows: u16,
+) -> anyhow::Result<()> {
+    // Read the clicked bar within a short lock scope, then drop the guards
+    // before any `.await` (no locks held across await points).
+    let (id, handle, is_paused) = {
+        let order = bar_order.lock().unwrap();
+        let n = order.len() as u16;
+        if n == 0 || term_rows == 0 {
+            return Ok(());
+        }
+
+        // The progress bars are drawn at the bottom of the terminal, one line
+        // each, in the order the bars were added (bar_order). The topmost bar
+        // starts at row `term_rows - n` (1-based mouse rows), so the clicked
+        // bar index is the offset from that row.
+        let top_bar_row = term_rows.saturating_sub(n) + 1;
+        let row = row.saturating_sub(1) + 1;
+        if row < top_bar_row || row > term_rows {
+            return Ok(());
+        }
+        let bar_idx = (row - top_bar_row) as usize;
+        let Some(&id) = order.get(bar_idx) else {
+            return Ok(());
+        };
+
+        let bars_guard = bars.lock().unwrap();
+        let Some(tb) = bars_guard.get(&id) else {
+            return Ok(());
+        };
+
+        let is_paused = matches!(
+            tb.handle.stats().state,
+            TorrentStatsState::Paused | TorrentStatsState::Error
+        );
+
+        (id, tb.handle.clone(), is_paused)
+    };
+
+    let col = column.saturating_sub(1) + 1;
+    let action_col = ACTIONS_COL + 1;
+
+    if (action_col..action_col + ACTION_BTN_WIDTH).contains(&col) {
+        if is_paused {
+            session.clone().unpause(&handle).await?;
+        } else {
+            session.pause(&handle).await?;
+        }
+    } else if (action_col + ACTION_GAP..action_col + ACTION_GAP + ACTION_BTN_WIDTH).contains(&col) {
+        session.delete(TorrentIdOrHash::Id(id), false).await?;
+    } else if (action_col + 2 * ACTION_GAP..action_col + 2 * ACTION_GAP + ACTION_BTN_WIDTH)
+        .contains(&col)
+    {
+        session.delete(TorrentIdOrHash::Id(id), true).await?;
+    }
+
+    Ok(())
+}
+
+async fn stats_printer(
+    session: Arc<Session>,
+    multi: MultiProgress,
+    mut mouse_rx: mpsc::UnboundedReceiver<MouseEvent>,
+) -> anyhow::Result<()> {
+    let bars: Mutex<HashMap<usize, TorrentBar>> = Mutex::new(HashMap::new());
+    let bar_order: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
     loop {
+        let seen = RefCell::new(Vec::<usize>::new());
+
         session.with_torrents(|torrents| {
             for (idx, torrent) in torrents {
+                seen.borrow_mut().push(idx);
                 let stats = torrent.stats();
                 let name = torrent.name().unwrap_or_else(|| format!("torrent #{idx}"));
 
-                let mut bars = bars.borrow_mut();
-                let tb = bars.entry(idx).or_insert_with(|| {
-                    let file_infos = torrent
-                        .with_metadata(|m| m.file_infos.clone())
-                        .unwrap_or_default();
-                    let main_file = file_infos
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|(_, fi)| fi.len)
-                        .map(|(i, fi)| (i, fi.len));
+                let mut bars = bars.lock().unwrap();
+                let mut bar_order = bar_order.lock().unwrap();
+                match bars.entry(idx) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let file_infos = torrent
+                            .with_metadata(|m| m.file_infos.clone())
+                            .unwrap_or_default();
+                        let main_file = file_infos
+                            .iter()
+                            .enumerate()
+                            .max_by_key(|(_, fi)| fi.len)
+                            .map(|(i, fi)| (i, fi.len));
 
-                    let bar = multi.add(ProgressBar::new(stats.total_bytes.max(1)));
-                    bar.set_style(
-                        ProgressStyle::with_template("{msg} [{bar:34.cyan/blue}]")
-                            .unwrap()
-                            .progress_chars("=>-"),
-                    );
-                    bar.set_message(format!("[{idx}] {name}"));
+                        let bar = build_bar(&multi, idx, stats.total_bytes, &name);
+                        entry.insert(TorrentBar {
+                            handle: torrent.clone(),
+                            bar,
+                            main_file,
+                        });
+                        bar_order.push(idx);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
 
-                    TorrentBar { bar, main_file }
-                });
+                let tb = bars.get(&idx).unwrap();
+                let is_paused = matches!(
+                    stats.state,
+                    TorrentStatsState::Paused | TorrentStatsState::Error
+                );
+                tb.bar.set_prefix(actions_string(is_paused));
 
                 let (pos, len) = match tb.main_file {
                     Some((i, file_len)) => {
@@ -295,6 +450,44 @@ async fn stats_printer(session: Arc<Session>, multi: MultiProgress) -> anyhow::R
                 }
             }
         });
+
+        // Remove bars for torrents that no longer exist (deleted by click).
+        {
+            let mut bars = bars.lock().unwrap();
+            let mut bar_order = bar_order.lock().unwrap();
+            bar_order.retain(|id| {
+                if seen.borrow().contains(id) {
+                    true
+                } else {
+                    if let Some(tb) = bars.remove(id) {
+                        multi.remove(&tb.bar);
+                    }
+                    false
+                }
+            });
+        }
+
+        // Drain pending mouse events.
+        let (_, term_rows) = terminal::size().unwrap_or((0, 0));
+        loop {
+            match mouse_rx.try_recv() {
+                Ok(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    row,
+                    column,
+                    ..
+                }) => {
+                    if let Err(err) =
+                        handle_click(&session, &bars, &bar_order, row, column, term_rows).await
+                    {
+                        print_line(&multi, &format!("click error: {err}"));
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
