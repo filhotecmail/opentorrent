@@ -19,12 +19,15 @@ use crossterm::{
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use librqbit::{
     api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, AddTorrentResponse, ByteBufOwned,
-    ListOnlyResponse, ManagedTorrent, Session, SessionOptions, TorrentMetaV1Info,
-    TorrentStatsState,
+    ListOnlyResponse, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
+    TorrentMetaV1Info, TorrentStatsState,
 };
 use size_format::SizeFormatterBinary as SF;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
+
+mod downloads;
+mod session_ui;
 
 const MSG_WIDTH: u16 = 40;
 const BAR_WIDTH: u16 = 20;
@@ -63,7 +66,7 @@ fn default_output_folder() -> anyhow::Result<PathBuf> {
 
 /// Whether the torrent's files already exist in the given output folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExistingState {
+pub(crate) enum ExistingState {
     /// No file exists on disk yet.
     Missing,
     /// At least one file exists, but not all of them are fully downloaded.
@@ -72,7 +75,7 @@ enum ExistingState {
     Complete,
 }
 
-fn existing_state(
+pub(crate) fn existing_state(
     output_folder: &Path,
     info: &TorrentMetaV1Info<ByteBufOwned>,
     only_files: Option<&[usize]>,
@@ -115,7 +118,7 @@ struct Opts {
     log_level: String,
 
     #[command(subcommand)]
-    subcommand: SubCommand,
+    subcommand: Option<SubCommand>,
 }
 
 #[derive(Parser)]
@@ -208,8 +211,36 @@ fn disable_mouse(mouse_enabled: bool) {
 
 async fn run(opts: Opts, multi: MultiProgress) -> anyhow::Result<()> {
     match opts.subcommand {
-        SubCommand::Add(add) => run_add(add, multi).await,
+        Some(SubCommand::Add(add)) => run_add(add, multi).await,
+        // US-009/US-010: without a subcommand, open the interactive session UI.
+        None => run_interactive().await,
     }
+}
+
+/// Run the interactive session UI (no subcommand).
+async fn run_interactive() -> anyhow::Result<()> {
+    let output_folder = default_output_folder()?;
+    std::fs::create_dir_all(&output_folder)
+        .with_context(|| format!("error creating output folder {}", output_folder.display()))?;
+
+    // US-009 FR-001a: persist the session to ~/.config/opentorrent/session.json.
+    let session_folder = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME environment variable is not set")?
+        .join(".config")
+        .join("opentorrent");
+    let session_opts = SessionOptions {
+        fastresume: true,
+        persistence: Some(SessionPersistenceConfig::Json {
+            folder: Some(session_folder),
+        }),
+        ..Default::default()
+    };
+    let session = Session::new_with_opts(output_folder.clone(), session_opts)
+        .await
+        .context("error initializing session")?;
+
+    session_ui::run_interactive(session, output_folder).await
 }
 
 async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {

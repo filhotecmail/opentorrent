@@ -115,6 +115,6 @@ jobs:
           password: ${{ secrets.SMTP_PASSWORD }}
           subject: ${{ steps.summary.outputs.subject }}
           to: filhotecmail@gmail.com
-          from: OpenTorrent CI
+          from: ${{ secrets.SMTP_USERNAME }}
           body: ${{ steps.summary.outputs.body }}
           secure: true
