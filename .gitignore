@@ -8,6 +8,9 @@
 # Arquivos .torrent baixados/gerados
 *.torrent
 
+# Estado local do pipeline de US (US-017)
+.us-pipeline.state
+
 # Estado local e credenciais do opencode (Spec Kit)
 .opencode/
 
