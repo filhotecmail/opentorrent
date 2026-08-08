@@ -387,9 +387,6 @@ impl Tui {
         let Some(layout) = self.layout else {
             return Ok(());
         };
-        if !layout.show_actions {
-            return Ok(());
-        }
         let first_row = layout.top.saturating_add(layout.rows_offset);
         let end = first_row.saturating_add(layout.row_count as u16);
         if row < first_row || row >= end {
@@ -397,17 +394,19 @@ impl Tui {
         }
         let idx = (row - first_row) as usize;
 
+        // Sem botões renderizados (terminal estreito) ou clique fora da área
+        // dos botões: apenas move a seleção para a linha clicada.
+        let actions_col = layout.left.saturating_add(layout.info_width + 1);
+        if !layout.show_actions || col < actions_col || col >= actions_col + ACTIONS_WIDTH {
+            self.row_index = idx;
+            return Ok(());
+        }
+
         let rows = self.session_rows();
         let Some(row_data) = rows.get(idx) else {
             return Ok(());
         };
 
-        let actions_col = layout.left.saturating_add(layout.info_width + 1);
-        if col < actions_col || col >= actions_col + ACTIONS_WIDTH {
-            // Clique fora dos botões: apenas move a seleção para a linha.
-            self.row_index = idx;
-            return Ok(());
-        }
         let Some(button) = action_button_at(col - actions_col) else {
             return Ok(());
         };
@@ -742,11 +741,17 @@ impl Tui {
         lines.push("sessão de downloads".into());
         lines.push(String::new());
 
-        // Largura da parte informativa de cada linha: os botões de ação são
-        // renderizados à direita em colunas fixas, recalculadas dinamicamente.
-        let info_width =
-            ROW_INFO_WIDTH.min(cols.saturating_sub(ACTIONS_WIDTH + 6).max(30)) as usize;
-        let name_max = info_width.saturating_sub(30);
+        // Largura da parte informativa de cada linha. Os botões de ação são
+        // renderizados à direita em colunas fixas apenas quando o terminal é
+        // largo o suficiente — em terminais estreitos as linhas ficam sem
+        // botões para evitar estouro (que desalinharia o mapeamento do clique).
+        let show_actions = cols >= ROW_INFO_WIDTH + 1 + ACTIONS_WIDTH;
+        let info_width = if show_actions {
+            ROW_INFO_WIDTH.min(cols.saturating_sub(1 + ACTIONS_WIDTH)) as usize
+        } else {
+            ROW_INFO_WIDTH.min(cols.saturating_sub(2)) as usize
+        };
+        let name_max = info_width.saturating_sub(31);
 
         if rows_data.is_empty() {
             lines.push("nenhum torrent na fila".into());
@@ -772,20 +777,26 @@ impl Tui {
                     row.state,
                     TorrentStatsState::Paused | TorrentStatsState::Error
                 );
+                // Parte informativa com largura fixa (id em 4 dígitos) para que
+                // a coluna dos botões permaneça estável entre as linhas.
                 let info = format!(
-                    "{} [{:>3}] {:>5.1}%  {:<11}  {}",
+                    "{} [{:>4}] {:>5.1}%  {:<11}  {}",
                     marker,
-                    row.id,
+                    row.id.min(9999),
                     pct,
                     state,
                     Self::truncate(&row.name, name_max),
                 );
-                let line = format!(
-                    "{:<width$} {actions}",
-                    info,
-                    width = info_width,
-                    actions = actions_string(paused),
-                );
+                let line = if show_actions {
+                    format!(
+                        "{:<width$} {actions}",
+                        info,
+                        width = info_width,
+                        actions = actions_string(paused),
+                    )
+                } else {
+                    format!("{:<width$}", info, width = info_width)
+                };
                 lines.push(line);
             }
         }
@@ -813,7 +824,7 @@ impl Tui {
                 rows_offset: 2,
                 row_count: rows_data.len(),
                 info_width: info_width as u16,
-                show_actions: true,
+                show_actions,
             });
         }
         Ok(())
