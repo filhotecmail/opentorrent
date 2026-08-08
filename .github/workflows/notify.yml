@@ -1,0 +1,120 @@
+name: Notificações por email
+
+on:
+  push:
+    branches: [master]
+  issues:
+    types: [opened, closed, reopened, edited]
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened, closed, merged, reopened, edited]
+  discussion:
+    types: [created, answered, category_changed, edited, labeled]
+  workflow_run:
+    types: [completed]
+    workflows: [CI, Cobertura]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Enviar email de notificação
+    if: ${{ !startsWith(github.head_ref, 'dependabot/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Montar resumo do evento
+        id: summary
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT: ${{ toJson(github.event) }}
+        run: |
+          subject=""
+          body=""
+
+          case "$EVENT_NAME" in
+            push)
+              author=$(echo "$EVENT" | jq -r '.head_commit.author.username // .pusher.name // "desconhecido"')
+              msg=$(echo "$EVENT" | jq -r '.head_commit.message // "sem mensagem"' | head -1)
+              n=$(echo "$EVENT" | jq -r '.commits | length')
+              subject="[OpenTorrent] $n novo(s) commit(s) em master por $author"
+              body=$(printf 'Novo(s) commit(s) em master:\n\n%s\n\nAutor: %s\nBranch: %s\nCommit: %s' \
+                "$msg" "$author" "${{ github.ref_name }}" "${{ github.sha }}")
+              ;;
+            issues)
+              action=$(echo "$EVENT" | jq -r '.action')
+              title=$(echo "$EVENT" | jq -r '.issue.title')
+              author=$(echo "$EVENT" | jq -r '.issue.user.login')
+              labels=$(echo "$EVENT" | jq -r '[.issue.labels[].name] | join(", ") // "sem labels"')
+              milestone=$(echo "$EVENT" | jq -r '.issue.milestone.title // "sem milestone"')
+              url=$(echo "$EVENT" | jq -r '.issue.html_url')
+              subject="[OpenTorrent] Issue #${{ github.event.issue.number }} $action: $title"
+              body=$(printf 'Issue #%s %s por @%s\n\nTítulo: %s\nLabels: %s\nMilestone: %s\nURL: %s' \
+                "${{ github.event.issue.number }}" "$action" "$author" "$title" "$labels" "$milestone" "$url")
+              ;;
+            issue_comment)
+              title=$(echo "$EVENT" | jq -r '.issue.title')
+              author=$(echo "$EVENT" | jq -r '.comment.user.login')
+              url=$(echo "$EVENT" | jq -r '.comment.html_url')
+              subject="[OpenTorrent] Novo comentário em #${{ github.event.issue.number }} ($title)"
+              body=$(printf 'Novo comentário por @%s em #%s: %s\n\nURL: %s' \
+                "$author" "${{ github.event.issue.number }}" "$title" "$url")
+              ;;
+            pull_request)
+              action=$(echo "$EVENT" | jq -r '.action')
+              title=$(echo "$EVENT" | jq -r '.pull_request.title')
+              author=$(echo "$EVENT" | jq -r '.pull_request.user.login')
+              url=$(echo "$EVENT" | jq -r '.pull_request.html_url')
+              subject="[OpenTorrent] PR #${{ github.event.pull_request.number }} $action: $title"
+              body=$(printf 'PR #%s %s por @%s\n\nTítulo: %s\nURL: %s' \
+                "${{ github.event.pull_request.number }}" "$action" "$author" "$title" "$url")
+              ;;
+            discussion)
+              action=$(echo "$EVENT" | jq -r '.action')
+              title=$(echo "$EVENT" | jq -r '.discussion.title')
+              author=$(echo "$EVENT" | jq -r '.discussion.user.login')
+              url=$(echo "$EVENT" | jq -r '.discussion.html_url')
+              subject="[OpenTorrent] Discussão $action: $title"
+              body=$(printf 'Discussão %s por @%s\n\nTítulo: %s\nURL: %s' \
+                "$action" "$author" "$title" "$url")
+              ;;
+            workflow_run)
+              name=$(echo "$EVENT" | jq -r '.workflow_run.name')
+              conclusion=$(echo "$EVENT" | jq -r '.workflow_run.conclusion')
+              url=$(echo "$EVENT" | jq -r '.workflow_run.html_url')
+              branch=$(echo "$EVENT" | jq -r '.workflow_run.head_branch')
+              subject="[OpenTorrent] CI $name: $conclusion"
+              body=$(printf 'Workflow %s concluído com status: %s\n\nBranch: %s\nURL: %s' \
+                "$name" "$conclusion" "$branch" "$url")
+              ;;
+            release)
+              tag=$(echo "$EVENT" | jq -r '.release.tag_name')
+              url=$(echo "$EVENT" | jq -r '.release.html_url')
+              subject="[OpenTorrent] Release $tag publicada"
+              body=$(printf 'Release %s publicada.\n\nURL: %s' "$tag" "$url")
+              ;;
+          esac
+
+          echo "subject=$subject" >> "$GITHUB_OUTPUT"
+          {
+            echo "body<<EOF"
+            echo "$body"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Enviar email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: ${{ steps.summary.outputs.subject }}
+          to: filhotecmail@gmail.com
+          from: OpenTorrent CI
+          body: ${{ steps.summary.outputs.body }}
+          secure: true

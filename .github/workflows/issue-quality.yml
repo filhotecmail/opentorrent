@@ -1,0 +1,44 @@
+name: Qualidade de issues
+
+on:
+  issues:
+    types: [opened, reopened, labeled, unlabeled, milestoned, demilestoned, edited]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  enforce-labels-milestone:
+    name: Exigir labels e milestone
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validar labels e milestone
+        id: validate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          issue=$(gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER")
+          n_labels=$(echo "$issue" | jq -r '.labels | length')
+          milestone=$(echo "$issue" | jq -r '.milestone.title // empty')
+
+          missing=""
+          [ -z "$milestone" ] && missing="$missing milestone"
+          [ "$n_labels" -eq 0 ] && missing="$missing label"
+          echo "missing=$missing" >> "$GITHUB_OUTPUT"
+
+      - name: Comentar e sinalizar se faltar
+        if: steps.validate.outputs.missing != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          MISSING: ${{ steps.validate.outputs.missing }}
+        run: |
+          body="Atenção: esta issue ainda não atende aos requisitos de qualidade. Faltam:$MISSING. Todo issue criado deve ter pelo menos um label (exemplos: US, bug, enhancement) e um milestone (exemplo: v1.0)."
+          gh issue comment "$ISSUE_NUMBER" --body "$body" \
+            --repo "${{ github.repository }}"

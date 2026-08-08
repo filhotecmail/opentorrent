@@ -1,7 +1,11 @@
 # OpenTorrent
 
-[![CI](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
+<!-- BADGES_START -->
+[![CI](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
 [![Cobertura](https://codecov.io/gh/filhotecmail/opentorrent/branch/master/graph/badge.svg)](https://codecov.io/gh/filhotecmail/opentorrent)
+[![Release](https://img.shields.io/badge/release-—-blue)](https://github.com/filhotecmail/opentorrent/releases)
+[![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
+<!-- BADGES_END -->
 
 Um cliente BitTorrent de **linha de comando (CLI)** para **Ubuntu/Linux** que
 baixa **torrents** e **magnet links** diretamente do terminal, sem interface
@@ -27,6 +31,29 @@ O **OpenTorrent** é um programa em Rust que:
 O motor de BitTorrent é o **librqbit** — uma implementação 100% em Rust — o que
 significa que o projeto compila e roda apenas com o ecossistema Rust, sem
 dependências externas de runtime.
+
+## Estado do projeto
+
+> Esta seção é **atualizada automaticamente** pelo workflow `README vivo`
+> (`.github/workflows/readme-live.yml`) a cada push, CI e semanalmente.
+
+<!-- ESTADO_START -->
+| Estado | Valor |
+| --- | --- |
+| Branch principal | `master` |
+| Última release | `—` |
+| Milestone atual | v1.0 |
+| Issues abertas | 0 |
+| Labels do projeto | 18 |
+<!-- ESTADO_END -->
+
+<!-- CARGO_START -->
+| Metadado | Valor |
+| --- | --- |
+| Pacote | `opentorrent` |
+| Versão | `0.1.0` |
+| Edição Rust | 2021 |
+<!-- CARGO_END -->
 
 ## Estrutura do projeto
 
@@ -232,11 +259,36 @@ O repositório usa **GitHub Actions** em `.github/workflows/`, executado a cada
 | --- | --- | --- |
 | **CI** | `ci.yml` | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, `cargo machete` |
 | **Cobertura** | `coverage.yml` | `cargo tarpaulin` → relatório XML (artefato + Codecov) |
+| **Qualidade de issues** | `issue-quality.yml` | comenta e sinaliza issues sem label/milestone |
+| **Notificações** | `notify.yml` | emails para `filhotecmail@gmail.com` (commits, issues, PRs, discussões, CI, releases) |
+| **README vivo** | `readme-live.yml` | regenera badges e estado do projeto no README |
+| **Dependabot** | `dependabot.yml` | atualizações semanais de deps Cargo e Actions |
 
 Benefícios: PRs são bloqueados se qualquer verificação falhar; métricas de
 cobertura ficam visíveis no badge do README e no Codecov. Para ativar o badge
 de cobertura, configure o token do Codecov em `Settings → Secrets →
 CODECOV_TOKEN` (o passo de CI não falha sem ele).
+
+### Notificações por email
+
+O workflow `notify.yml` envia emails para `filhotecmail@gmail.com` sempre que
+acontece: novos commits em `master`, criação/edição/fechamento de **issues** e
+comentários, abertura/fechamento/merge de **PRs**, **discussões**, conclusão de
+**CI/CD** e **releases**.
+
+Para ativar, configure as variáveis SMTP (Gmail com senha de app) em
+`Settings → Secrets and variables → Actions`:
+
+| Secret | Exemplo |
+| --- | --- |
+| `SMTP_SERVER` | `smtp.gmail.com` |
+| `SMTP_PORT` | `465` |
+| `SMTP_USERNAME` | `filhotecmail@gmail.com` |
+| `SMTP_PASSWORD` | senha de app do Gmail |
+
+> **Como gerar a senha de app no Gmail:** Conta do Google → Segurança →
+> Verificação em 2 etapas (ativar) → Senhas de app → criar para "Mail".
+> O email da conta deve ser `filhotecmail@gmail.com`.
 
 ## Diretrizes de desenvolvimento
 
