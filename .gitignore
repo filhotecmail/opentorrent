@@ -11,6 +11,10 @@
 # Estado local do pipeline de US (US-017)
 .us-pipeline.state
 
+# Chaves privadas e certificados de assinatura digital (US-018) — nunca versionar
+.signing/
+*.sig
+
 # Estado local e credenciais do opencode (Spec Kit)
 .opencode/
 

@@ -38,14 +38,29 @@ bump_version() {
   echo "OpenTorrent v$next — build em andamento (verbose)"
 }
 
+# Assina o binário release (US-018): gera CA local e certificado de code
+# signing caso não existam, assina com RSA-SHA256 e valida a integridade contra
+# a CA raiz. Falha na verificação aborta a esteira (set -e).
+sign_release() {
+  echo "OpenTorrent — assinatura digital do binário (US-018)"
+  ./scripts/sign-release.sh sign target/release/opentorrent
+}
+
 case "$ACTION" in
   build|b|"")
     bump_version
     cargo build $PROFILE --verbose
+    # Assina apenas em release (PROFILE normalizado cobre o alias 'r').
+    if [ "$PROFILE" = "--release" ]; then
+      sign_release
+    fi
     ;;
   verbose|v)
     bump_version
     cargo build $PROFILE --verbose
+    if [ "$PROFILE" = "--release" ]; then
+      sign_release
+    fi
     ;;
   clean|c)
     cargo clean
