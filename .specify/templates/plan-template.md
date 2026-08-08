@@ -47,7 +47,7 @@
 *GATE: Must pass before Phase 0 research (all Rust design/implementation).*
 
 Antes de definir arquitetura, tipos, ownership/borrowing, concorrência ou
-escolha de crates, consulte as **Rust Skills** (`vendor/rust-skills/`, carregadas
+escolha de crates, consulte as **Rust Skills** (`~/rust-skills/`, carregadas
 via `.opencode/opencode.json` → `skills.paths`):
 
 1. Rode o `rust-router` e identifique a camada de entrada (Domínio → Design →
@@ -63,6 +63,10 @@ via `.opencode/opencode.json` → `skills.paths`):
      `rust-learner`.
 3. Aplique o **framework de meta-cognição** (não responda sintomas com remendos
    superficiais — trace a causa pelas camadas).
+4. Ative o contexto do **cargo-skill** (`.skill/context.md`) quando útil:
+   `cargo skill think` (design), `cargo skill write` (implementação),
+   `cargo skill review`/`refactor`/`debug` (workflows dirigidos). O índice
+   Layer 1 está na seção `# Rust Skill Reference` do `AGENTS.md`.
 
 Registre abaixo as skills consultadas e as decisões de design derivadas:
 

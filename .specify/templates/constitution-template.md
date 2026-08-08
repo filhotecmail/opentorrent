@@ -29,7 +29,7 @@
 <!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
 
 ### VI. Rust-Skills (NON-NEGOTIABLE)
-<!-- Projeto Rust: integra https://github.com/actionbook/rust-skills (vendor/rust-skills/). -->
+<!-- Projeto Rust: integra https://github.com/actionbook/rust-skills (clone em ~/rust-skills/). -->
 Todo planejamento, design ou implementação de código Rust MUST consultar as
 Rust Skills via `rust-router` e aplicar o framework de meta-cognição em 3 camadas
 (Domínio → Design → Mecânica), usando as skills da camada identificada
@@ -39,6 +39,15 @@ concorrência ou escolha de crates. Plano SDD/`plan.md` MUST registrar as skills
 consultadas na seção `Rust Skills Check`. Remendos superficiais a sintomas de
 compilação (ex.: `.clone()` sem análise de ownership) são PROIBIDOS sem análise
 cognitiva.
+
+### VII. Cargo-Skill (NON-NEGOTIABLE)
+<!-- Projeto Rust: integra https://lib.rs/crates/cargo-skill (contexto ativo por camadas). -->
+O agente MUST usar o `cargo-skill` como fonte de contexto ativo de regras Rust:
+carregar `.skill/context.md` quando existir e invocar `cargo skill lookup`/
+`think`/`write`/`review`/`refactor`/`debug` conforme a tarefa (consulta pontual,
+raciocínio de design ou execução). O índice de regras (Layer 1) da seção
+`# Rust Skill Reference` do `AGENTS.md` é a referência offline obrigatória antes
+de propor regras de estilo, tipos, ownership, performance ou testes.
 
 ## [SECTION_2_NAME]
 <!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->

@@ -7,10 +7,8 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, Session, SessionOptions,
-    TorrentStatsState,
 };
 use size_format::SizeFormatterBinary as SF;
-use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 struct MultiProgressWriter(MultiProgress);
@@ -28,12 +26,18 @@ impl Write for MultiProgressWriter {
     }
 }
 
+fn print_line(multi: &MultiProgress, msg: &str) {
+    multi.suspend(|| {
+        let _ = writeln!(std::io::stdout(), "{msg}");
+    });
+}
+
 /// OpenTorrent: download torrents and magnet links from the terminal.
 #[derive(Parser)]
 #[command(version, author, about)]
 struct Opts {
-    /// The console log level (trace, debug, info, warn, error)
-    #[arg(long, short = 'v', default_value = "info")]
+    /// The console log level (trace, debug, info, warn, error, off). Defaults to off for a clean interface.
+    #[arg(long, short = 'v', default_value = "off")]
     log_level: String,
 
     #[command(subcommand)]
@@ -107,7 +111,7 @@ fn main() -> anyhow::Result<()> {
     match runtime.block_on(run(opts, multi)) {
         Ok(()) => std::process::exit(0),
         Err(err) => {
-            error!("{err:#}");
+            eprintln!("error: {err}");
             std::process::exit(1)
         }
     }
@@ -121,7 +125,7 @@ async fn run(opts: Opts, multi: MultiProgress) -> anyhow::Result<()> {
 
 async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
     if opts.list {
-        info!("listing torrent contents");
+        print_line(&multi, "listing torrent contents");
     }
 
     let initial_peers = match opts.initial_peers.as_deref() {
@@ -150,13 +154,14 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
     librqbit::librqbit_spawn(
         "stats_printer",
         tracing::trace_span!("stats_printer"),
-        stats_printer(session.clone(), multi),
+        stats_printer(session.clone(), multi.clone()),
     );
 
     let mut added = false;
     let mut handles = Vec::new();
 
     for torrent in &opts.torrent {
+        print_line(&multi, &format!("processing {torrent}..."));
         let torrent_opts = || AddTorrentOptions {
             only_files_regex: opts.only_files_matching_regex.clone(),
             overwrite: opts.overwrite,
@@ -174,9 +179,9 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
             .await
         {
             Ok(AddTorrentResponse::AlreadyManaged(id, handle)) => {
-                info!(
-                    "torrent {torrent:?} already managed, id={id}, hash={:?}",
-                    handle.info_hash()
+                print_line(
+                    &multi,
+                    &format!("already managed (id={id}, hash={:?})", handle.info_hash()),
                 );
                 continue;
             }
@@ -188,21 +193,25 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
                         Some(files) => files.contains(&idx),
                         None => true,
                     };
-                    info!(
-                        "file {:?}, size {}{}",
-                        file.filename,
-                        SF::new(file.len),
-                        if included { "" } else { ", will skip" }
+                    print_line(
+                        &multi,
+                        &format!(
+                            "[{idx}] {:?} ({}){}",
+                            file.filename,
+                            SF::new(file.len),
+                            if included { "" } else { ", will skip" }
+                        ),
                     );
                 }
                 continue;
             }
             Ok(AddTorrentResponse::Added(_, handle)) => {
+                print_line(&multi, &format!("added, hash={:?}", handle.info_hash()));
                 added = true;
                 handles.push(handle);
             }
             Err(err) => {
-                error!("error adding {torrent:?}: {err:#}");
+                print_line(&multi, &format!("failed: {err}"));
                 continue;
             }
         }
@@ -220,7 +229,7 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
         let results = futures::future::join_all(handles.iter().map(|h| h.wait_until_completed()));
         let results = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                warn!("received Ctrl+C, shutting down");
+                print_line(&multi, "interrupted by Ctrl+C, shutting down");
                 return Ok(());
             }
             r = results => r,
@@ -228,22 +237,22 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
         if results.iter().any(|r| r.is_err()) {
             bail!("some downloads failed");
         }
-        info!("all downloads completed");
+        print_line(&multi, "all downloads completed");
     } else {
         tokio::signal::ctrl_c().await?;
-        warn!("received Ctrl+C, shutting down");
+        print_line(&multi, "interrupted by Ctrl+C, shutting down");
     }
 
     Ok(())
 }
 
-struct TorrentBars {
-    status: ProgressBar,
-    files: Vec<ProgressBar>,
+struct TorrentBar {
+    bar: ProgressBar,
+    main_file: Option<(usize, u64)>,
 }
 
 async fn stats_printer(session: Arc<Session>, multi: MultiProgress) -> anyhow::Result<()> {
-    let bars: RefCell<HashMap<usize, TorrentBars>> = RefCell::new(HashMap::new());
+    let bars: RefCell<HashMap<usize, TorrentBar>> = RefCell::new(HashMap::new());
 
     loop {
         session.with_torrents(|torrents| {
@@ -253,96 +262,36 @@ async fn stats_printer(session: Arc<Session>, multi: MultiProgress) -> anyhow::R
 
                 let mut bars = bars.borrow_mut();
                 let tb = bars.entry(idx).or_insert_with(|| {
-                    let status = multi.add(ProgressBar::new_spinner());
-                    status.set_style(
-                        ProgressStyle::with_template("{spinner:.green} {msg}")
-                            .unwrap()
-                            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈"),
-                    );
-                    status.enable_steady_tick(Duration::from_millis(100));
-
                     let file_infos = torrent
                         .with_metadata(|m| m.file_infos.clone())
                         .unwrap_or_default();
-                    let files = file_infos
-                        .into_iter()
-                        .map(|fi| {
-                            let bar = multi.add(ProgressBar::new(fi.len));
-                            bar.set_style(
-                                ProgressStyle::with_template(
-                                    "{msg} [{bar:34.cyan/blue}] {pos}/{len} ({percent}%)",
-                                )
-                                .unwrap()
-                                .progress_chars("=>-"),
-                            );
-                            bar.set_message(format!(
-                                "[{}] {}",
-                                idx,
-                                fi.relative_filename.display()
-                            ));
-                            bar
-                        })
-                        .collect::<Vec<_>>();
+                    let main_file = file_infos
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, fi)| fi.len)
+                        .map(|(i, fi)| (i, fi.len));
 
-                    TorrentBars { status, files }
+                    let bar = multi.add(ProgressBar::new(stats.total_bytes.max(1)));
+                    bar.set_style(
+                        ProgressStyle::with_template("{msg} [{bar:34.cyan/blue}]")
+                            .unwrap()
+                            .progress_chars("=>-"),
+                    );
+                    bar.set_message(format!("[{idx}] {name}"));
+
+                    TorrentBar { bar, main_file }
                 });
 
-                if let TorrentStatsState::Initializing = stats.state {
-                    let total = stats.total_bytes;
-                    let progress = stats.progress_bytes;
-                    let pct = if total == 0 {
-                        0.0
-                    } else {
-                        (progress as f64 / total as f64) * 100.0
-                    };
-                    tb.status
-                        .set_message(format!("[{idx}] {name}: inicializando {pct:.2}%"));
-                    continue;
-                }
-
-                let (live, _live_stats) = match (torrent.live(), stats.live.as_ref()) {
-                    (Some(live), Some(_live_stats)) => (live, _live_stats),
-                    _ => continue,
+                let (pos, len) = match tb.main_file {
+                    Some((i, file_len)) => {
+                        (stats.file_progress.get(i).copied().unwrap_or(0), file_len)
+                    }
+                    None => (stats.progress_bytes, stats.total_bytes),
                 };
-                let down_speed = live.down_speed_estimator();
-                let up_speed = live.up_speed_estimator();
-                let total = stats.total_bytes;
-                let progress = stats.progress_bytes;
-                let downloaded_pct = if stats.finished {
-                    100.0
-                } else {
-                    (progress as f64 / total as f64) * 100.0
-                };
-                let eta = match down_speed.time_remaining() {
-                    Some(d) => format!(", ETA: {d:?}"),
-                    None => String::new(),
-                };
-
+                tb.bar.set_length(len.max(1));
+                tb.bar.set_position(pos);
                 if stats.finished {
-                    tb.status.set_message(format!(
-                        "[{idx}] {name}: concluído — {downloaded_pct:.2}% ({}/{})",
-                        SF::new(progress),
-                        SF::new(total),
-                    ));
-                    tb.status.finish();
-                } else {
-                    tb.status.set_message(format!(
-                        "[{idx}] {name}: {downloaded_pct:.2}% ({}/{}) ↓{:.2} MiB/s ↑{:.2} MiB/s{}",
-                        SF::new(progress),
-                        SF::new(total),
-                        down_speed.mbps(),
-                        up_speed.mbps(),
-                        eta,
-                    ));
-                }
-
-                for (fi, bar) in tb.files.iter().enumerate() {
-                    if let Some(prog) = stats.file_progress.get(fi) {
-                        bar.set_position(*prog);
-                    }
-                    if stats.finished {
-                        bar.finish();
-                    }
+                    tb.bar.finish();
                 }
             }
         });
