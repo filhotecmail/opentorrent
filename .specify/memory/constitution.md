@@ -52,7 +52,7 @@ de propor regras de estilo, tipos, ownership, performance ou testes.
 ### VIII. Build Velocity (NON-NEGOTIABLE)
 <!-- Referência: https://corrode.dev/blog/tips-for-faster-rust-compile-times -->
 O loop de desenvolvimento local e o CI MUST seguir as regras mínimas da seção
-`## Otimização de Tempos de Compilação` do `AGENTS.md`. Regras-non-negotiable:
+`## Otimização de Tempos de Compilação` do `AGENTS.md`. Regras non-negotiable:
 - `cargo check` no lugar de `cargo build` durante iteração; parar de gerar
   binário desnecessário.
 - Toolchain atualizada (`rustup update`).
