@@ -57,12 +57,38 @@ fn print_line(multi: &MultiProgress, msg: &str) {
     });
 }
 
-/// The default output folder when `-o` is not provided.
+/// O diretório de saída padrão quando `-o` não é informado (US-038): resolve a
+/// pasta pessoal de forma cross-platform e monta o caminho de downloads.
 fn default_output_folder() -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME environment variable is not set")?;
-    Ok(PathBuf::from(home)
-        .join("downloads")
-        .join("torrent-downloads"))
+    Ok(default_output_folder_from(&home_dir()?))
+}
+
+/// Monta o caminho padrão de downloads a partir da pasta pessoal.
+/// Windows: `%USERPROFILE%\Downloads\torrent-downloads`; demais SOs:
+/// `$HOME/downloads/torrent-downloads`.
+fn default_output_folder_from(home: &Path) -> PathBuf {
+    let mut path = home.to_path_buf();
+    #[cfg(target_os = "windows")]
+    path.push("Downloads");
+    #[cfg(not(target_os = "windows"))]
+    path.push("downloads");
+    path.push("torrent-downloads");
+    path
+}
+
+/// Resolve a pasta pessoal do usuário de forma cross-platform (US-038): usa
+/// `$HOME` no Unix e `%USERPROFILE%` no Windows (fallback automático do crate
+/// `dirs`) — a inicialização não aborta se `HOME` não estiver definida.
+fn home_dir() -> anyhow::Result<PathBuf> {
+    dirs::home_dir().context("could not determine the user home directory")
+}
+
+/// Diretório de dados de configuração da aplicação (US-038): `%APPDATA%\opentorrent`
+/// no Windows e `~/.config/opentorrent` no Unix (via `dirs::config_dir()`).
+fn config_folder() -> anyhow::Result<PathBuf> {
+    dirs::config_dir()
+        .context("could not determine the user config directory")
+        .map(|dir| dir.join("opentorrent"))
 }
 
 /// Whether the torrent's files already exist in the given output folder.
@@ -306,12 +332,9 @@ async fn run_interactive() -> anyhow::Result<()> {
     std::fs::create_dir_all(&output_folder)
         .with_context(|| format!("error creating output folder {}", output_folder.display()))?;
 
-    // US-009 FR-001a: persist the session to ~/.config/opentorrent/session.json.
-    let session_folder = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME environment variable is not set")?
-        .join(".config")
-        .join("opentorrent");
+    // US-009 FR-001a: persiste a sessão em ~/.config/opentorrent no Unix e em
+    // %APPDATA%\opentorrent no Windows (resolução cross-platform, US-038).
+    let session_folder = config_folder()?;
     let session_opts = SessionOptions {
         fastresume: true,
         persistence: Some(SessionPersistenceConfig::Json {
@@ -761,5 +784,36 @@ mod tests {
         let cmd = update_command("v0.1.16");
         assert!(cmd.contains("opentorrent-v0.1.16-linux-x86_64"));
         assert!(cmd.contains("chmod +x opentorrent"));
+    }
+
+    #[test]
+    fn default_output_folder_uses_platform_downloads_dir() {
+        let folder = default_output_folder_from(Path::new("/home/usuario"));
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            folder,
+            Path::new("/home/usuario/Downloads/torrent-downloads")
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            folder,
+            Path::new("/home/usuario/downloads/torrent-downloads")
+        );
+    }
+
+    #[test]
+    fn default_output_folder_resolves_cross_platform() {
+        // US-038: a resolução não depende da variável `$HOME`; o crate `dirs`
+        // usa `%USERPROFILE%` no Windows (fallback automático) e o passwd no
+        // Unix quando a variável está ausente.
+        let folder = default_output_folder().expect("pasta pessoal resolvida");
+        assert!(folder.ends_with("torrent-downloads"));
+    }
+
+    #[test]
+    fn config_folder_is_opentorrent_under_config_dir() {
+        // US-038: %APPDATA%\opentorrent no Windows / ~/.config/opentorrent no Unix.
+        let folder = config_folder().expect("diretório de configuração resolvido");
+        assert_eq!(folder.file_name().unwrap(), "opentorrent");
     }
 }

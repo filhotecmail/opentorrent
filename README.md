@@ -226,8 +226,9 @@ Invoke-WebRequest -Uri https://github.com/filhotecmail/opentorrent/releases/late
 .\opentorrent.exe --version
 ```
 
-Para usá-lo de qualquer diretório, coloque o `opentorrent.exe` em uma pasta do
-`PATH` (ou adicione a pasta atual ao `PATH` da sessão):
+Para usá-lo de qualquer diretório — com o comando `opentorrent` sem o prefixo
+`.\` — coloque o `opentorrent.exe` em uma pasta do `PATH` (ou adicione a pasta
+atual ao `PATH` da sessão):
 
 ```powershell
 # Ex.: instala em uma pasta do PATH criada para ferramentas do usuário
@@ -235,8 +236,23 @@ New-Item -ItemType Directory -Force -Path "$HOME\bin" | Out-Null
 Move-Item -Force .\opentorrent.exe "$HOME\bin\opentorrent.exe"
 $env:Path += ";$HOME\bin"
 
+# Agora o comando funciona em qualquer diretório, sem ".\":
+opentorrent --version
+
 # Em janelas futuras, adicione a linha acima ao perfil do PowerShell:
 # notepad $PROFILE  →  $env:Path += ";$HOME\bin"
+```
+
+No **CMD**, o equivalente é:
+
+```bat
+:: Instala em %USERPROFILE%\bin e adiciona ao PATH da sessão
+mkdir %USERPROFILE%\bin
+move opentorrent.exe %USERPROFILE%\bin\
+set PATH=%PATH%;%USERPROFILE%\bin
+opentorrent --version
+:: Para persistir em todas as sessões:
+::   setx PATH "%PATH%;%USERPROFILE%\bin"
 ```
 
 > **Alternativa sem downloads:** se o `cargo` estiver instalado, compile
@@ -524,6 +540,11 @@ US:
   último commit, CodeQL/Code Scanning, Codespaces e Discussions), análise
   estática de segurança via CodeQL e publicação de release também para Windows
   (instalação via PowerShell).
+- **US-038** — Suporte cross-platform na resolução do diretório Home: uso de
+  `dirs::home_dir()`/`dirs::config_dir()` com fallback automático para
+  `%USERPROFILE%`/`%APPDATA%` no Windows (o `opentorrent.exe` inicia sem depender
+  da variável `$HOME`) e orientação de `PATH` para executar `opentorrent` sem o
+  prefixo `.\`.
 
 ## Licença
 
