@@ -996,9 +996,16 @@ impl Tui {
         };
         match target {
             DeleteTarget::Torrent { id, name } => {
-                self.session
+                // Erro capturado como aviso (e não propagado): uma falha ao
+                // apagar os arquivos não deve encerrar a TUI via handle_event.
+                if let Err(err) = self
+                    .session
                     .delete(librqbit::api::TorrentIdOrHash::Id(id), true)
-                    .await?;
+                    .await
+                {
+                    self.notice = Some(format!("falha ao excluir: {err:#}"));
+                    return Ok(());
+                }
                 self.notice = Some(format!("excluído: {name} (arquivos removidos)"));
             }
             DeleteTarget::Pending { name } => {
