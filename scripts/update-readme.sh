@@ -24,13 +24,43 @@ nlabels=$(jq -r 'length' "$TMPDIR_C/labels.json")
 latest_tag=$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || echo "—")
 
 # --- 1) Badges dinâmicos ----------------------------------------------
-ci_badge="[![CI](https://github.com/$REPO/actions/workflows/ci.yml/badge.svg?branch=$default_branch)](https://github.com/$REPO/actions/workflows/ci.yml)"
+# Mantém o mesmo conteúdo do bloco BADGES_START do README.md. As badges com
+# valor dinâmico (branch/tag) usam as variáveis acima; as demais são estáveis.
+msrv_badge="[![MSRV](https://img.shields.io/badge/MSRV-1.85+-orange?logo=rust)](https://github.com/$REPO/blob/$default_branch/Cargo.toml)"
+platform_badge="[![Plataforma](https://img.shields.io/badge/plataforma-linux%20x86__64%20%7C%20windows%20x86__64-blue)](https://github.com/$REPO/releases/latest)"
+downloads_badge="[![Downloads](https://img.shields.io/github/downloads/$REPO/total?color=2ea44f&label=downloads)](https://github.com/$REPO/releases)"
+ci_push_badge="[![CI push](https://github.com/$REPO/actions/workflows/ci.yml/badge.svg?event=push&branch=$default_branch)](https://github.com/$REPO/actions/workflows/ci.yml)"
+ci_pr_badge="[![CI pull request](https://github.com/$REPO/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/$REPO/actions/workflows/ci.yml)"
+ci_sched_badge="[![CI schedule](https://github.com/$REPO/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/$REPO/actions/workflows/ci.yml)"
+deps_badge="[![Dependências auditadas](https://deps.rs/repo/github/$REPO/badge.svg)](https://deps.rs/repo/github/$REPO)"
+codeql_badge="[![CodeQL](https://github.com/$REPO/actions/workflows/codeql.yml/badge.svg?branch=$default_branch)](https://github.com/$REPO/security/code-scanning)"
 cov_badge="[![Cobertura](https://codecov.io/gh/$REPO/branch/$default_branch/graph/badge.svg)](https://codecov.io/gh/$REPO)"
+last_commit_badge="[![Último commit](https://img.shields.io/github/last-commit/$REPO/$default_branch)](https://github.com/$REPO/commits/$default_branch)"
+codespaces_badge="[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/$REPO)"
+discussions_badge="[![GitHub Discussions](https://img.shields.io/badge/Discussions-junte-se-8a2be2)](https://github.com/$REPO/discussions)"
 release_badge="[![Release](https://img.shields.io/badge/release-$latest_tag-blue)](https://github.com/$REPO/releases)"
 issues_badge="[![Issues abertas](https://img.shields.io/github/issues/$REPO)](https://github.com/$REPO/issues)"
 
-badges="$ci_badge
+badges="**Métricas e Compatibilidade**
+
+$msrv_badge
+$platform_badge
+$downloads_badge
+
+**Qualidade e Segurança**
+
+$ci_push_badge
+$ci_pr_badge
+$ci_sched_badge
+$deps_badge
+$codeql_badge
 $cov_badge
+
+**Atividade e Comunidade**
+
+$last_commit_badge
+$codespaces_badge
+$discussions_badge
 $release_badge
 $issues_badge"
 

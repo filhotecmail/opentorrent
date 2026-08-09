@@ -27,6 +27,10 @@ AGENTS.md
 # Logs
 *.log
 
+# Cobertura (cargo tarpaulin) e profiling
+/coverage/
+*.profraw
+
 # Editores/IDEs
 .vscode/
 .idea/

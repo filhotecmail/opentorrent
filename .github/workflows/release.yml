@@ -87,9 +87,42 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # Compila o binário para Windows (nativo em windows-latest) e o compartilha
+  # com o job de publicação via artefato. Não assina (a assinatura RSA-SHA256
+  # local é aplicada apenas ao binário Linux pelo job `release`).
+  windows:
+    name: Compilar para Windows
+    needs: check
+    if: needs.check.outputs.exists == 'false'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Compilar binário de release
+        run: cargo build --release --verbose
+
+      - name: Empacotar artefato Windows
+        shell: bash
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          mkdir -p dist
+          cp target/release/opentorrent.exe "dist/opentorrent-$TAG-windows-x86_64.exe"
+          cp target/release/opentorrent.exe "dist/opentorrent-windows-x86_64.exe"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: dist
+          retention-days: 1
+
   release:
     name: Compilar e publicar release
-    needs: check
+    needs: [check, windows]
     if: needs.check.outputs.exists == 'false'
     runs-on: ubuntu-latest
     steps:
@@ -136,7 +169,14 @@ jobs:
 
       # AC-4: artefatos com nome estável (instalação via /releases/latest) e
       # nome versionado (rastreabilidade exata da versão), ambos com .sig.
-      - name: Empacotar artefatos
+      # Primeiro agrega o .exe do Windows compilado no job `windows`.
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: dist
+          merge-multiple: true
+
+      - name: Empacotar artefatos Linux
         run: |
           TAG="${{ needs.check.outputs.tag }}"
           mkdir -p dist
@@ -162,6 +202,13 @@ jobs:
             curl -L -o opentorrent https://github.com/filhotecmail/opentorrent/releases/latest/download/opentorrent-linux-x86_64
             chmod +x opentorrent
             sudo mv opentorrent /usr/local/bin/
+            ```
+
+            Instalação (Windows — PowerShell):
+
+            ```powershell
+            Invoke-WebRequest -Uri https://github.com/filhotecmail/opentorrent/releases/latest/download/opentorrent-windows-x86_64.exe -OutFile opentorrent.exe
+            .\opentorrent.exe --version
             ```
           files: dist/*
           fail_on_unmatched_files: true

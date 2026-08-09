@@ -1,15 +1,33 @@
 # OpenTorrent
 
 <!-- BADGES_START -->
-[![CI](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
+**Métricas e Compatibilidade**
+
+[![MSRV](https://img.shields.io/badge/MSRV-1.85+-orange?logo=rust)](https://github.com/filhotecmail/opentorrent/blob/master/Cargo.toml)
+[![Plataforma](https://img.shields.io/badge/plataforma-linux%20x86__64%20%7C%20windows%20x86__64-blue)](https://github.com/filhotecmail/opentorrent/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/filhotecmail/opentorrent/total?color=2ea44f&label=downloads)](https://github.com/filhotecmail/opentorrent/releases)
+
+**Qualidade e Segurança**
+
+[![CI push](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?event=push&branch=master)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
+[![CI pull request](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
+[![CI schedule](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
+[![Dependências auditadas](https://deps.rs/repo/github/filhotecmail/opentorrent/badge.svg)](https://deps.rs/repo/github/filhotecmail/opentorrent)
+[![CodeQL](https://github.com/filhotecmail/opentorrent/actions/workflows/codeql.yml/badge.svg?branch=master)](https://github.com/filhotecmail/opentorrent/security/code-scanning)
 [![Cobertura](https://codecov.io/gh/filhotecmail/opentorrent/branch/master/graph/badge.svg)](https://codecov.io/gh/filhotecmail/opentorrent)
-[![Release](https://img.shields.io/badge/release-v0.1.20-blue)](https://github.com/filhotecmail/opentorrent/releases)
+
+**Atividade e Comunidade**
+
+[![Último commit](https://img.shields.io/github/last-commit/filhotecmail/opentorrent/master)](https://github.com/filhotecmail/opentorrent/commits/master)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/filhotecmail/opentorrent)
+[![GitHub Discussions](https://img.shields.io/badge/Discussions-junte-se-8a2be2)](https://github.com/filhotecmail/opentorrent/discussions)
+[![Release](https://img.shields.io/badge/release-v0.1.24-blue)](https://github.com/filhotecmail/opentorrent/releases)
 [![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
 <!-- BADGES_END -->
 
-Um cliente BitTorrent de **linha de comando (CLI)** para **Ubuntu/Linux** que
-baixa **torrents** e **magnet links** diretamente do terminal, sem interface
-gráfica.
+Um cliente BitTorrent de **linha de comando (CLI)** para **Linux/Ubuntu e
+Windows** que baixa **torrents** e **magnet links** diretamente do terminal,
+sem interface gráfica.
 
 ## O que é este projeto?
 
@@ -59,10 +77,11 @@ dependências externas de runtime.
 
 ```text
 opentorrent/
-├── Cargo.toml              # Manifesto: nome, versão, edição (2024), dependências e perfis
+├── Cargo.toml              # Manifesto: nome, versão, edição (2024), MSRV e dependências
 ├── Cargo.lock              # Versões exatas das dependências travadas (commitado)
 ├── build.rs                # Gera a nota .note.opentorrent com metadados do projeto (US-021)
 ├── build.sh                # Helper de build: bump de versão, build verbose e assinatura
+├── .devcontainer/          # Container de desenvolvimento para GitHub Codespaces (US-034)
 ├── src/
 │   ├── main.rs             # CLI (clap), sessão de download (librqbit) e checagem de versão (US-029)
 │   ├── session_ui.rs       # TUI interativa: Header/Body/Footer, tabela, modal, mouse
@@ -70,11 +89,11 @@ opentorrent/
 │   └── metadata.rs         # Metadados embutidos na seção .note.opentorrent do ELF
 ├── scripts/
 │   ├── sign-release.sh     # Assinatura digital do binário (CA local, RSA-SHA256) — US-018
-│   ├── update-readme.sh    # Gerador do README vivo (estado do projeto)
+│   ├── update-readme.sh    # Gerador do README vivo (badges e estado do projeto)
 │   └── us-pipeline.sh      # Automação do pipeline de US (start/finish/state) — US-017
 ├── specs/                  # Especificações das user stories (specs/001 a specs/018)
 ├── .github/
-│   └── workflows/          # CI, Release (US-030), README vivo, auto-merge, notificações
+│   └── workflows/          # CI, CodeQL, Release (US-030), README vivo, auto-merge, notificações
 ├── .cargo/config.toml      # Linker mold (linkagem rápida em dev)
 ├── .gitignore              # Arquivos/pastas que não entram no repositório
 └── README.md               # Este arquivo
@@ -119,9 +138,11 @@ Necessárias apenas para **compilar** (gerar o binário):
 | `pkg-config` | Localização de bibliotecas nativas durante o build |
 | `libssl-dev` | Headers de OpenSSL (necessários por algumas dependências transitivas) |
 
-## Instalação (Ubuntu)
+## Instalação
 
-### Opção 1 — Instalar a partir do Release (recomendado)
+### Linux (Ubuntu)
+
+#### Instalar a partir do Release (recomendado)
 
 Cada release do GitHub publica o binário compilado para **Linux x86_64**. Para
 instalar, basta baixar o binário da última release (sem hardcode de versão) e
@@ -156,11 +177,11 @@ opentorrent --version
 disponível, com o comando de atualização sugerido (US-029).
 
 > **Releases automáticas:** cada push na `master` que incremente a versão do
-> `Cargo.toml` publica automaticamente uma nova release (binário assinado +
-> `.sig`) pelo workflow `Release` — não é preciso criar a release manualmente.
+> `Cargo.toml` publica automaticamente uma nova release (binários Linux +
+> Windows) pelo workflow `Release` — não é preciso criar a release manualmente.
 
-> **Verificação da assinatura (US-018):** cada release publica o binário com
-> seu arquivo `.sig` (RSA-SHA256, assinado por uma CA local). O pipeline de
+> **Verificação da assinatura (US-018):** cada release publica o binário Linux
+> com seu arquivo `.sig` (RSA-SHA256, assinado por uma CA local). O pipeline de
 > release já valida a integridade antes de publicar; para conferir
 > manualmente (desenvolvedores/mantenedores que possuem a chave pública da
 > CA local em `~/.local/share/opentorrent/signing/`):
@@ -171,7 +192,7 @@ disponível, com o comando de atualização sugerido (US-029).
 > openssl dgst -sha256 -verify ~/.local/share/opentorrent/signing/code-signing.pub -signature opentorrent-linux-x86_64.sig opentorrent
 > ```
 
-### Opção 2 — Compilar a partir do código-fonte
+#### Compilar a partir do código-fonte
 
 ```bash
 # 1. Dependências de sistema (apenas para compilar)
@@ -188,6 +209,43 @@ cargo build --release
 ```
 
 O binário estará em `target/release/opentorrent`.
+
+### Windows
+
+#### Baixar e instalar (PowerShell)
+
+Cada release do GitHub publica o executável compilado para **Windows x86_64**
+(`opentorrent-windows-x86_64.exe`). No **PowerShell** (abra o menu Iniciar,
+digite `powershell` e pressione Enter):
+
+```powershell
+# Baixa o executável da última release automaticamente
+Invoke-WebRequest -Uri https://github.com/filhotecmail/opentorrent/releases/latest/download/opentorrent-windows-x86_64.exe -OutFile opentorrent.exe
+
+# Verifica a instalação (informa também se há versão mais recente)
+.\opentorrent.exe --version
+```
+
+Para usá-lo de qualquer diretório, coloque o `opentorrent.exe` em uma pasta do
+`PATH` (ou adicione a pasta atual ao `PATH` da sessão):
+
+```powershell
+# Ex.: instala em uma pasta do PATH criada para ferramentas do usuário
+New-Item -ItemType Directory -Force -Path "$HOME\bin" | Out-Null
+Move-Item -Force .\opentorrent.exe "$HOME\bin\opentorrent.exe"
+$env:Path += ";$HOME\bin"
+
+# Em janelas futuras, adicione a linha acima ao perfil do PowerShell:
+# notepad $PROFILE  →  $env:Path += ";$HOME\bin"
+```
+
+> **Alternativa sem downloads:** se o `cargo` estiver instalado, compile
+> diretamente com `cargo install --git https://github.com/filhotecmail/opentorrent`
+> ou `cargo build --release` a partir do código-fonte (Rust 1.85+).
+
+**Para atualizar:** repita o `Invoke-WebRequest` acima — o endpoint
+`/releases/latest` sempre aponta para a versão mais recente, e o
+`opentorrent --version` avisa quando há release nova (US-029).
 
 ## Quickstart
 
@@ -208,6 +266,10 @@ opentorrent add "magnet:?xt=urn:btih:..."
 # 4. Acompanha a sessão interativa (menu, fila e barra de progresso com mouse)
 opentorrent
 ```
+
+> **No Windows (PowerShell):** troque o passo 1 por
+> `Invoke-WebRequest -Uri https://github.com/filhotecmail/opentorrent/releases/latest/download/opentorrent-windows-x86_64.exe -OutFile opentorrent.exe`
+> e use `.\opentorrent.exe` nos demais comandos.
 
 ## Uso
 
@@ -358,15 +420,17 @@ O repositório usa **GitHub Actions** em `.github/workflows/`, executado a cada
 | Workflow | Arquivo | Verificações |
 | --- | --- | --- |
 | **CI** | `ci.yml` | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, `cargo machete` |
+| **CodeQL** | `codeql.yml` | análise estática de segurança (Code Scanning) para Rust (US-034) |
 | **Cobertura** | `coverage.yml` | `cargo tarpaulin` → relatório XML (artefato + Codecov) |
 | **Qualidade de issues** | `issue-quality.yml` | comenta e sinaliza issues sem label/milestone |
 | **Notificações** | `notify.yml` | emails para `filhotecmail@gmail.com` (commits, issues, PRs, discussões, CI, releases) |
 | **README vivo** | `readme-live.yml` | regenera badges e estado do projeto no README |
-| **Release** | `release.yml` | publica release automática no push de tag `v*` ou push na master com bump de versão (US-030) |
+| **Release** | `release.yml` | publica release automática (Linux + Windows) no push de tag `v*` ou push na master com bump de versão (US-030) |
 | **Dependabot** | `dependabot.yml` | atualizações semanais de deps Cargo e Actions |
 
 Benefícios: PRs são bloqueados se qualquer verificação falhar; métricas de
-cobertura ficam visíveis no badge do README e no Codecov. Para ativar o badge
+cobertura ficam visíveis no badge do README e no Codecov; os relatórios de
+segurança aparecem em **Security → Code scanning**. Para ativar o badge
 de cobertura, configure o token do Codecov em `Settings → Secrets →
 CODECOV_TOKEN` (o passo de CI não falha sem ele).
 
@@ -456,6 +520,10 @@ US:
 - **US-030** — Pipeline de CI/CD de release no GitHub Actions: publica o binário
   assinado automaticamente no push de tag `v*` ou push na master com bump de
   versão (instalação via `/releases/latest`).
+- **US-034** — Badges de saúde no README (MSRV, deps.rs, downloads, plataformas,
+  último commit, CodeQL/Code Scanning, Codespaces e Discussions), análise
+  estática de segurança via CodeQL e publicação de release também para Windows
+  (instalação via PowerShell).
 
 ## Licença
 
