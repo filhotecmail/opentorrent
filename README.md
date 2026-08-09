@@ -160,12 +160,15 @@ disponível, com o comando de atualização sugerido (US-029).
 > `.sig`) pelo workflow `Release` — não é preciso criar a release manualmente.
 
 > **Verificação da assinatura (US-018):** cada release publica o binário com
-> seu arquivo `.sig` (RSA-SHA256, CA local). Para conferir a integridade do
-> binário baixado:
+> seu arquivo `.sig` (RSA-SHA256, assinado por uma CA local). O pipeline de
+> release já valida a integridade antes de publicar; para conferir
+> manualmente (desenvolvedores/mantenedores que possuem a chave pública da
+> CA local em `~/.local/share/opentorrent/signing/`):
 >
 > ```bash
+> # Baixa a assinatura e verifica o binário `opentorrent` já baixado
 > curl -LO https://github.com/filhotecmail/opentorrent/releases/latest/download/opentorrent-linux-x86_64.sig
-> openssl dgst -sha256 -verify ~/.local/share/opentorrent/signing/code-signing.pub -signature opentorrent-linux-x86_64.sig opentorrent-linux-x86_64
+> openssl dgst -sha256 -verify ~/.local/share/opentorrent/signing/code-signing.pub -signature opentorrent-linux-x86_64.sig opentorrent
 > ```
 
 ### Opção 2 — Compilar a partir do código-fonte
@@ -270,7 +273,7 @@ A sessão exibe uma tabela com colunas `ID`, `PROGRESSO`, `STATUS`, `NOME` e
 Em um terminal interativo (TTY), cada linha exibe botões clicáveis à direita:
 
 ```text
->  [0] ██████████░░░░░░░░░░ 45.2% baixando  debian.iso  [Pausar ] [Parar  ] [Excluir]
+>  [0] ██████████░░░░░░░░░░ 45.2% baixando  debian.iso  [Pausar ] [Parar   ] [Excluir]
 ```
 
 | Botão / Tecla | Ação |
