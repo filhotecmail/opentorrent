@@ -1884,8 +1884,9 @@ fn table_row_to_index(row: u16, first_row: u16, row_count: usize, stride: u16) -
     Some((offset / stride) as usize)
 }
 
-/// Linha divisória sutil (US-028): `─` repetido pela largura da tabela, em tom
-/// escuro (`THEME.muted`), separando registros sem gastar linhas em branco.
+/// Linha divisória sutil (US-028): `─` repetido pela largura da tabela,
+/// separando registros sem gastar linhas em branco. A cor escura
+/// (`THEME.muted`) é aplicada pelo chamador na sobreposição.
 fn separator_line(width: usize) -> String {
     "─".repeat(width)
 }
