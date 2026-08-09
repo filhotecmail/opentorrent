@@ -2549,7 +2549,7 @@ fn table_row_to_index(row: u16, first_row: u16, row_count: usize, stride: u16) -
         return None;
     }
     let offset = row - first_row;
-    if !offset.is_multiple_of(stride) {
+    if offset % stride != 0 {
         return None;
     }
     Some((offset / stride) as usize)

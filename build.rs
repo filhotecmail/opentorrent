@@ -32,7 +32,8 @@ fn main() {
     note.extend_from_slice(note_name);
     note.extend_from_slice(desc_text.as_bytes());
     // Padding final para manter o alinhamento de 4 bytes do formato.
-    while !note.len().is_multiple_of(4) {
+    // (`is_multiple_of` é estável só desde 1.87; MSRV do projeto é 1.85.)
+    while note.len() % 4 != 0 {
         note.push(0);
     }
 
