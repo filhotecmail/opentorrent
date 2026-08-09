@@ -128,6 +128,9 @@ struct Layout {
     rows_offset: u16,
     /// Número de entradas renderizadas.
     row_count: usize,
+    /// Linhas de tela ocupadas por cada entrada (1 = consecutivas; 2 = com
+    /// linha de separação/gap entre elas, usado na tabela de downloads).
+    row_stride: u16,
     /// Largura da parte informativa da linha (define a coluna dos botões).
     info_width: u16,
     /// Se a sessão exibe botões de ação clicáveis.
@@ -689,11 +692,11 @@ impl Tui {
             return;
         };
         let first_row = layout.top.saturating_add(layout.rows_offset);
-        let end = first_row.saturating_add(layout.row_count as u16);
-        if row < first_row || row >= end {
+        let Some(idx) = table_row_to_index(row, first_row, layout.row_count, layout.row_stride)
+        else {
             return;
-        }
-        self.menu_index = (row - first_row) as usize;
+        };
+        self.menu_index = idx;
     }
 
     /// Clique nas opções do diálogo de inclusão (fora do modo de digitação).
@@ -702,11 +705,11 @@ impl Tui {
             return;
         };
         let first_row = layout.top.saturating_add(layout.rows_offset);
-        let end = first_row.saturating_add(layout.row_count as u16);
-        if row < first_row || row >= end {
+        let Some(idx) = table_row_to_index(row, first_row, layout.row_count, layout.row_stride)
+        else {
             return;
-        }
-        self.include_index = (row - first_row) as usize;
+        };
+        self.include_index = idx;
     }
 
     /// Maps a click on the session view to the clicked row and action button.
@@ -718,11 +721,10 @@ impl Tui {
             return Ok(());
         };
         let first_row = layout.top.saturating_add(layout.rows_offset);
-        let end = first_row.saturating_add(layout.row_count as u16);
-        if row < first_row || row >= end {
+        let Some(idx) = table_row_to_index(row, first_row, layout.row_count, layout.row_stride)
+        else {
             return Ok(());
-        }
-        let idx = (row - first_row) as usize;
+        };
 
         // Sem botões renderizados (terminal estreito) ou clique fora da área
         // dos botões: apenas move a seleção para a linha clicada.
@@ -1144,6 +1146,7 @@ impl Tui {
             left: content_left,
             rows_offset: MENU_ITEMS_OFFSET as u16,
             row_count: MENU_ITEMS.len(),
+            row_stride: 1,
             info_width: 0,
             show_actions: false,
         });
@@ -1188,9 +1191,14 @@ impl Tui {
         // seguida com `put_styled` (verde/amarelo/vermelho/ciano).
         let mut bars: Vec<(usize, String, Color)> = Vec::new();
 
+        let total_entries = rows_data.len() + pending.len();
         if rows_data.is_empty() && pending.is_empty() {
             lines.push("nenhum torrent na fila".into());
         } else {
+            // Espaçamento vertical (US-026): cada entrada é seguida de uma
+            // linha de separação (gap), exceto a última — barras de progresso
+            // consecutivas não ficam coladas umas nas outras.
+            let mut rendered = 0usize;
             for (idx, row) in rows_data.iter().enumerate() {
                 let marker = if idx == self.row_index { "> " } else { "  " };
                 let state = if row.finished {
@@ -1229,6 +1237,10 @@ impl Tui {
                     actions.as_deref(),
                 ));
                 bars.push((idx, bar, color));
+                rendered += 1;
+                if rendered < total_entries {
+                    lines.push(String::new());
+                }
             }
 
             // Origens adicionadas em segundo plano, ainda sem handle.
@@ -1252,6 +1264,10 @@ impl Tui {
                 lines.push(line);
                 bars.push((idx, bar, color));
                 idx += 1;
+                rendered += 1;
+                if rendered < total_entries {
+                    lines.push(String::new());
+                }
             }
         }
 
@@ -1262,7 +1278,9 @@ impl Tui {
         // 0 título, 1 vazio, 2 cabeçalho, 3 separador, 4+ entradas.
         let mut highlighted = Vec::new();
         if !rows_data.is_empty() || !pending.is_empty() {
-            highlighted.push(4 + self.row_index);
+            // Cada entrada ocupa 2 linhas (linha + gap); o destaque cobre
+            // apenas a linha da entrada, sem invadir a separação (US-026).
+            highlighted.push(session_row_line(self.row_index));
         }
         let (left, top) =
             self.centered_write(frame, lines, cols, body_top, body_height, &highlighted);
@@ -1270,7 +1288,7 @@ impl Tui {
         // Sobreposição da barra com cor por estado. Na linha selecionada o
         // fundo de destaque é preservado (a barra mantém sua cor por cima).
         for (line_idx, bar, color) in &bars {
-            let row = top + 4 + *line_idx as u16;
+            let row = top + session_row_line(*line_idx) as u16;
             let bg = if *line_idx == self.row_index {
                 Some(THEME.highlight_bg)
             } else {
@@ -1279,16 +1297,18 @@ impl Tui {
             frame.put_styled(row, left + ROW_PREFIX_W as u16, bar, Some(*color), bg);
         }
 
-        // Registra a geometria para o mapeamento de cliques do mouse.
-        let total_rows = rows_data.len() + pending.len();
-        if total_rows == 0 {
+        // Registra a geometria para o mapeamento de cliques do mouse. Com o
+        // espaçamento vertical (US-026) cada entrada ocupa 2 linhas de tela
+        // (stride 2); cliques na linha de gap não alteram a seleção.
+        if bars.is_empty() {
             self.layout = None;
         } else {
             self.layout = Some(Layout {
                 top,
                 left,
                 rows_offset: 4,
-                row_count: total_rows,
+                row_count: bars.len(),
+                row_stride: 2,
                 info_width: info_width as u16,
                 show_actions,
             });
@@ -1395,6 +1415,7 @@ impl Tui {
                 left: content_left,
                 rows_offset: 2,
                 row_count: 2,
+                row_stride: 1,
                 info_width: 0,
                 show_actions: false,
             });
@@ -1627,6 +1648,35 @@ fn progress_color(state: TorrentStatsState, finished: bool) -> Color {
 /// Cabeçalho da tabela estruturada da sessão (US-019): colunas alinhadas
 /// ID/PROGRESSO/STATUS/NOME, com a coluna AÇÕES apenas quando há espaço para
 /// renderizar os botões à direita.
+/// Índice (linha do bloco) que uma entrada da tabela de sessão ocupa no
+/// conjunto de linhas renderizadas. O bloco começa com 4 linhas fixas
+/// (título, vazio, cabeçalho e separador) e, com o espaçamento vertical
+/// (US-026), cada entrada ocupa 2 linhas: a própria linha + o gap.
+fn session_row_line(entry_idx: usize) -> usize {
+    4 + entry_idx * 2
+}
+
+/// Mapeia uma linha da tela para o índice da entrada de um bloco listado
+/// (menu, diálogo ou tabela), considerando o espaçamento vertical (`stride`
+/// linhas por entrada; 1 = linhas consecutivas, 2 = com linha de gap).
+/// Retorna `None` quando a linha está fora das entradas ou cai exatamente na
+/// linha de separação (gap) — um clique aí não altera a seleção.
+fn table_row_to_index(row: u16, first_row: u16, row_count: usize, stride: u16) -> Option<usize> {
+    if row_count == 0 || stride == 0 {
+        return None;
+    }
+    let last_row =
+        first_row.saturating_add((row_count as u16).saturating_sub(1).saturating_mul(stride));
+    if row < first_row || row > last_row {
+        return None;
+    }
+    let offset = row - first_row;
+    if !offset.is_multiple_of(stride) {
+        return None;
+    }
+    Some((offset / stride) as usize)
+}
+
 fn session_table_header(name_width: usize, show_actions: bool) -> String {
     // Colunas numéricas com rótulos alinhados à direita (sobre os dígitos);
     // colunas de texto alinhadas à esquerda — alinhamento perfeito com os
@@ -2312,6 +2362,29 @@ mod tests {
         assert!(header.contains("ID"));
         assert!(header.contains("PROGRESSO"));
         assert!(header.contains("AÇÕES"));
+    }
+
+    #[test]
+    fn session_row_line_accounts_for_vertical_gap() {
+        // 4 linhas fixas + 2 linhas por entrada (linha + gap de separação).
+        assert_eq!(session_row_line(0), 4);
+        assert_eq!(session_row_line(1), 6);
+        assert_eq!(session_row_line(3), 10);
+    }
+
+    #[test]
+    fn table_row_to_index_maps_with_stride() {
+        // stride 2: entradas nas linhas pares do bloco; gaps ímpares ignorados.
+        assert_eq!(table_row_to_index(10, 10, 5, 2), Some(0));
+        assert_eq!(table_row_to_index(12, 10, 5, 2), Some(1));
+        assert_eq!(table_row_to_index(11, 10, 5, 2), None); // gap
+        assert_eq!(table_row_to_index(19, 10, 5, 2), None); // além da última
+        assert_eq!(table_row_to_index(18, 10, 5, 2), Some(4));
+        // stride 1: linhas consecutivas (menus) — comportamento original.
+        assert_eq!(table_row_to_index(3, 1, 3, 1), Some(2));
+        assert_eq!(table_row_to_index(4, 1, 3, 1), None);
+        // contagem vazia
+        assert_eq!(table_row_to_index(0, 0, 0, 2), None);
     }
 
     #[test]
