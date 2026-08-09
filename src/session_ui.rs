@@ -22,10 +22,8 @@ use tokio::sync::mpsc;
 use crate::downloads::{format_completed, list_completed_downloads};
 
 /// Comandos do menu flutuante (US-031): comando e descrição funcional.
-const COMMANDS: [(&str, &str); 8] = [
+const COMMANDS: [(&str, &str); 6] = [
     ("/add", "adicionar torrent a lista"),
-    ("/list", "acompanhar progresso"),
-    ("/history", "listar downloads completos"),
     ("/pause", "pausar torrent selecionado"),
     ("/resume", "retomar torrent selecionado"),
     ("/delete", "excluir torrent selecionado"),
@@ -33,18 +31,6 @@ const COMMANDS: [(&str, &str); 8] = [
     ("/exit", "sair do OpenTorrent"),
 ];
 
-/// Largura de cada botão de ação renderizado nas linhas da sessão (ex.: `[Pausar ]`).
-const ACTION_BTN_WIDTH: u16 = 9;
-/// Espaço entre botões de ação.
-const ACTION_GAP: u16 = 1;
-/// Largura total ocupada pelos três botões de ação.
-const ACTIONS_WIDTH: u16 = 3 * ACTION_BTN_WIDTH + 2 * ACTION_GAP;
-/// Início da área do botão "parar" (após o primeiro botão + espaço).
-const ACTION_1_START: u16 = ACTION_BTN_WIDTH + ACTION_GAP;
-/// Início da área do botão "excluir" (após dois botões + dois espaços).
-const ACTION_2_START: u16 = 2 * (ACTION_BTN_WIDTH + ACTION_GAP);
-/// Largura máxima da parte informativa da linha da sessão (antes dos botões).
-const ROW_INFO_WIDTH: u16 = 90;
 /// Largura do prefixo da linha: marcador (2) + ID (4) + espaço (1).
 const ROW_PREFIX_W: usize = 7;
 /// Largura da coluna de progresso: barra de blocos + percentual adjacente.
@@ -56,15 +42,10 @@ const STATE_W: usize = 13;
 const METRICS_FIXED_W: usize = 38;
 /// Largura fixa da parte não-nome de cada linha da tabela da sessão.
 const ROW_FIXED_W: usize = ROW_PREFIX_W + PROGRESS_COL_W + 1 + STATE_W + 1;
-/// Linhas fixas do bloco da tabela de sessão antes das entradas: título,
-/// linha vazia, cabeçalho e separador. Usado pelo render e pelo mapeamento de
-/// cliques (evita divergência entre `session_row_line` e `Layout.rows_offset`).
-const SESSION_HEADER_LINES: usize = 4;
 
 /// Margens do layout full-window (US-031, estilo opencode): 2 colunas em
-/// cada lateral e 1 linha no topo/base, ocupando todo o terminal disponível.
+/// cada lateral. O topo/base é 1 linha, embutido nos painéis.
 const LAYOUT_MARGIN_COLS: u16 = 2;
-const LAYOUT_MARGIN_ROWS: u16 = 1;
 
 /// The state machine driving the interactive UI.
 enum View {
@@ -73,12 +54,46 @@ enum View {
     Home,
     /// Command palette floating popup opened by typing `/` (US-031).
     Menu,
-    /// US-009 session list with per-row actions.
-    Session,
-    /// US-009 simplified include dialog (type source / back).
-    Include,
-    /// US-010 completed downloads list.
-    Completed,
+}
+
+/// Ação de tecla única na Home (US-037), executada sobre a linha selecionada
+/// da Biblioteca quando o prompt está vazio.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HomeAction {
+    /// Pausa o torrent selecionado.
+    Pause,
+    /// Retoma o torrent selecionado.
+    Resume,
+    /// Remove o torrent selecionado da fila (sem apagar arquivos).
+    Remove,
+    /// Abre a confirmação de exclusão definitiva (US-027).
+    Delete,
+}
+
+/// Ação oferecida pelo menu de contexto da Biblioteca (US-036).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ContextAction {
+    /// Pausa o torrent clicado.
+    Pause,
+    /// Retoma o torrent clicado.
+    Resume,
+    /// Remove o torrent clicado da fila (sem apagar arquivos).
+    Stop,
+    /// Abre a confirmação de exclusão definitiva (US-027).
+    Delete,
+}
+
+/// Estado do menu de contexto aberto (US-036): item clicado da Biblioteca,
+/// opção destacada e a linha da tela onde o popup é ancorado.
+#[derive(Clone, Copy, Debug)]
+struct ContextMenu {
+    /// Índice do item clicado (torrents + pendentes, mesma indexação de
+    /// `row_index`).
+    entry_index: usize,
+    /// Opção destacada (índice em `context_menu_options`).
+    selected: usize,
+    /// Linha da tela do item clicado (âncora do popup).
+    anchor_row: u16,
 }
 
 struct SessionRow {
@@ -149,19 +164,13 @@ enum AddOutcome {
 struct Layout {
     /// Linha da tela onde o bloco de conteúdo começa.
     top: u16,
-    /// Coluna da tela onde o bloco de conteúdo começa.
-    left: u16,
     /// Deslocamento (em linhas) entre o topo do bloco e a primeira entrada.
     rows_offset: u16,
     /// Número de entradas renderizadas.
     row_count: usize,
     /// Linhas de tela ocupadas por cada entrada (1 = consecutivas; 2 = com
-    /// linha de separação/gap entre elas, usado na tabela de downloads).
+    /// linha de separação/gap entre elas).
     row_stride: u16,
-    /// Largura da parte informativa da linha (define a coluna dos botões).
-    info_width: u16,
-    /// Se a sessão exibe botões de ação clicáveis.
-    show_actions: bool,
 }
 
 /// Uma célula do buffer de tela (double buffering): um caractere + cores de
@@ -206,8 +215,6 @@ struct Theme {
     header_bg: Color,
     /// Fundo do Footer fixo.
     footer_bg: Color,
-    /// Fundo do overlay do modal (escurece a tela principal).
-    overlay_bg: Color,
     /// Fundo sólido do popup flutuante de comandos (US-031): evita que o
     /// conteúdo do painel por trás vaze nas linhas do popup.
     popup_bg: Color,
@@ -224,7 +231,6 @@ const THEME: Theme = Theme {
     highlight_bg: Color::DarkBlue,
     header_bg: Color::Blue,
     footer_bg: Color::DarkGrey,
-    overlay_bg: Color::DarkGrey,
     popup_bg: Color::DarkGrey,
 };
 
@@ -392,23 +398,20 @@ struct Tui {
     menu_index: usize,
     /// Selected session row index.
     row_index: usize,
-    /// Selected include-dialog option.
-    include_index: usize,
-    /// The torrent source typed in the include dialog.
-    include_input: String,
-    /// Cursor position within `include_input` (byte index).
-    input_cursor_pos: usize,
     /// Cursor position within the home prompt `input` (byte index).
     prompt_cursor: usize,
     /// Modo "insira o link:" do prompt da Home (US-034): ativo após `/add`
     /// sem origem; o texto digitado é a origem a adicionar.
     prompt_add_mode: bool,
-    /// Whether the include dialog is in "typing" mode (entering the source).
-    typing: bool,
     /// Transient status/error message.
     notice: Option<String>,
     /// Exclusão definitiva aguardando confirmação Y/N (US-027).
     confirming_delete: Option<DeleteTarget>,
+    /// Menu de contexto aberto na Biblioteca (US-036); `None` = fechado.
+    context_menu: Option<ContextMenu>,
+    /// Geometria (left, top, width, height) do popup de contexto no último
+    /// render (US-036), para mapear cliques do mouse nas opções.
+    context_rect: Option<(u16, u16, u16, u16)>,
     /// Keys received from the keyboard thread.
     keys: mpsc::UnboundedReceiver<Event>,
     /// Geometria do último render (usada para mapear cliques do mouse).
@@ -435,14 +438,12 @@ impl Tui {
             input: String::new(),
             menu_index: 0,
             row_index: 0,
-            include_index: 0,
-            include_input: String::new(),
-            input_cursor_pos: 0,
             prompt_cursor: 0,
             prompt_add_mode: false,
-            typing: false,
             notice: None,
             confirming_delete: None,
+            context_menu: None,
+            context_rect: None,
             keys,
             layout: None,
             pending: Arc::new(Mutex::new(Vec::new())),
@@ -460,14 +461,7 @@ impl Tui {
         match event {
             Event::Key(key) => (self.handle_key(key).await.unwrap_or(false), true),
             Event::Paste(text) => {
-                if self.typing {
-                    // Insert pasted text at cursor position
-                    let before = &self.include_input[..self.input_cursor_pos];
-                    let after = &self.include_input[self.input_cursor_pos..];
-                    self.include_input = format!("{before}{text}{after}");
-                    self.input_cursor_pos += text.len();
-                    self.notice = None;
-                } else if matches!(self.view, View::Home | View::Menu) {
+                if matches!(self.view, View::Home | View::Menu) {
                     // Paste no prompt da base (US-031): insere na posição do
                     // cursor; se começar com `/`, abre o popup de comandos.
                     let before = &self.input[..self.prompt_cursor];
@@ -494,7 +488,10 @@ impl Tui {
                     self.notice = Some(format!("erro no clique: {err:#}"));
                 }
                 // Apenas cliques alteram o estado; movimentos não redesenham.
-                let click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+                let click = matches!(
+                    mouse.kind,
+                    MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
+                );
                 (true, click)
             }
             _ => (true, false),
@@ -510,9 +507,6 @@ impl Tui {
         match self.view {
             View::Home => self.handle_home_key(key).await?,
             View::Menu => self.handle_menu_key(key).await?,
-            View::Session => self.handle_session_key(key).await?,
-            View::Include => self.handle_include_key(key).await?,
-            View::Completed => self.handle_completed_key(key)?,
         }
         Ok(self.running)
     }
@@ -546,6 +540,28 @@ impl Tui {
         // próprio prompt da Home (sem abrir o menu de comandos).
         if self.prompt_add_mode {
             return self.handle_add_prompt_key(key).await;
+        }
+
+        // US-036: com o menu de contexto aberto, apenas ↑/↓/Enter/Esc agem.
+        if self.context_menu.is_some() {
+            return self.handle_context_menu_key(key).await;
+        }
+
+        // US-037: com o prompt vazio, teclas únicas agem na linha selecionada
+        // da Biblioteca (pausar/retomar/remover/excluir).
+        if let Some(action) = home_action_for_key(
+            key.code,
+            self.input.is_empty(),
+            self.prompt_add_mode,
+            self.confirming_delete.is_some(),
+        ) {
+            match action {
+                HomeAction::Pause => self.pause_row().await?,
+                HomeAction::Resume => self.resume_row().await?,
+                HomeAction::Remove => self.remove_row().await?,
+                HomeAction::Delete => self.request_delete(self.row_index),
+            }
+            return Ok(());
         }
 
         match key.code {
@@ -736,11 +752,6 @@ impl Tui {
                 self.view = View::Home;
                 self.notice = None;
             }
-            "/list" => {
-                self.row_index = 0;
-                self.view = View::Session;
-            }
-            "/history" => self.view = View::Completed,
             "/pause" => self.pause_row().await?,
             "/resume" => self.resume_row().await?,
             "/delete" => {
@@ -762,160 +773,12 @@ impl Tui {
         Ok(())
     }
 
-    async fn handle_session_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_row(1),
-            KeyCode::Char('p') | KeyCode::Char('P') => self.pause_row().await?,
-            KeyCode::Char('r') | KeyCode::Char('R') => self.resume_row().await?,
-            KeyCode::Char('x') | KeyCode::Char('X') => self.remove_row().await?,
-            // US-035: a tecla Delete abre a confirmação no prompt da Home.
-            KeyCode::Delete => {
-                self.request_delete(self.row_index);
-                self.view = View::Home;
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('+') => {
-                self.include_index = 0;
-                self.include_input.clear();
-                self.view = View::Include;
-            }
-            KeyCode::Esc => self.view = View::Home,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.running = false;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    async fn handle_include_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        if self.typing {
-            return self.handle_include_typing_key(key).await;
-        }
-
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.include_index = 0,
-            KeyCode::Down | KeyCode::Char('j') => self.include_index = 1,
-            KeyCode::Enter => match self.include_index {
-                0 => {
-                    self.typing = true;
-                    self.include_input.clear();
-                    self.input_cursor_pos = 0;
-                    self.notice = None;
-                }
-                1 => self.view = View::Session,
-                _ => unreachable!("include index out of range"),
-            },
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.running = false;
-            }
-            KeyCode::Esc => self.view = View::Session,
-            _ => {}
-        }
-        Ok(())
-    }
-
-    async fn handle_include_typing_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        match key.code {
-            KeyCode::Enter => {
-                self.typing = false;
-                self.submit_include();
-            }
-            KeyCode::Esc => {
-                self.typing = false;
-                self.include_input.clear();
-                self.input_cursor_pos = 0;
-            }
-            KeyCode::Backspace => {
-                if self.input_cursor_pos > 0 {
-                    // Remove character before cursor
-                    let before = &self.include_input[..self.input_cursor_pos];
-                    let after = &self.include_input[self.input_cursor_pos..];
-                    // Find the previous character boundary
-                    if let Some((new_pos, _)) = before.char_indices().next_back() {
-                        self.include_input = format!("{}{}", &before[..new_pos], after);
-                        self.input_cursor_pos = new_pos;
-                    }
-                }
-            }
-            KeyCode::Delete => {
-                if self.input_cursor_pos < self.include_input.len() {
-                    // Remove character at cursor
-                    let before = &self.include_input[..self.input_cursor_pos];
-                    let after = &self.include_input[self.input_cursor_pos..];
-                    if let Some((next_pos, _)) = after.char_indices().next() {
-                        self.include_input = format!("{}{}", before, &after[next_pos..]);
-                    } else {
-                        self.include_input = before.to_string();
-                    }
-                }
-            }
-            KeyCode::Left => {
-                if self.input_cursor_pos > 0 {
-                    // Move cursor one character left
-                    let before = &self.include_input[..self.input_cursor_pos];
-                    if let Some((new_pos, _)) = before.char_indices().next_back() {
-                        self.input_cursor_pos = new_pos;
-                    } else {
-                        self.input_cursor_pos = 0;
-                    }
-                }
-            }
-            KeyCode::Right => {
-                if self.input_cursor_pos < self.include_input.len() {
-                    // Move cursor one character right
-                    let after = &self.include_input[self.input_cursor_pos..];
-                    if let Some((next_pos, _)) = after.char_indices().next() {
-                        self.input_cursor_pos += next_pos;
-                    } else {
-                        self.input_cursor_pos = self.include_input.len();
-                    }
-                }
-            }
-            KeyCode::Home => {
-                self.input_cursor_pos = 0;
-            }
-            KeyCode::End => {
-                self.input_cursor_pos = self.include_input.len();
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.running = false;
-            }
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+A = Home
-                self.input_cursor_pos = 0;
-            }
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+E = End
-                self.input_cursor_pos = self.include_input.len();
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Insert character at cursor position
-                let before = &self.include_input[..self.input_cursor_pos];
-                let after = &self.include_input[self.input_cursor_pos..];
-                self.include_input = format!("{}{}{}", before, c, after);
-                self.input_cursor_pos += c.len_utf8();
-                self.notice = None;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn handle_completed_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        match key.code {
-            KeyCode::Esc => self.view = View::Home,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.running = false;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
     /// Handle one mouse event, dispatching clicks to the active view.
     async fn handle_mouse(&mut self, me: MouseEvent) -> anyhow::Result<()> {
-        if me.kind != MouseEventKind::Down(MouseButton::Left) {
+        if !matches!(
+            me.kind,
+            MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
+        ) {
             return Ok(());
         }
         // Durante a confirmação de exclusão o mouse não interfere (US-027).
@@ -923,21 +786,38 @@ impl Tui {
             return Ok(());
         }
         match self.view {
-            View::Session => self.mouse_session(me.column, me.row).await,
             View::Menu => {
                 self.mouse_menu(me.row);
                 Ok(())
             }
             View::Home => {
-                // Clique na Biblioteca move a seleção da linha clicada.
+                // US-036: com o popup de contexto aberto, o clique esquerdo
+                // executa a opção clicada (dentro do popup) ou fecha (fora).
+                if self.context_menu.is_some() {
+                    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        if let Some(rect) = self.context_rect {
+                            let options = self.current_context_options();
+                            if (rect.0..rect.0 + rect.2).contains(&me.column)
+                                && let Some(idx) = context_option_at(me.row, rect, options.len())
+                            {
+                                let action = options[idx];
+                                self.execute_context_action(action).await?;
+                                return Ok(());
+                            }
+                        }
+                        self.close_context_menu();
+                    }
+                    return Ok(());
+                }
+                // US-036: clique direito na Biblioteca abre o menu de contexto.
+                if matches!(me.kind, MouseEventKind::Down(MouseButton::Right)) {
+                    self.open_context_menu(me.row);
+                    return Ok(());
+                }
+                // Clique esquerdo move a seleção para a linha clicada.
                 self.mouse_home(me.row);
                 Ok(())
             }
-            View::Include if !self.typing => {
-                self.mouse_include(me.row);
-                Ok(())
-            }
-            _ => Ok(()),
         }
     }
 
@@ -968,88 +848,6 @@ impl Tui {
         self.menu_index = idx;
     }
 
-    /// Clique nas opções do diálogo de inclusão (fora do modo de digitação).
-    fn mouse_include(&mut self, row: u16) {
-        let Some(layout) = self.layout else {
-            return;
-        };
-        let first_row = layout.top.saturating_add(layout.rows_offset);
-        let Some(idx) = table_row_to_index(row, first_row, layout.row_count, layout.row_stride)
-        else {
-            return;
-        };
-        self.include_index = idx;
-    }
-
-    /// Maps a click on the session view to the clicked row and action button.
-    ///
-    /// The coordinates are relative to the `Layout` stored by the last render,
-    /// so window resizes are reflected on the very next frame.
-    async fn mouse_session(&mut self, col: u16, row: u16) -> anyhow::Result<()> {
-        let Some(layout) = self.layout else {
-            return Ok(());
-        };
-        let first_row = layout.top.saturating_add(layout.rows_offset);
-        let Some(idx) = table_row_to_index(row, first_row, layout.row_count, layout.row_stride)
-        else {
-            return Ok(());
-        };
-
-        // Sem botões renderizados (terminal estreito) ou clique fora da área
-        // dos botões: apenas move a seleção para a linha clicada.
-        let actions_col = layout.left.saturating_add(layout.info_width + 1);
-        if !layout.show_actions || col < actions_col || col >= actions_col + ACTIONS_WIDTH {
-            self.row_index = idx;
-            return Ok(());
-        }
-
-        let Some(button) = action_button_at(col - actions_col) else {
-            return Ok(());
-        };
-
-        // O clique em um botão foca a linha clicada (o highlight acompanha).
-        self.row_index = idx;
-
-        let rows = self.session_rows();
-        match button {
-            0 | 1 => {
-                // Pendentes ainda não têm handle para pausar/parar (US-027).
-                let Some(row_data) = rows.get(idx) else {
-                    self.notice =
-                        Some("torrent em inicialização — aguarde a resolução dos metadados".into());
-                    return Ok(());
-                };
-                if button == 0 {
-                    let paused = matches!(
-                        row_data.state,
-                        TorrentStatsState::Paused | TorrentStatsState::Error
-                    );
-                    if paused {
-                        self.session.clone().unpause(&row_data.handle).await?;
-                        self.notice = Some(format!("retomado: {}", row_data.name));
-                    } else {
-                        self.session.pause(&row_data.handle).await?;
-                        self.notice = Some(format!("pausado: {}", row_data.name));
-                    }
-                } else {
-                    self.session
-                        .delete(librqbit::api::TorrentIdOrHash::Id(row_data.id), false)
-                        .await?;
-                    self.notice = Some(format!("parado: {}", row_data.name));
-                    self.clamp_row_index();
-                }
-            }
-            2 => {
-                // Excluir: confirmação no prompt da Home (US-035) antes de
-                // apagar os arquivos.
-                self.request_delete(idx);
-                self.view = View::Home;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
     /// Mantém `row_index` dentro dos limites após remoção de linhas,
     /// considerando também as origens pendentes (adição assíncrona).
     fn clamp_row_index(&mut self) {
@@ -1071,50 +869,87 @@ impl Tui {
         out
     }
 
-    /// Wrap text to fit within the given width (soft wrap by words).
-    /// Returns a vector of visual lines.
-    fn wrap_text(text: &str, width: usize) -> Vec<String> {
-        if width == 0 {
-            return vec![String::new()];
-        }
-        let mut lines = Vec::new();
-        let mut current_line = String::new();
+    /// Abre o menu de contexto (US-036) sobre o item clicado da Biblioteca:
+    /// resolve a linha clicada (mesmo mapeamento de `mouse_home`), passa a
+    /// seleção para ela e ancora o popup. Não faz nada se o clique cai fora
+    /// das linhas de itens.
+    fn open_context_menu(&mut self, row: u16) {
+        let Some(layout) = self.layout else {
+            return;
+        };
+        let first_row = layout.top.saturating_add(layout.rows_offset);
+        let Some(idx) = table_row_to_index(row, first_row, layout.row_count, layout.row_stride)
+        else {
+            return;
+        };
+        self.row_index = idx;
+        self.context_menu = Some(ContextMenu {
+            entry_index: idx,
+            selected: 0,
+            anchor_row: row,
+        });
+        self.context_rect = None;
+    }
 
-        for word in text.split_inclusive(' ') {
-            // If adding this word would exceed width, start a new line
-            if current_line.chars().count() + word.chars().count() > width {
-                if !current_line.is_empty() {
-                    lines.push(current_line);
-                    current_line = String::new();
+    /// Fecha o menu de contexto (US-036), mantendo a seleção da linha.
+    fn close_context_menu(&mut self) {
+        self.context_menu = None;
+        self.context_rect = None;
+    }
+
+    /// Opções atuais do menu de contexto, conforme o item clicado (US-036).
+    fn current_context_options(&self) -> Vec<ContextAction> {
+        let entry_index = self.context_menu.map(|cm| cm.entry_index).unwrap_or(0);
+        context_menu_options(entry_index, self.session_rows().len())
+    }
+
+    /// Teclas do menu de contexto aberto (US-036): ↑/↓ movem a opção
+    /// destacada, Enter executa, Esc fecha; demais teclas são ignoradas.
+    async fn handle_context_menu_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        match key.code {
+            KeyCode::Up => {
+                let len = self.current_context_options().len();
+                if let Some(cm) = &mut self.context_menu
+                    && len > 1
+                {
+                    cm.selected = (cm.selected + len - 1) % len;
                 }
-                // If a single word is longer than width, hard-break it
-                if word.chars().count() > width {
-                    let mut remaining = word;
-                    while remaining.chars().count() > width {
-                        let (line_part, rest) = remaining.split_at(
-                            remaining
-                                .char_indices()
-                                .nth(width)
-                                .map(|(i, _)| i)
-                                .unwrap_or(remaining.len()),
-                        );
-                        lines.push(line_part.to_string());
-                        remaining = rest;
-                    }
-                    current_line = remaining.to_string();
-                } else {
-                    current_line.push_str(word);
-                }
-            } else {
-                current_line.push_str(word);
             }
+            KeyCode::Down => {
+                let len = self.current_context_options().len();
+                if let Some(cm) = &mut self.context_menu
+                    && len > 1
+                {
+                    cm.selected = (cm.selected + 1) % len;
+                }
+            }
+            KeyCode::Enter => {
+                let options = self.current_context_options();
+                if let Some(cm) = self.context_menu
+                    && let Some(action) = options.get(cm.selected).copied()
+                {
+                    self.execute_context_action(action).await?;
+                }
+            }
+            KeyCode::Esc => self.close_context_menu(),
+            _ => {}
         }
+        Ok(())
+    }
 
-        if !current_line.is_empty() || lines.is_empty() {
-            lines.push(current_line);
+    /// Executa a ação escolhida no menu de contexto (US-036): move a seleção
+    /// para o item clicado, fecha o popup e despacha para a ação existente.
+    async fn execute_context_action(&mut self, action: ContextAction) -> anyhow::Result<()> {
+        let entry_index = self.context_menu.map(|cm| cm.entry_index).unwrap_or(0);
+        self.row_index = entry_index;
+        self.close_context_menu();
+        match action {
+            ContextAction::Pause => self.pause_row().await?,
+            ContextAction::Resume => self.resume_row().await?,
+            ContextAction::Stop => self.remove_row().await?,
+            ContextAction::Delete => self.request_delete(entry_index),
         }
-
-        lines
+        Ok(())
     }
 
     fn move_row(&mut self, delta: isize) {
@@ -1271,32 +1106,6 @@ impl Tui {
         Ok(())
     }
 
-    /// Submete a origem digitada de forma assíncrona (US-014): valida apenas a
-    /// sintaxe, registra a requisição e transiciona imediatamente para a tela
-    /// de acompanhamento. A resolução de metadados e as conexões de rede rodam
-    /// em uma task em background, mantendo a interface responsiva.
-    fn submit_include(&mut self) {
-        let source = self.include_input.trim().to_string();
-        self.notice = None;
-
-        if source.is_empty() {
-            self.notice = Some("informe uma origem (magnet, .torrent ou URL)".into());
-            return;
-        }
-
-        // Validação síncrona apenas de sintaxe — nenhuma espera de rede aqui.
-        // Em caso de erro o texto digitado é preservado para correção.
-        if let Err(err) = AddTorrent::from_cli_argument(&source) {
-            self.notice = Some(format!("origem inválida: {err:#}"));
-            return;
-        }
-
-        self.include_input.clear();
-        self.input_cursor_pos = 0;
-        self.view = View::Session;
-        self.start_add_background(source);
-    }
-
     /// Submete uma origem digitada/colada no prompt da Home (US-034): valida a
     /// sintaxe e, se válida, registra a requisição e dispara a adição em
     /// segundo plano — permanecendo na Home. Em erro/vazio o texto digitado é
@@ -1388,9 +1197,6 @@ impl Tui {
         match self.view {
             View::Home => self.render_home(&mut frame, cols, body_top, body_height),
             View::Menu => self.render_menu(&mut frame, cols, body_top, body_height),
-            View::Session => self.render_session(&mut frame, cols, body_top, body_height),
-            View::Include => self.render_include(&mut frame, cols, body_top, body_height),
-            View::Completed => self.render_completed(&mut frame, cols, body_top, body_height),
         }
 
         // US-035: a confirmação de exclusão é exibida no próprio prompt da Home
@@ -1458,6 +1264,94 @@ impl Tui {
             self.render_library_panel(frame, cols, body_top, panels_height);
         }
         self.render_home_prompt(frame, cols, prompt_row);
+
+        // US-036: o menu de contexto fica por cima de tudo na Home.
+        if self.context_menu.is_some() {
+            self.render_context_menu(frame, cols, body_top, body_height);
+        }
+    }
+
+    /// Popup de contexto da Biblioteca (US-036): desenhado sobre a Home,
+    /// ancorado na linha clicada, com as opções do item (Pausar/Retomar/Parar/
+    /// Excluir; só Excluir para pendentes). O item destacado recebe highlight
+    /// de fundo (padrão US-031). Grava `context_rect` para cliques do mouse.
+    fn render_context_menu(
+        &mut self,
+        frame: &mut Frame,
+        cols: u16,
+        body_top: u16,
+        body_height: u16,
+    ) {
+        let Some(cm) = self.context_menu else {
+            return;
+        };
+        let options = self.current_context_options();
+        let lines: Vec<String> = options
+            .iter()
+            .enumerate()
+            .map(|(i, action)| context_item_line(context_action_label(*action), i == cm.selected))
+            .collect();
+
+        let inner_w = (cols as usize).saturating_sub(8);
+        let width = lines
+            .iter()
+            .map(|l| Self::truncate(l, inner_w).chars().count() as u16)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(4)
+            .min(cols.saturating_sub(4));
+        // Altura mínima de 3 (bordas), limitada ao espaço do Body acima do
+        // prompt; cada opção cabe (sem o -3 do `write_boxed_lines`).
+        let height = (lines.len() as u16)
+            .saturating_add(2)
+            .clamp(3, body_height.saturating_sub(1).max(3));
+        // Ancora no item clicado, com clamp vertical dentro do Body.
+        let bottom = body_top.saturating_add(body_height);
+        let top = cm
+            .anchor_row
+            .min(bottom.saturating_sub(height))
+            .max(body_top);
+        let left = LAYOUT_MARGIN_COLS;
+        let content_left = left + 2;
+        let content_w = width.saturating_sub(4) as usize;
+
+        // Fundo sólido do popup (evita vazar o conteúdo dos painéis por trás).
+        frame.fill_rect(top, left, height, width, ' ', None, Some(THEME.popup_bg));
+        draw_box(frame, left, top, width, height);
+
+        for (idx, line) in lines.iter().enumerate() {
+            let row = top + 1 + idx as u16;
+            let text = Self::truncate(line, content_w);
+            if idx == cm.selected {
+                // O highlight cobre apenas o interior (não invade a borda).
+                frame.fill(
+                    row,
+                    content_left,
+                    width - 3,
+                    ' ',
+                    None,
+                    Some(THEME.highlight_bg),
+                );
+                frame.put_styled(
+                    row,
+                    content_left,
+                    &text,
+                    Some(THEME.text),
+                    Some(THEME.highlight_bg),
+                );
+            } else {
+                frame.put_styled(
+                    row,
+                    content_left,
+                    &text,
+                    Some(THEME.text),
+                    Some(THEME.popup_bg),
+                );
+            }
+        }
+
+        // Geometria para cliques do mouse nas opções do popup.
+        self.context_rect = Some((left, top, width, height));
     }
 
     /// Painel superior da Home: tabela compacta da sessão (sem ações),
@@ -1483,7 +1377,7 @@ impl Tui {
             ROW_FIXED_W
         };
         let name_width = inner_width.saturating_sub(fixed_w).max(1);
-        lines.push(session_table_header(name_width, false, show_metrics));
+        lines.push(session_table_header(name_width, show_metrics));
         lines.push(separator_line(inner_width));
 
         let total = rows_data.len() + pending.len();
@@ -1538,7 +1432,7 @@ impl Tui {
                     state,
                     &row.name,
                     name_width,
-                    (metrics.as_deref(), None),
+                    metrics.as_deref(),
                 ));
                 bars.push((row_line, bar, color));
                 row_line += 1;
@@ -1551,8 +1445,11 @@ impl Tui {
                 }
                 let marker = if idx == self.row_index { "> " } else { "  " };
                 let (state, color) = match &pt.status {
-                    PendingStatus::Resolving => ("inicializando", THEME.accent),
-                    PendingStatus::Error(_) => ("erro", THEME.error),
+                    PendingStatus::Resolving => ("inicializando".to_string(), THEME.accent),
+                    PendingStatus::Error(err) => {
+                        // Mensagem truncada para a largura da coluna STATUS.
+                        (Tui::truncate(err, STATE_W), THEME.error)
+                    }
                     PendingStatus::Done(_) => continue,
                 };
                 let bar = progress_bar(0.0);
@@ -1565,10 +1462,10 @@ impl Tui {
                     marker,
                     idx,
                     &bar,
-                    state,
+                    &state,
                     &pt.source,
                     name_width,
-                    (metrics.as_deref(), None),
+                    metrics.as_deref(),
                 ));
                 bars.push((row_line, bar, color));
                 row_line += 1;
@@ -1599,12 +1496,9 @@ impl Tui {
         // Geometria para cliques do mouse na Biblioteca (move a seleção).
         self.layout = Some(Layout {
             top: top + 1,
-            left: content_left,
             rows_offset: 4,
             row_count: bars.len().max(1),
             row_stride: 1,
-            info_width: 0,
-            show_actions: false,
         });
     }
 
@@ -1738,6 +1632,7 @@ impl Tui {
             &self.view,
             self.prompt_add_mode,
             self.confirming_delete.is_some(),
+            self.context_menu.is_some(),
         );
         frame.put_styled(row, 1, hints, Some(THEME.muted), Some(THEME.footer_bg));
 
@@ -1835,520 +1730,11 @@ impl Tui {
         // Geometria para cliques do mouse nos itens do popup.
         self.layout = Some(Layout {
             top: top + 1,
-            left: content_left,
             rows_offset: 0,
             row_count: filtered.len(),
             row_stride: 1,
-            info_width: 0,
-            show_actions: false,
         });
     }
-
-    /// Renderiza a sessão como uma tabela estruturada com colunas alinhadas
-    /// (US-019): ID, PROGRESSO (barra em blocos), STATUS, NOME e AÇÕES — com a
-    /// barra de progresso visual colorida por estado (US-020).
-    fn render_session(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
-        let rows_data = self.session_rows();
-        let pending = self.pending.lock().unwrap().clone();
-        let mut lines: Vec<String> = Vec::new();
-        lines.push("sessão de downloads".into());
-        lines.push(String::new());
-
-        // Largura da parte informativa de cada linha. A coluna de progresso
-        // (barra + percentual) é fixa; o nome absorve o espaço restante. Os
-        // botões de ação aparecem apenas quando o terminal é largo o
-        // suficiente (evita estouro que desalinharia o mapeamento do clique).
-        let show_actions = cols >= ROW_FIXED_W as u16 + 10 + 1 + ACTIONS_WIDTH;
-        let available = if show_actions {
-            cols.saturating_sub(1 + ACTIONS_WIDTH)
-        } else {
-            cols.saturating_sub(2)
-        };
-        // Métricas de rede (US-033): exigem espaço além das colunas fixas para
-        // o nome não encolher a nada; por isso o teste usa a largura bruta
-        // antes do cap (senão as colunas nunca apareceriam no terminal padrão).
-        let show_metrics = available >= (ROW_FIXED_W + METRICS_FIXED_W + 15) as u16;
-        // O cap de nome (ROW_INFO_WIDTH) é ampliado quando as métricas estão
-        // presentes, para que a linha tenha onde exibir as 4 colunas extras.
-        let info_width = (if show_metrics {
-            available.min(ROW_INFO_WIDTH + METRICS_FIXED_W as u16)
-        } else {
-            available.min(ROW_INFO_WIDTH)
-        }) as usize;
-        let fixed_w = if show_metrics {
-            ROW_FIXED_W + METRICS_FIXED_W
-        } else {
-            ROW_FIXED_W
-        };
-        let name_width = info_width.saturating_sub(fixed_w).max(1);
-        // Largura total da tabela (base do cabeçalho e dos divisores sutis).
-        let table_width = info_width
-            + if show_actions {
-                1 + ACTIONS_WIDTH as usize
-            } else {
-                0
-            };
-
-        // Cabeçalho + separador da tabela (colunas alinhadas).
-        lines.push(session_table_header(name_width, show_actions, show_metrics));
-        lines.push(separator_line(table_width));
-
-        // Barras de progresso renderizadas com cor por estado (US-020): a
-        // linha é desenhada com o texto completo e a barra é sobreposta em
-        // seguida com `put_styled` (verde/amarelo/vermelho/ciano).
-        let mut bars: Vec<(usize, String, Color)> = Vec::new();
-        // Índices (no bloco) das linhas divisoras sutis entre registros, para
-        // sobrepor a cor escura após a escrita base (US-028).
-        let mut seps: Vec<usize> = Vec::new();
-
-        let total_entries = rows_data.len() + pending.len();
-        if rows_data.is_empty() && pending.is_empty() {
-            lines.push("nenhum torrent na fila".into());
-        } else {
-            // Densidade compacta (US-028): sem linhas em branco — cada entrada
-            // é seguida de um divisor fino `─` (exceto a última), isolando as
-            // barras de progresso sem gastar altura da tela.
-            let mut rendered = 0usize;
-            for (idx, row) in rows_data.iter().enumerate() {
-                let marker = if idx == self.row_index { "> " } else { "  " };
-                let state = if row.finished {
-                    "concluído"
-                } else {
-                    match row.state {
-                        TorrentStatsState::Live => "em andamento",
-                        TorrentStatsState::Paused => "pausado",
-                        TorrentStatsState::Error => "erro",
-                        TorrentStatsState::Initializing => "inicializando",
-                    }
-                };
-                let pct = if row.total_bytes == 0 {
-                    0.0
-                } else {
-                    row.progress_bytes as f64 / row.total_bytes as f64 * 100.0
-                };
-                let paused = matches!(
-                    row.state,
-                    TorrentStatsState::Paused | TorrentStatsState::Error
-                );
-                let actions = if show_actions {
-                    Some(actions_string(paused))
-                } else {
-                    None
-                };
-                let bar = progress_bar(pct);
-                let color = progress_color(row.state, row.finished);
-                // O ID exibido é a posição contígua na tabela (AC-5: re-indexa
-                // imediatamente após remoções); o id real do librqbit continua
-                // sendo usado internamente nas operações de pausar/excluir.
-                let metrics = if show_metrics {
-                    Some(row_metrics_text(
-                        row.finished,
-                        row.down_speed_mbps,
-                        row.up_speed_mbps,
-                        row.eta_seconds,
-                        row.uploaded_bytes,
-                        if row.finished {
-                            row.total_bytes
-                        } else {
-                            row.progress_bytes
-                        },
-                    ))
-                } else {
-                    None
-                };
-                lines.push(session_table_line(
-                    marker,
-                    idx,
-                    &bar,
-                    state,
-                    &row.name,
-                    name_width,
-                    (metrics.as_deref(), actions.as_deref()),
-                ));
-                bars.push((idx, bar, color));
-                rendered += 1;
-                if rendered < total_entries {
-                    seps.push(lines.len());
-                    lines.push(separator_line(table_width));
-                }
-            }
-
-            // Origens adicionadas em segundo plano, ainda sem handle.
-            let mut idx = rows_data.len();
-            for pt in &pending {
-                let marker = if idx == self.row_index { "> " } else { "  " };
-                let (state, detail, color) = match &pt.status {
-                    PendingStatus::Resolving => ("inicializando", "", THEME.accent),
-                    PendingStatus::Error(err) => ("erro", err.as_str(), THEME.error),
-                    PendingStatus::Done(_) => continue, // já consumido no render
-                };
-                let bar = progress_bar(0.0);
-                // US-027: pendentes em "inicializando" exibem a coluna de ações
-                // completa, alinhada com os demais itens (AC-1).
-                let actions = if matches!(&pt.status, PendingStatus::Resolving) && show_actions {
-                    Some(actions_string(false))
-                } else {
-                    None
-                };
-                let metrics = if show_metrics {
-                    Some(empty_metrics_text())
-                } else {
-                    None
-                };
-                let mut line = session_table_line(
-                    marker,
-                    idx,
-                    &bar,
-                    state,
-                    &pt.source,
-                    name_width,
-                    (metrics.as_deref(), actions.as_deref()),
-                );
-                if !detail.is_empty() {
-                    line = Self::truncate(
-                        &format!("{line} — {}", Self::truncate(detail, 28)),
-                        info_width,
-                    );
-                }
-                lines.push(line);
-                bars.push((idx, bar, color));
-                idx += 1;
-                rendered += 1;
-                if rendered < total_entries {
-                    seps.push(lines.len());
-                    lines.push(separator_line(table_width));
-                }
-            }
-        }
-
-        lines.push(String::new());
-
-        // Highlight apenas a linha de dados selecionada (o notice é exibido no
-        // Footer, sem duplicação). Estrutura das linhas:
-        // 0 título, 1 vazio, 2 cabeçalho, 3 separador, 4+ entradas.
-        let mut highlighted = Vec::new();
-        if !rows_data.is_empty() || !pending.is_empty() {
-            // Cada entrada ocupa 2 linhas (linha + gap); o destaque cobre
-            // apenas a linha da entrada, sem invadir a separação (US-026).
-            highlighted.push(session_row_line(self.row_index));
-        }
-        let (left, top) =
-            self.centered_write(frame, lines, cols, body_top, body_height, &highlighted);
-
-        // Divisores sutis entre registros em tom escuro (US-028, AC-2).
-        let sep_text = separator_line(table_width);
-        for sep_idx in &seps {
-            let row = top + *sep_idx as u16;
-            frame.put_styled(row, left, &sep_text, Some(THEME.muted), None);
-        }
-
-        // Sobreposição da barra com cor por estado. Na linha selecionada o
-        // fundo de destaque é preservado (a barra mantém sua cor por cima).
-        for (line_idx, bar, color) in &bars {
-            let row = top + session_row_line(*line_idx) as u16;
-            let bg = if *line_idx == self.row_index {
-                Some(THEME.highlight_bg)
-            } else {
-                None
-            };
-            frame.put_styled(row, left + ROW_PREFIX_W as u16, bar, Some(*color), bg);
-        }
-
-        // Registra a geometria para o mapeamento de cliques do mouse. Com os
-        // divisores sutis (US-028) cada entrada ocupa 2 linhas de tela
-        // (stride 2); cliques na linha do divisor não alteram a seleção.
-        if bars.is_empty() {
-            self.layout = None;
-        } else {
-            self.layout = Some(Layout {
-                top,
-                left,
-                rows_offset: SESSION_HEADER_LINES as u16,
-                row_count: bars.len(),
-                row_stride: 2,
-                info_width: info_width as u16,
-                show_actions,
-            });
-        }
-    }
-
-    fn render_include(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
-        // US-019: o formulário de adição é um Modal centralizado sobreposto à
-        // tela principal — o Body é escurecido (overlay) e o diálogo com
-        // bordas duplas é desenhado por cima, contido entre Header e Footer.
-        frame.fill_rect(
-            body_top,
-            0,
-            body_height,
-            cols,
-            ' ',
-            None,
-            Some(THEME.overlay_bg),
-        );
-        let (left, top, width, height) = body_frame(cols, body_top, body_height);
-        let content_left = left + 2;
-        let inner_width = (width as usize).saturating_sub(4);
-
-        let mut lines: Vec<String> = Vec::new();
-        lines.push("adicionar torrent a fila".into());
-        lines.push(String::new());
-
-        let options = [
-            "digitar a origem (magnet, .torrent ou URL)",
-            "voltar a listagem",
-        ];
-        for (idx, opt) in options.iter().enumerate() {
-            let marker = if idx == self.include_index { ">" } else { " " };
-            lines.push(format!("{marker} {opt}"));
-        }
-
-        lines.push(String::new());
-
-        // Largura do campo de entrada respeitando os limites internos do quadro.
-        let prompt = "origem: ";
-        let prompt_width = prompt.chars().count();
-        let max_input_width = inner_width.saturating_sub(prompt_width);
-
-        if self.typing {
-            // Quebra de linha automática restrita à largura interna do container.
-            let wrapped_lines = Self::wrap_text(&self.include_input, max_input_width);
-            if wrapped_lines.is_empty() {
-                lines.push(prompt.to_string());
-            } else {
-                for (i, wrapped) in wrapped_lines.iter().enumerate() {
-                    if i == 0 {
-                        lines.push(format!("{prompt}{wrapped}"));
-                    } else {
-                        // Continuation lines: indent to align with prompt
-                        let indent = " ".repeat(prompt_width);
-                        lines.push(format!("{indent}{wrapped}"));
-                    }
-                }
-            }
-
-            lines.push(String::new());
-            lines.push("Enter para confirmar, Esc para cancelar".into());
-        } else {
-            lines.push("Enter para selecionar, Esc para voltar".into());
-        }
-
-        if let Some(notice) = &self.notice {
-            lines.push(notice.clone());
-        }
-
-        // Nenhum texto ultrapassa as bordas laterais do quadro.
-        for line in &mut lines {
-            *line = Self::truncate(line, inner_width);
-        }
-
-        // No modo de digitação o bloco fica ancorado no topo (cursor estável);
-        // fora dele, o bloco é centralizado verticalmente no interior do quadro.
-        let content_top = if self.typing {
-            top + 2
-        } else {
-            center_content_top(top, height, lines.len())
-        };
-
-        // Highlight apenas a opção selecionada (AC-4: fundo + indicador).
-        let highlighted = vec![2 + self.include_index];
-
-        draw_box(frame, left, top, width, height);
-        write_boxed_lines(
-            frame,
-            content_left,
-            content_top,
-            &lines,
-            &highlighted,
-            height,
-        );
-
-        // If typing, position the cursor at the correct position in the wrapped input
-        if self.typing {
-            self.render_input_cursor(frame, content_left, content_top, max_input_width, height);
-        } else {
-            // Registra a geometria para cliques do mouse nas opções.
-            self.layout = Some(Layout {
-                top: content_top,
-                left: content_left,
-                rows_offset: 2,
-                row_count: 2,
-                row_stride: 1,
-                info_width: 0,
-                show_actions: false,
-            });
-        }
-    }
-
-    /// Registra a posição do cursor dentro do campo de entrada, relativo ao
-    /// interior do quadro (bordas duplas). O cursor nunca ultrapassa a área
-    /// visível do conteúdo mesmo com texto colado muito longo.
-    fn render_input_cursor(
-        &self,
-        frame: &mut Frame,
-        content_left: u16,
-        content_top: u16,
-        max_input_width: usize,
-        frame_height: u16,
-    ) {
-        let prompt = "origem: ";
-        let prompt_width = prompt.chars().count();
-
-        // Estrutura das linhas do conteúdo:
-        // 0: "adicionar torrent a fila"
-        // 1: ""
-        // 2: option 0
-        // 3: option 1
-        // 4: ""
-        // 5+: wrapped input lines (starts at line 5)
-        let input_start_line = 5;
-
-        // Calculate cursor position within the wrapped text
-        let wrapped = Self::wrap_text(&self.include_input, max_input_width);
-        let input_line_count = wrapped.len().max(1);
-
-        // Find which visual line and column the cursor is on
-        let mut cursor_line = 0;
-        let mut cursor_col = prompt_width;
-        let mut chars_before_cursor = self.input_cursor_pos;
-
-        for (i, wrapped_line) in wrapped.iter().enumerate() {
-            let line_len = wrapped_line.chars().count();
-            if chars_before_cursor <= line_len {
-                cursor_line = i;
-                cursor_col = prompt_width + chars_before_cursor;
-                break;
-            }
-            chars_before_cursor -= line_len;
-        }
-
-        // If cursor is past all wrapped lines, put it at the end of the last line
-        if cursor_line >= input_line_count {
-            cursor_line = input_line_count - 1;
-            let last_line = wrapped.last().map(|l| l.chars().count()).unwrap_or(0);
-            cursor_col = prompt_width + last_line.min(chars_before_cursor);
-        }
-
-        // Limita o cursor à última linha visível do conteúdo (dentro do quadro).
-        let max_visible = (frame_height as usize).saturating_sub(3).saturating_sub(1);
-        let cursor_line = cursor_line.min(max_visible.saturating_sub(input_start_line));
-        let cursor_row = content_top.saturating_add((input_start_line + cursor_line) as u16);
-        let cursor_col = content_left.saturating_add(cursor_col as u16);
-
-        frame.set_cursor(cursor_row, cursor_col);
-    }
-
-    fn render_completed(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
-        // Consistência visual: a listagem também fica dentro do quadro,
-        // contida na região do Body (entre Header e Footer).
-        let (left, top, width, height) = body_frame(cols, body_top, body_height);
-        let content_left = left + 2;
-        let inner_width = (width as usize).saturating_sub(4);
-
-        let mut lines: Vec<String> = Vec::new();
-        lines.push("downloads completos".into());
-        lines.push(format!("pasta: {}", self.output_folder.display()));
-        lines.push(String::new());
-
-        let items = match list_completed_downloads(&self.output_folder) {
-            Ok(items) => items,
-            Err(err) => {
-                lines.push(format!("erro ao listar: {err:#}"));
-                Vec::new()
-            }
-        };
-
-        // Texto de cada download completo (em verde na paleta unificada).
-        let item_texts: Vec<String> = items
-            .iter()
-            .map(|item| Self::truncate(&format_completed(item), inner_width))
-            .collect();
-
-        if item_texts.is_empty() {
-            lines.push("nenhum download completo".into());
-        } else {
-            for text in &item_texts {
-                lines.push(text.clone());
-            }
-        }
-
-        lines.push(String::new());
-        lines.push("Esc para voltar ao menu".into());
-
-        for line in &mut lines {
-            *line = Self::truncate(line, inner_width);
-        }
-        let content_top = center_content_top(top, height, lines.len());
-
-        let mut highlighted = Vec::new();
-        if items.is_empty() {
-            // Destaque o estado vazio (linha 3 = "nenhum download completo").
-            highlighted.push(3);
-        }
-        draw_box(frame, left, top, width, height);
-        write_boxed_lines(
-            frame,
-            content_left,
-            content_top,
-            &lines,
-            &highlighted,
-            height,
-        );
-
-        // Downloads completos em verde (acento de sucesso da paleta, US-019).
-        let max_lines = (height as usize).saturating_sub(3);
-        let items_start = content_top + 3;
-        for (i, text) in item_texts
-            .iter()
-            .take(max_lines.saturating_sub(3))
-            .enumerate()
-        {
-            frame.put_colored(
-                items_start + i as u16,
-                content_left,
-                text,
-                Some(THEME.success),
-            );
-        }
-    }
-
-    /// Desenha as linhas centralizadas no buffer dentro da região do Body e
-    /// retorna a geometria usada `(left, top)` (para o mapeamento de cliques).
-    /// A linha selecionada recebe fundo de destaque (highlight background).
-    fn centered_write(
-        &self,
-        frame: &mut Frame,
-        lines: Vec<String>,
-        cols: u16,
-        body_top: u16,
-        body_height: u16,
-        highlighted: &[usize],
-    ) -> (u16, u16) {
-        let width = lines
-            .iter()
-            .map(|l| l.chars().count() as u16)
-            .max()
-            .unwrap_or(0);
-        let top = body_top.saturating_add(body_height.saturating_sub(lines.len() as u16) / 2);
-        let left = cols.saturating_sub(width) / 2;
-
-        for (idx, line) in lines.iter().enumerate() {
-            let row = top.saturating_add(idx as u16);
-            if highlighted.contains(&idx) {
-                // Highlight background: fundo + texto de alto contraste.
-                frame.fill(row, left, width, ' ', None, Some(THEME.highlight_bg));
-                frame.put_styled(row, left, line, Some(THEME.text), Some(THEME.highlight_bg));
-            } else {
-                frame.put(row, left, line, false);
-            }
-        }
-        (left, top)
-    }
-}
-
-/// Texto dos botões de ação de uma linha da sessão.
-fn actions_string(paused: bool) -> String {
-    let toggle = if paused { "[Retomar]" } else { "[Pausar ]" };
-    format!("{toggle} [Parar  ] [Excluir]")
 }
 
 /// Linha de um comando do popup flutuante (US-031): comando à esquerda e
@@ -2523,17 +1909,6 @@ fn progress_color(state: TorrentStatsState, finished: bool) -> Color {
     }
 }
 
-/// Cabeçalho da tabela estruturada da sessão (US-019): colunas alinhadas
-/// ID/PROGRESSO/STATUS/NOME, com a coluna AÇÕES apenas quando há espaço para
-/// renderizar os botões à direita.
-/// Índice (linha do bloco) que uma entrada da tabela de sessão ocupa no
-/// conjunto de linhas renderizadas. O bloco começa com 4 linhas fixas
-/// (título, vazio, cabeçalho e separador) e, com os divisores sutis (US-028),
-/// cada entrada ocupa 2 linhas: a própria linha + o divisor fino.
-fn session_row_line(entry_idx: usize) -> usize {
-    SESSION_HEADER_LINES + entry_idx * 2
-}
-
 /// Mapeia uma linha da tela para o índice da entrada de um bloco listado
 /// (menu, diálogo ou tabela), considerando a altura ocupada por entrada
 /// (`stride` linhas; 1 = consecutivas, 2 = com divisor fino). Retorna `None`
@@ -2562,7 +1937,7 @@ fn separator_line(width: usize) -> String {
     "─".repeat(width)
 }
 
-fn session_table_header(name_width: usize, show_actions: bool, show_metrics: bool) -> String {
+fn session_table_header(name_width: usize, show_metrics: bool) -> String {
     // Colunas numéricas com rótulos alinhados à direita (sobre os dígitos);
     // colunas de texto alinhadas à esquerda — alinhamento perfeito com os
     // valores das linhas de dados.
@@ -2574,22 +1949,14 @@ fn session_table_header(name_width: usize, show_actions: bool, show_metrics: boo
         ));
     }
     line.push_str(&format!(" {:<name_width$}", "NOME"));
-    if show_actions {
-        line.push_str(&format!(
-            " {:<width$}",
-            "AÇÕES",
-            width = ACTIONS_WIDTH as usize
-        ));
-    }
     line
 }
 
 /// Linha de dados da tabela estruturada da sessão (US-019/US-020). Todas as
 /// colunas permanecem perfeitamente alinhadas entre si: marcador + ID, barra
-/// de progresso + percentual, status, métricas de rede (opcional), nome
-/// (truncado para `name_width`) e, opcionalmente, os botões de ação.
-/// `extras` é o par `(métricas, ações)`, cada um opcional de forma
-/// independente (ex.: a Biblioteca mostra métricas sem ações).
+/// de progresso + percentual, status, métricas de rede (opcional) e nome
+/// (truncado para `name_width`). `metrics` é opcional (ex.: layout compacto
+/// da Biblioteca quando o terminal não tem espaço).
 fn session_table_line(
     marker: &str,
     id: usize,
@@ -2597,18 +1964,14 @@ fn session_table_line(
     state: &str,
     name: &str,
     name_width: usize,
-    extras: (Option<&str>, Option<&str>),
+    metrics: Option<&str>,
 ) -> String {
     let name = Tui::truncate(name, name_width);
     let mut line = format!("{marker}{id:>4} {bar} {state:<13}");
-    if let Some(metrics) = extras.0 {
+    if let Some(metrics) = metrics {
         line.push_str(metrics);
     }
     line.push_str(&format!(" {name:<name_width$}"));
-    if let Some(actions) = extras.1 {
-        line.push(' ');
-        line.push_str(actions);
-    }
     line
 }
 
@@ -2618,50 +1981,94 @@ fn empty_metrics_text() -> String {
     format!(" {:<10} {:<10} {:<8} {:<6}", "—", "—", "—", "—")
 }
 
+/// Mapeia uma tecla única para a ação correspondente na Home (US-037). Retorna
+/// `None` quando o prompt não está vazio ou quando os modos `prompt_add_mode`
+/// ou `confirming_delete` estão ativos (estados soberanos — a tecla volta a
+/// ter o significado normal de edição/cancelamento).
+fn home_action_for_key(
+    key_code: KeyCode,
+    prompt_empty: bool,
+    prompt_add_mode: bool,
+    confirming_delete: bool,
+) -> Option<HomeAction> {
+    if !prompt_empty || prompt_add_mode || confirming_delete {
+        return None;
+    }
+    match key_code {
+        KeyCode::Char('p') | KeyCode::Char('P') => Some(HomeAction::Pause),
+        KeyCode::Char('r') | KeyCode::Char('R') => Some(HomeAction::Resume),
+        KeyCode::Char('x') | KeyCode::Char('X') => Some(HomeAction::Remove),
+        KeyCode::Delete => Some(HomeAction::Delete),
+        _ => None,
+    }
+}
+
+/// Opções do menu de contexto (US-036): torrents reais ganham as quatro ações
+/// (Pausar/Retomar/Parar/Excluir); origens pendentes (sem handle) apenas
+/// `Excluir`.
+fn context_menu_options(entry_index: usize, session_len: usize) -> Vec<ContextAction> {
+    if entry_index < session_len {
+        vec![
+            ContextAction::Pause,
+            ContextAction::Resume,
+            ContextAction::Stop,
+            ContextAction::Delete,
+        ]
+    } else {
+        vec![ContextAction::Delete]
+    }
+}
+
+/// Rótulo exibido de cada ação do menu de contexto (US-036).
+fn context_action_label(action: ContextAction) -> &'static str {
+    match action {
+        ContextAction::Pause => "Pausar",
+        ContextAction::Resume => "Retomar",
+        ContextAction::Stop => "Parar",
+        ContextAction::Delete => "Excluir",
+    }
+}
+
+/// Mapeia uma linha da tela para a opção do menu de contexto (US-036),
+/// considerando a geometria do popup (borda superior em `top`, itens logo
+/// abaixo). Retorna `None` quando a linha cai na borda ou fora do popup.
+fn context_option_at(row: u16, rect: (u16, u16, u16, u16), option_count: usize) -> Option<usize> {
+    let (_, top, _, height) = rect;
+    if row < top || row >= top + height {
+        return None;
+    }
+    let rel = row.checked_sub(top + 1)? as usize;
+    (rel < option_count).then_some(rel)
+}
+
+/// Linha de uma opção do menu de contexto (US-036): marcador `>` na opção
+/// destacada (o fundo é aplicado pelo render com `write_boxed_lines`).
+fn context_item_line(label: &str, selected: bool) -> String {
+    let marker = if selected { "> " } else { "  " };
+    format!("{marker}{label}")
+}
+
 /// Rótulo da view atual, exibido no canto direito do Header (US-019).
 fn view_label(view: &View) -> &'static str {
     match view {
         View::Home => "INÍCIO",
         View::Menu => "COMANDOS",
-        View::Session => "SESSÃO",
-        View::Include => "ADICIONAR",
-        View::Completed => "COMPLETOS",
     }
 }
 
 /// Atalhos da view atual, exibidos no lado esquerdo do Footer (US-019).
-fn footer_hints(view: &View, prompt_add_mode: bool, confirming_delete: bool) -> &'static str {
+fn footer_hints(
+    view: &View,
+    prompt_add_mode: bool,
+    confirming_delete: bool,
+    context_menu_open: bool,
+) -> &'static str {
     match view {
+        View::Home if context_menu_open => "↑/↓ navegar · Enter executa · Esc fecha",
         View::Home if confirming_delete => "Y exclui · N/Esc cancela",
         View::Home if prompt_add_mode => "digite/cole a origem · Enter adiciona · Esc cancela",
-        View::Home => "/ para comandos · Enter executa · ↑/↓ seleciona",
+        View::Home => "p pausar · r retomar · x remover · Del excluir · / comandos · ↑/↓ seleciona",
         View::Menu => "↑/↓ navegar · Enter executa · Tab completa · Esc fecha",
-        View::Session => {
-            "[P] pausar  [R] retomar  [X] remover  [Del] excluir  [A/+] adicionar  [Esc] voltar"
-        }
-        View::Include => "Enter confirmar · Esc cancelar",
-        View::Completed => "Esc voltar ao início",
-    }
-}
-
-/// Se `offset` cai dentro da área do botão que começa em `start`.
-fn in_action_button(offset: u16, start: u16) -> bool {
-    (start..start + ACTION_BTN_WIDTH).contains(&offset)
-}
-
-/// Mapeia o deslocamento horizontal a partir do início dos botões de ação para
-/// o índice do botão (0 = pausar/retomar, 1 = parar, 2 = excluir).
-/// Retorna `None` quando o clique cai fora da área delimitada (incluindo os
-/// espaços entre botões, que são intencionalmente inertes).
-fn action_button_at(offset: u16) -> Option<usize> {
-    if in_action_button(offset, 0) {
-        Some(0)
-    } else if in_action_button(offset, ACTION_1_START) {
-        Some(1)
-    } else if in_action_button(offset, ACTION_2_START) {
-        Some(2)
-    } else {
-        None
     }
 }
 
@@ -2679,35 +2086,10 @@ async fn add_torrent_background(
     }
 }
 
-/// Dimensões do quadro full-window (US-031, estilo opencode): ocupa todo o
-/// terminal disponível respeitando as margens laterais (2 colunas) e a margem
-/// de 1 linha no topo/base — recalculado a cada frame com o tamanho real.
-fn frame_rect(cols: u16, rows: u16) -> (u16, u16, u16, u16) {
-    let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS).max(2);
-    let height = rows.saturating_sub(2 * LAYOUT_MARGIN_ROWS).max(2);
-    (LAYOUT_MARGIN_COLS, LAYOUT_MARGIN_ROWS, width, height)
-}
-
-/// Dimensões do quadro do Body (US-019): full-window contido entre o Header
-/// (topo) e o Footer (base), com as mesmas margens laterais do layout.
-fn body_frame(cols: u16, body_top: u16, body_height: u16) -> (u16, u16, u16, u16) {
-    let (left, rel_top, width, height) = frame_rect(cols, body_height);
-    let top = body_top.saturating_add(rel_top);
-    (left, top, width, height)
-}
-
 /// Linhas superior e inferior do quadro (bordas de linha fina, estilo opencode).
 fn frame_top_bottom(width: u16) -> (String, String) {
     let inner = "─".repeat(width.saturating_sub(2) as usize);
     (format!("┌{inner}┐"), format!("└{inner}┘"))
-}
-
-/// Linha inicial do conteúdo para centralizá-lo verticalmente no quadro
-/// (com margem mínima de 1 linha abaixo da borda superior).
-fn center_content_top(frame_top: u16, frame_height: u16, line_count: usize) -> u16 {
-    let inner = (frame_height as usize).saturating_sub(2);
-    let spare = inner.saturating_sub(line_count);
-    frame_top + 1 + (spare / 2) as u16
 }
 
 /// Desenha o quadro de linha fina no buffer usando a cor de borda da paleta
@@ -2918,41 +2300,6 @@ mod tests {
     }
 
     #[test]
-    fn wrap_text_keeps_short_lines_untouched() {
-        let lines = Tui::wrap_text("olá mundo", 30);
-        assert_eq!(lines, vec!["olá mundo"]);
-    }
-
-    #[test]
-    fn wrap_text_breaks_long_lines_on_spaces() {
-        let lines = Tui::wrap_text("aaaa bbbb cccc", 6);
-        assert_eq!(lines, vec!["aaaa ", "bbbb ", "cccc"]);
-    }
-
-    #[test]
-    fn wrap_text_hard_breaks_single_long_word() {
-        let lines = Tui::wrap_text("abcdefghij", 4);
-        assert_eq!(lines, vec!["abcd", "efgh", "ij"]);
-    }
-
-    #[test]
-    fn wrap_text_handles_width_zero() {
-        let lines = Tui::wrap_text("qualquer coisa", 0);
-        assert_eq!(lines, vec![""]);
-    }
-
-    #[test]
-    fn wrap_text_preserves_whole_text_when_wrapped() {
-        let source =
-            "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01&dn=arquivo+de+teste";
-        let width = 30;
-        let lines = Tui::wrap_text(source, width);
-        let joined: String = lines.join("");
-        assert_eq!(joined, source);
-        assert!(lines.iter().all(|l| l.chars().count() <= width));
-    }
-
-    #[test]
     fn truncate_keeps_short_text() {
         assert_eq!(Tui::truncate("curto", 20), "curto");
     }
@@ -2966,64 +2313,22 @@ mod tests {
     }
 
     #[test]
-    fn actions_string_shows_resume_when_paused() {
-        assert_eq!(actions_string(true), "[Retomar] [Parar  ] [Excluir]");
-        assert_eq!(actions_string(false), "[Pausar ] [Parar  ] [Excluir]");
-    }
-
-    #[test]
     fn command_item_line_marks_selected_only() {
         let line = command_item_line("/add", "adicionar torrent a lista", true);
         assert!(line.starts_with("> /add"));
         assert!(line.contains("adicionar torrent a lista"));
-        let unselected = command_item_line("/list", "acompanhar progresso", false);
-        assert!(unselected.starts_with("  /list"));
+        let unselected = command_item_line("/exit", "sair do OpenTorrent", false);
+        assert!(unselected.starts_with("  /exit"));
         assert!(!unselected.starts_with('>'));
     }
 
     #[test]
     fn commands_cover_all_shortcuts() {
-        assert_eq!(COMMANDS.len(), 8);
+        assert_eq!(COMMANDS.len(), 6);
         for (cmd, desc) in COMMANDS {
             assert!(cmd.starts_with('/'));
             assert!(!desc.is_empty());
         }
-    }
-
-    #[test]
-    fn frame_rect_uses_margins_full_window_when_terminal_is_large() {
-        // Full-window (estilo opencode): ocupa todo o terminal com margens.
-        let (left, top, w, h) = frame_rect(200, 60);
-        assert_eq!(w, 200 - 4);
-        assert_eq!(h, 60 - 2);
-        assert_eq!(left, 2);
-        assert_eq!(top, 1);
-    }
-
-    #[test]
-    fn frame_rect_fills_small_terminal_with_margins() {
-        let (left, top, w, h) = frame_rect(80, 24);
-        assert_eq!(w, 76);
-        assert_eq!(h, 22);
-        assert_eq!(left, 2);
-        assert_eq!(top, 1);
-    }
-
-    #[test]
-    fn frame_rect_never_exceeds_tiny_terminal() {
-        let (left, top, w, h) = frame_rect(15, 7);
-        assert!(w <= 15);
-        assert!(h <= 7);
-        assert!(left + w <= 15);
-        assert!(top + h <= 7);
-    }
-
-    #[test]
-    fn center_content_top_centers_block() {
-        // quadro 22 linhas, conteúdo 7 linhas → interior 20, sobra 13, margem 6
-        assert_eq!(center_content_top(1, 22, 7), 1 + 1 + 6);
-        // conteúdo maior que o interior: fica colado na margem mínima
-        assert_eq!(center_content_top(1, 22, 100), 2);
     }
 
     #[test]
@@ -3122,47 +2427,6 @@ mod tests {
     }
 
     #[test]
-    fn action_button_mapping_covers_buttons_only() {
-        // botão pausar/retomar
-        assert_eq!(action_button_at(0), Some(0));
-        assert_eq!(action_button_at(8), Some(0));
-        // espaço entre botões não dispara ação
-        assert_eq!(action_button_at(9), None);
-        // botão parar
-        assert_eq!(action_button_at(10), Some(1));
-        assert_eq!(action_button_at(18), Some(1));
-        // espaço entre botões não dispara ação
-        assert_eq!(action_button_at(19), None);
-        // botão excluir
-        assert_eq!(action_button_at(20), Some(2));
-        assert_eq!(action_button_at(28), Some(2));
-        // fora da área dos botões
-        assert_eq!(action_button_at(29), None);
-        assert_eq!(action_button_at(100), None);
-    }
-
-    #[test]
-    fn body_frame_keeps_box_inside_body_region() {
-        // Body de 46 linhas entre Header e Footer: o quadro full-window usa as
-        // margens do layout (2 colunas laterais, 1 linha no topo).
-        let (left, top, width, height) = body_frame(128, 1, 46);
-        assert_eq!(width, 124); // 128 - 4 (margens laterais)
-        assert_eq!(height, 44); // 46 - 2 (margens do Body)
-        assert_eq!(left, 2);
-        assert_eq!(top, 2); // 1 (body_top) + 1 (margem)
-        assert!(top + height <= 1 + 46);
-    }
-
-    #[test]
-    fn body_frame_shrinks_on_tiny_terminal() {
-        let (left, top, width, height) = body_frame(40, 1, 20);
-        assert!(width <= 38);
-        assert!(height <= 18);
-        assert!(top >= 1);
-        assert!(left + width <= 40);
-    }
-
-    #[test]
     fn progress_bar_fills_half_with_blocks() {
         let bar = progress_bar(50.0);
         // barra de 24 blocos: metade cheia + metade vazia, percentual adjacente
@@ -3210,15 +2474,7 @@ mod tests {
     #[test]
     fn session_table_line_aligns_columns() {
         let bar = progress_bar(50.0);
-        let line = session_table_line(
-            "> ",
-            1,
-            &bar,
-            "em andamento",
-            "arquivo.iso",
-            12,
-            (None, None),
-        );
+        let line = session_table_line("> ", 1, &bar, "em andamento", "arquivo.iso", 12, None);
         // marcador + ID
         assert_eq!(&line[0..6], ">    1");
         // barra ocupa a coluna de progresso a partir da coluna 7
@@ -3237,55 +2493,18 @@ mod tests {
     #[test]
     fn session_table_line_truncates_long_names() {
         let bar = progress_bar(100.0);
-        let line = session_table_line(
-            "  ",
-            2,
-            &bar,
-            "concluído",
-            "nome-muito-longo",
-            8,
-            (None, None),
-        );
+        let line = session_table_line("  ", 2, &bar, "concluído", "nome-muito-longo", 8, None);
         assert!(line.contains("nome-mu…"));
         assert_eq!(line.chars().count(), ROW_FIXED_W + 8);
     }
 
     #[test]
-    fn session_table_line_appends_actions_when_provided() {
+    fn session_table_line_appends_metrics_when_provided() {
         let bar = progress_bar(0.0);
-        let line = session_table_line(
-            "  ",
-            3,
-            &bar,
-            "pausado",
-            "x",
-            10,
-            (None, Some("[Retomar] [Parar  ] [Excluir]")),
-        );
-        assert_eq!(
-            line.chars().count(),
-            ROW_FIXED_W + 10 + 1 + ACTIONS_WIDTH as usize
-        );
-        assert!(line.ends_with("[Excluir]"));
-    }
-
-    #[test]
-    fn session_table_header_matches_data_width() {
-        let bar = progress_bar(0.0);
-        let header = session_table_header(12, true, false);
-        let data = session_table_line(
-            "  ",
-            1,
-            &bar,
-            "erro",
-            "abc",
-            12,
-            (None, Some("[Pausar ] [Parar  ] [Excluir]")),
-        );
-        assert_eq!(header.chars().count(), data.chars().count());
-        assert!(header.contains("ID"));
-        assert!(header.contains("PROGRESSO"));
-        assert!(header.contains("AÇÕES"));
+        let metrics = row_metrics_text(false, Some(1.2), Some(0.5), Some(300), 100, 50);
+        let line = session_table_line("  ", 3, &bar, "pausado", "x", 10, Some(&metrics));
+        assert_eq!(line.chars().count(), ROW_FIXED_W + METRICS_FIXED_W + 10);
+        assert!(line.contains("MiB/s"));
     }
 
     #[test]
@@ -3345,7 +2564,7 @@ mod tests {
     #[test]
     fn session_table_header_with_metrics_matches_data_width() {
         let bar = progress_bar(50.0);
-        let header = session_table_header(12, false, true);
+        let header = session_table_header(12, true);
         let metrics = row_metrics_text(false, Some(1.2), Some(0.0), Some(252), 145, 100);
         let data = session_table_line(
             "  ",
@@ -3354,7 +2573,7 @@ mod tests {
             "em andamento",
             "arquivo.iso",
             12,
-            (Some(&metrics), None),
+            Some(&metrics),
         );
         assert_eq!(header.chars().count(), data.chars().count());
         assert!(header.contains("DOWN SPEED"));
@@ -3363,39 +2582,158 @@ mod tests {
     }
 
     #[test]
-    fn session_footer_hints_mention_delete_shortcut() {
-        assert!(footer_hints(&View::Session, false, false).contains("[Del]"));
-        assert!(footer_hints(&View::Home, true, false).contains("Esc cancela"));
-        assert!(footer_hints(&View::Home, false, true).contains("Y exclui"));
-        assert!(footer_hints(&View::Home, false, true).contains("N/Esc cancela"));
+    fn home_footer_hints_mention_shortcuts() {
+        assert!(footer_hints(&View::Home, false, false, false).contains("p pausar"));
+        assert!(footer_hints(&View::Home, false, false, false).contains("r retomar"));
+        assert!(footer_hints(&View::Home, false, false, false).contains("x remover"));
+        assert!(footer_hints(&View::Home, false, false, false).contains("Del excluir"));
+        assert!(footer_hints(&View::Home, true, false, false).contains("Esc cancela"));
+        assert!(footer_hints(&View::Home, false, true, false).contains("Y exclui"));
+        assert!(footer_hints(&View::Home, false, true, false).contains("N/Esc cancela"));
+        // US-036: com o menu de contexto aberto, os atalhos da Home somem.
+        assert!(footer_hints(&View::Home, false, false, true).contains("↑/↓ navegar"));
+        assert!(footer_hints(&View::Home, false, false, true).contains("Enter executa"));
+        assert!(footer_hints(&View::Home, false, false, true).contains("Esc fecha"));
+        assert!(!footer_hints(&View::Home, false, false, true).contains("p pausar"));
     }
 
     #[test]
-    fn session_row_line_accounts_for_thin_separator() {
-        // 4 linhas fixas + 2 linhas por entrada (linha + divisor fino).
-        assert_eq!(session_row_line(0), 4);
-        assert_eq!(session_row_line(1), 6);
-        assert_eq!(session_row_line(3), 10);
+    fn home_action_for_key_maps_shortcuts_with_empty_prompt() {
+        assert_eq!(
+            home_action_for_key(KeyCode::Char('p'), true, false, false),
+            Some(HomeAction::Pause)
+        );
+        assert_eq!(
+            home_action_for_key(KeyCode::Char('P'), true, false, false),
+            Some(HomeAction::Pause)
+        );
+        assert_eq!(
+            home_action_for_key(KeyCode::Char('r'), true, false, false),
+            Some(HomeAction::Resume)
+        );
+        assert_eq!(
+            home_action_for_key(KeyCode::Char('R'), true, false, false),
+            Some(HomeAction::Resume)
+        );
+        assert_eq!(
+            home_action_for_key(KeyCode::Char('x'), true, false, false),
+            Some(HomeAction::Remove)
+        );
+        assert_eq!(
+            home_action_for_key(KeyCode::Char('X'), true, false, false),
+            Some(HomeAction::Remove)
+        );
+        assert_eq!(
+            home_action_for_key(KeyCode::Delete, true, false, false),
+            Some(HomeAction::Delete)
+        );
+    }
+
+    #[test]
+    fn home_action_for_key_is_inert_with_typed_prompt() {
+        // Com texto no prompt, as letras voltam a digitar (e Delete edita).
+        assert_eq!(
+            home_action_for_key(KeyCode::Char('p'), false, false, false),
+            None
+        );
+        assert_eq!(
+            home_action_for_key(KeyCode::Delete, false, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn home_action_for_key_sovereign_states_block_shortcuts() {
+        // Modo "insira o link:" (US-034): teclas editam a origem.
+        assert_eq!(
+            home_action_for_key(KeyCode::Char('p'), true, true, false),
+            None
+        );
+        // Confirmação de exclusão (US-027): apenas S/N/Esc agem.
+        assert_eq!(
+            home_action_for_key(KeyCode::Delete, true, false, true),
+            None
+        );
+        // Tecla fora do conjunto não gera ação.
+        assert_eq!(
+            home_action_for_key(KeyCode::Char('a'), true, false, false),
+            None
+        );
+        assert_eq!(
+            home_action_for_key(KeyCode::Char('/'), true, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn context_menu_options_list_all_actions_for_torrents() {
+        let options = context_menu_options(0, 3);
+        assert_eq!(
+            options,
+            vec![
+                ContextAction::Pause,
+                ContextAction::Resume,
+                ContextAction::Stop,
+                ContextAction::Delete,
+            ]
+        );
+        let last_real = context_menu_options(2, 3);
+        assert_eq!(last_real.len(), 4);
+    }
+
+    #[test]
+    fn context_menu_options_for_pending_show_only_delete() {
+        // entry_index >= session_len → origem pendente (sem handle).
+        let options = context_menu_options(3, 3);
+        assert_eq!(options, vec![ContextAction::Delete]);
+        let options = context_menu_options(9, 0);
+        assert_eq!(options, vec![ContextAction::Delete]);
+    }
+
+    #[test]
+    fn context_action_labels_match_shortcut_actions() {
+        assert_eq!(context_action_label(ContextAction::Pause), "Pausar");
+        assert_eq!(context_action_label(ContextAction::Resume), "Retomar");
+        assert_eq!(context_action_label(ContextAction::Stop), "Parar");
+        assert_eq!(context_action_label(ContextAction::Delete), "Excluir");
+    }
+
+    #[test]
+    fn context_item_line_marks_selected_only() {
+        let selected = context_item_line("Pausar", true);
+        assert!(selected.starts_with("> Pausar"));
+        let unselected = context_item_line("Excluir", false);
+        assert!(unselected.starts_with("  Excluir"));
+        assert!(!unselected.starts_with('>'));
+    }
+
+    #[test]
+    fn context_option_at_maps_rows_inside_popup() {
+        // Popup top=5, height=6 (borda + 4 opções + borda).
+        let rect = (2, 5, 20, 6);
+        assert_eq!(context_option_at(6, rect, 4), Some(0));
+        assert_eq!(context_option_at(9, rect, 4), Some(3));
+        // Borda superior/inferior e linhas fora do popup: None.
+        assert_eq!(context_option_at(5, rect, 4), None);
+        assert_eq!(context_option_at(10, rect, 4), None);
+        assert_eq!(context_option_at(4, rect, 4), None);
+        assert_eq!(context_option_at(30, rect, 4), None);
+        // Popup com só Excluir (3 linhas): a borda inferior não é opção.
+        let small = (2, 5, 20, 3);
+        assert_eq!(context_option_at(6, small, 1), Some(0));
+        assert_eq!(context_option_at(7, small, 1), None);
     }
 
     #[test]
     fn separator_line_matches_table_width() {
         // O divisor fino tem a mesma largura do cabeçalho e da linha de dados
-        // com ações — as colunas permanecem alinhadas (AC-2/AC-3).
+        // (sem métricas) — as colunas permanecem alinhadas (AC-2/AC-3).
         let name_width = 12;
-        let header = session_table_header(name_width, true, false);
+        let header = session_table_header(name_width, false);
         let sep = separator_line(header.chars().count());
         assert!(sep.chars().all(|c| c == '─'));
         assert_eq!(sep.chars().count(), header.chars().count());
-        let data = session_table_line(
-            "  ",
-            1,
-            &progress_bar(0.0),
-            "erro",
-            "abc",
-            name_width,
-            (None, Some("[Pausar ] [Parar  ] [Excluir]")),
-        );
+        let data = session_table_line("  ", 1, &progress_bar(0.0), "erro", "abc", name_width, None);
         assert_eq!(sep.chars().count(), data.chars().count());
     }
 
@@ -3444,8 +2782,8 @@ mod tests {
         // Consulta vazia (após `/`): todos os comandos.
         assert_eq!(filter_commands("/").len(), COMMANDS.len());
         // Filtro por prefixo/substring do comando.
-        let filtered = filter_commands("/li");
-        assert!(filtered.iter().any(|(c, _)| c == "/list"));
+        let filtered = filter_commands("/de");
+        assert!(filtered.iter().any(|(c, _)| c == "/delete"));
         assert!(!filtered.iter().any(|(c, _)| c == "/add"));
         // Sem correspondência: lista vazia.
         assert!(filter_commands("/zzz").is_empty());
@@ -3481,8 +2819,8 @@ mod tests {
 
     #[test]
     fn parse_add_command_returns_none_for_other_commands() {
-        assert_eq!(parse_add_command("/list"), None);
-        assert_eq!(parse_add_command("/history"), None);
+        assert_eq!(parse_add_command("/pause"), None);
+        assert_eq!(parse_add_command("/delete"), None);
         assert_eq!(parse_add_command("olá"), None);
     }
 
@@ -3490,7 +2828,7 @@ mod tests {
     fn should_open_command_menu_opens_for_command_prefixes() {
         assert!(should_open_command_menu("/"));
         assert!(should_open_command_menu("/add"));
-        assert!(should_open_command_menu("/li"));
+        assert!(should_open_command_menu("/pa"));
         assert!(!should_open_command_menu(""));
     }
 
@@ -3523,9 +2861,10 @@ mod tests {
 
     #[test]
     fn home_footer_hints_change_in_add_mode() {
-        assert!(footer_hints(&View::Home, false, false).contains("Enter executa"));
-        assert!(footer_hints(&View::Home, true, false).contains("Esc cancela"));
-        assert!(footer_hints(&View::Home, false, true).contains("Y exclui"));
+        assert!(footer_hints(&View::Home, false, false, false).contains("/ comandos"));
+        assert!(footer_hints(&View::Home, true, false, false).contains("Enter adiciona"));
+        assert!(footer_hints(&View::Home, true, false, false).contains("Esc cancela"));
+        assert!(footer_hints(&View::Home, false, true, false).contains("Y exclui"));
     }
 
     #[test]
