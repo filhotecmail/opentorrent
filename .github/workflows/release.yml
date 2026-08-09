@@ -37,7 +37,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Instalar dependências de sistema
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev mold
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev mold openssl
 
       # AC-2: sanitiza caches de build antigos — recompilação total dos arquivos
       # alterados. O job de release não restaura cache de builds anteriores.
@@ -63,27 +63,36 @@ jobs:
       # AC-3: validação pré-publicação — o `--version` do binário deve retornar
       # a versão correspondente à tag do release. A saída é gravada em arquivo
       # (sem pipe) para evitar broken pipe/panic do stdout quando lida com head.
+      # O match é ANCORADO (^OpenTorrent $TAG$) para evitar falso-positivo de
+      # substring (ex.: tag v0.1.1 casando com binário v0.1.16).
       - name: Validar versão do binário
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
           ./target/release/opentorrent --version > /tmp/opentorrent-version.txt 2>&1 || true
           OUTPUT="$(head -n 1 /tmp/opentorrent-version.txt)"
           echo "Versão retornada: $OUTPUT"
-          if grep -q "$TAG" <<< "$OUTPUT"; then
-            echo "OK: a versão do binário corresponde à tag $TAG"
+          if [[ "$OUTPUT" == "OpenTorrent $TAG" ]]; then
+            echo "OK: a versão do binário corresponde exatamente à tag $TAG"
           else
-            echo "ERRO: a versão do binário não corresponde à tag $TAG" >&2
+            echo "ERRO: a versão do binário ($OUTPUT) não corresponde à tag $TAG" >&2
             exit 1
           fi
 
+      # US-018: assina o binário com a CA local (RSA-SHA256) e valida a
+      # integridade — qualquer falha de verificação falha a esteira.
+      - name: Assinar binário de release
+        run: ./scripts/sign-release.sh sign
+
       # AC-4: artefatos com nome estável (instalação via /releases/latest) e
-      # nome versionado (rastreabilidade exata da versão).
+      # nome versionado (rastreabilidade exata da versão), ambos com .sig.
       - name: Empacotar artefatos
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
           mkdir -p dist
           cp target/release/opentorrent "dist/opentorrent-$TAG-linux-x86_64"
           cp target/release/opentorrent "dist/opentorrent-linux-x86_64"
+          cp target/release/opentorrent.sig "dist/opentorrent-$TAG-linux-x86_64.sig"
+          cp target/release/opentorrent.sig "dist/opentorrent-linux-x86_64.sig"
           ls -lh dist
 
       - name: Publicar release
