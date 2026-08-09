@@ -51,6 +51,9 @@ const ROW_PREFIX_W: usize = 7;
 const PROGRESS_COL_W: usize = 31;
 /// Largura da coluna de status.
 const STATE_W: usize = 13;
+/// Largura das colunas de métricas de rede (US-033): DOWN SPEED, UP SPEED, ETA
+/// e RATIO, incluindo os espaços separadores. Ex.: `12.4 MiB/s 1.2 MiB/s 00:04:12   1.45`.
+const METRICS_FIXED_W: usize = 38;
 /// Largura fixa da parte não-nome de cada linha da tabela da sessão.
 const ROW_FIXED_W: usize = ROW_PREFIX_W + PROGRESS_COL_W + 1 + STATE_W + 1;
 /// Linhas fixas do bloco da tabela de sessão antes das entradas: título,
@@ -85,6 +88,14 @@ struct SessionRow {
     progress_bytes: u64,
     total_bytes: u64,
     finished: bool,
+    /// Velocidade de download em MiB/s (US-033), quando a sessão está Live.
+    down_speed_mbps: Option<f64>,
+    /// Velocidade de upload em MiB/s (US-033), quando a sessão está Live.
+    up_speed_mbps: Option<f64>,
+    /// Tempo restante estimado em segundos (US-033), quando calculável.
+    eta_seconds: Option<u64>,
+    /// Bytes enviados (upload) acumulados na sessão (US-033).
+    uploaded_bytes: u64,
     handle: Arc<ManagedTorrent>,
 }
 
@@ -1045,6 +1056,19 @@ impl Tui {
         self.session.with_torrents(|torrents| {
             for (id, handle) in torrents {
                 let stats = handle.stats();
+                // Métricas de rede (US-033): `live` só existe na sessão Live;
+                // pausado/inicializando/erro não têm velocidade nem ETA.
+                let down_speed_mbps = stats.live.as_ref().map(|l| l.download_speed.mbps);
+                let up_speed_mbps = stats.live.as_ref().map(|l| l.upload_speed.mbps);
+                let eta_seconds = if stats.finished {
+                    None
+                } else {
+                    stats.live.as_ref().and_then(|l| {
+                        let remaining = stats.total_bytes.saturating_sub(stats.progress_bytes);
+                        (l.download_speed.mbps > 0.0 && remaining > 0)
+                            .then(|| remaining / (l.download_speed.mbps * 1024.0 * 1024.0) as u64)
+                    })
+                };
                 rows.borrow_mut().push(SessionRow {
                     id,
                     name: handle.name().unwrap_or_else(|| format!("torrent #{id}")),
@@ -1052,6 +1076,10 @@ impl Tui {
                     progress_bytes: stats.progress_bytes,
                     total_bytes: stats.total_bytes,
                     finished: stats.finished,
+                    down_speed_mbps,
+                    up_speed_mbps,
+                    eta_seconds,
+                    uploaded_bytes: stats.uploaded_bytes,
                     handle: handle.clone(),
                 });
             }
@@ -1340,8 +1368,16 @@ impl Tui {
         lines.push("Biblioteca de downloads".into());
         lines.push(String::new());
 
-        let name_width = inner_width.saturating_sub(ROW_FIXED_W).max(1);
-        lines.push(session_table_header(name_width, false));
+        // Métricas de rede (US-033) apenas quando o terminal tem espaço para o
+        // nome além das colunas fixas — senão a tabela cai no layout compacto.
+        let show_metrics = inner_width >= ROW_FIXED_W + METRICS_FIXED_W + 15;
+        let fixed_w = if show_metrics {
+            ROW_FIXED_W + METRICS_FIXED_W
+        } else {
+            ROW_FIXED_W
+        };
+        let name_width = inner_width.saturating_sub(fixed_w).max(1);
+        lines.push(session_table_header(name_width, false, show_metrics));
         lines.push(separator_line(inner_width));
 
         let total = rows_data.len() + pending.len();
@@ -1373,8 +1409,30 @@ impl Tui {
                 };
                 let bar = progress_bar(pct);
                 let color = progress_color(row.state, row.finished);
+                let metrics = if show_metrics {
+                    Some(row_metrics_text(
+                        row.finished,
+                        row.down_speed_mbps,
+                        row.up_speed_mbps,
+                        row.eta_seconds,
+                        row.uploaded_bytes,
+                        if row.finished {
+                            row.total_bytes
+                        } else {
+                            row.progress_bytes
+                        },
+                    ))
+                } else {
+                    None
+                };
                 lines.push(session_table_line(
-                    marker, idx, &bar, state, &row.name, name_width, None,
+                    marker,
+                    idx,
+                    &bar,
+                    state,
+                    &row.name,
+                    name_width,
+                    (metrics.as_deref(), None),
                 ));
                 bars.push((row_line, bar, color));
                 row_line += 1;
@@ -1392,8 +1450,19 @@ impl Tui {
                     PendingStatus::Done(_) => continue,
                 };
                 let bar = progress_bar(0.0);
+                let metrics = if show_metrics {
+                    Some(empty_metrics_text())
+                } else {
+                    None
+                };
                 lines.push(session_table_line(
-                    marker, idx, &bar, state, &pt.source, name_width, None,
+                    marker,
+                    idx,
+                    &bar,
+                    state,
+                    &pt.source,
+                    name_width,
+                    (metrics.as_deref(), None),
                 ));
                 bars.push((row_line, bar, color));
                 row_line += 1;
@@ -1668,13 +1737,28 @@ impl Tui {
         // botões de ação aparecem apenas quando o terminal é largo o
         // suficiente (evita estouro que desalinharia o mapeamento do clique).
         let show_actions = cols >= ROW_FIXED_W as u16 + 10 + 1 + ACTIONS_WIDTH;
-        let info_width = (if show_actions {
+        let available = if show_actions {
             cols.saturating_sub(1 + ACTIONS_WIDTH)
         } else {
             cols.saturating_sub(2)
-        })
-        .min(ROW_INFO_WIDTH) as usize;
-        let name_width = info_width.saturating_sub(ROW_FIXED_W).max(1);
+        };
+        // Métricas de rede (US-033): exigem espaço além das colunas fixas para
+        // o nome não encolher a nada; por isso o teste usa a largura bruta
+        // antes do cap (senão as colunas nunca apareceriam no terminal padrão).
+        let show_metrics = available >= (ROW_FIXED_W + METRICS_FIXED_W + 15) as u16;
+        // O cap de nome (ROW_INFO_WIDTH) é ampliado quando as métricas estão
+        // presentes, para que a linha tenha onde exibir as 4 colunas extras.
+        let info_width = (if show_metrics {
+            available.min(ROW_INFO_WIDTH + METRICS_FIXED_W as u16)
+        } else {
+            available.min(ROW_INFO_WIDTH)
+        }) as usize;
+        let fixed_w = if show_metrics {
+            ROW_FIXED_W + METRICS_FIXED_W
+        } else {
+            ROW_FIXED_W
+        };
+        let name_width = info_width.saturating_sub(fixed_w).max(1);
         // Largura total da tabela (base do cabeçalho e dos divisores sutis).
         let table_width = info_width
             + if show_actions {
@@ -1684,7 +1768,7 @@ impl Tui {
             };
 
         // Cabeçalho + separador da tabela (colunas alinhadas).
-        lines.push(session_table_header(name_width, show_actions));
+        lines.push(session_table_header(name_width, show_actions, show_metrics));
         lines.push(separator_line(table_width));
 
         // Barras de progresso renderizadas com cor por estado (US-020): a
@@ -1734,6 +1818,22 @@ impl Tui {
                 // O ID exibido é a posição contígua na tabela (AC-5: re-indexa
                 // imediatamente após remoções); o id real do librqbit continua
                 // sendo usado internamente nas operações de pausar/excluir.
+                let metrics = if show_metrics {
+                    Some(row_metrics_text(
+                        row.finished,
+                        row.down_speed_mbps,
+                        row.up_speed_mbps,
+                        row.eta_seconds,
+                        row.uploaded_bytes,
+                        if row.finished {
+                            row.total_bytes
+                        } else {
+                            row.progress_bytes
+                        },
+                    ))
+                } else {
+                    None
+                };
                 lines.push(session_table_line(
                     marker,
                     idx,
@@ -1741,7 +1841,7 @@ impl Tui {
                     state,
                     &row.name,
                     name_width,
-                    actions.as_deref(),
+                    (metrics.as_deref(), actions.as_deref()),
                 ));
                 bars.push((idx, bar, color));
                 rendered += 1;
@@ -1768,6 +1868,11 @@ impl Tui {
                 } else {
                     None
                 };
+                let metrics = if show_metrics {
+                    Some(empty_metrics_text())
+                } else {
+                    None
+                };
                 let mut line = session_table_line(
                     marker,
                     idx,
@@ -1775,7 +1880,7 @@ impl Tui {
                     state,
                     &pt.source,
                     name_width,
-                    actions.as_deref(),
+                    (metrics.as_deref(), actions.as_deref()),
                 );
                 if !detail.is_empty() {
                     line = Self::truncate(
@@ -2246,6 +2351,58 @@ fn progress_bar(pct: f64) -> String {
     bar
 }
 
+/// Formata uma velocidade em MiB/s (US-033), ex.: `12.4 MiB/s`.
+fn format_speed(mbps: f64) -> String {
+    format!("{mbps:.1} MiB/s")
+}
+
+/// Formata um tempo restante em segundos como `HH:MM:SS` (US-033), ex.: `00:04:12`.
+fn format_eta(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{secs:02}")
+}
+
+/// Formata a razão de share `enviado / baixado` (US-033), ex.: `1.45`. Guarda
+/// contra divisão por zero (retorna `0.00` quando nada foi baixado).
+fn format_ratio(uploaded: u64, downloaded: u64) -> String {
+    if downloaded == 0 {
+        return "0.00".to_string();
+    }
+    format!("{:.2}", uploaded as f64 / downloaded as f64)
+}
+
+/// Texto das colunas de métricas de rede de uma linha da sessão (US-033):
+/// DOWN SPEED, UP SPEED, ETA e RATIO, com placeholders `—` quando o torrent
+/// está pausado/inicializando/erro (sem `live` stats) e `Done` no ETA quando
+/// concluído. Função pura sobre as métricas (sem depender do `SessionRow`
+/// inteiro) para ser testável isoladamente.
+fn row_metrics_text(
+    finished: bool,
+    down_speed_mbps: Option<f64>,
+    up_speed_mbps: Option<f64>,
+    eta_seconds: Option<u64>,
+    uploaded_bytes: u64,
+    downloaded_bytes: u64,
+) -> String {
+    let (down, up, eta, ratio) = if finished {
+        let ratio = format_ratio(uploaded_bytes, downloaded_bytes);
+        ("—".into(), "—".into(), "Done".into(), ratio)
+    } else {
+        let down = down_speed_mbps
+            .map(format_speed)
+            .unwrap_or_else(|| "—".into());
+        let up = up_speed_mbps
+            .map(format_speed)
+            .unwrap_or_else(|| "—".into());
+        let eta = eta_seconds.map(format_eta).unwrap_or_else(|| "—".into());
+        let ratio = format_ratio(uploaded_bytes, downloaded_bytes);
+        (down, up, eta, ratio)
+    };
+    format!(" {down:<10} {up:<10} {eta:<8} {ratio:<6}")
+}
+
 /// Cor da barra de progresso conforme o estado do download (US-020): verde
 /// para em andamento/concluído, amarelo para pausado, vermelho para erro e
 /// ciano (azul) para inicializando.
@@ -2301,14 +2458,18 @@ fn separator_line(width: usize) -> String {
     "─".repeat(width)
 }
 
-fn session_table_header(name_width: usize, show_actions: bool) -> String {
+fn session_table_header(name_width: usize, show_actions: bool, show_metrics: bool) -> String {
     // Colunas numéricas com rótulos alinhados à direita (sobre os dígitos);
     // colunas de texto alinhadas à esquerda — alinhamento perfeito com os
     // valores das linhas de dados.
-    let mut line = format!(
-        "  {:>4} {:<31} {:<13} {:<name_width$}",
-        "ID", "PROGRESSO", "STATUS", "NOME"
-    );
+    let mut line = format!("  {:>4} {:<31} {:<13}", "ID", "PROGRESSO", "STATUS");
+    if show_metrics {
+        line.push_str(&format!(
+            " {:<10} {:<10} {:<8} {:<6}",
+            "DOWN SPEED", "UP SPEED", "ETA", "RATIO"
+        ));
+    }
+    line.push_str(&format!(" {:<name_width$}", "NOME"));
     if show_actions {
         line.push_str(&format!(
             " {:<width$}",
@@ -2321,8 +2482,10 @@ fn session_table_header(name_width: usize, show_actions: bool) -> String {
 
 /// Linha de dados da tabela estruturada da sessão (US-019/US-020). Todas as
 /// colunas permanecem perfeitamente alinhadas entre si: marcador + ID, barra
-/// de progresso + percentual, status, nome (truncado para `name_width`) e,
-/// opcionalmente, os botões de ação.
+/// de progresso + percentual, status, métricas de rede (opcional), nome
+/// (truncado para `name_width`) e, opcionalmente, os botões de ação.
+/// `extras` é o par `(métricas, ações)`, cada um opcional de forma
+/// independente (ex.: a Biblioteca mostra métricas sem ações).
 fn session_table_line(
     marker: &str,
     id: usize,
@@ -2330,15 +2493,25 @@ fn session_table_line(
     state: &str,
     name: &str,
     name_width: usize,
-    actions: Option<&str>,
+    extras: (Option<&str>, Option<&str>),
 ) -> String {
     let name = Tui::truncate(name, name_width);
-    let mut line = format!("{marker}{id:>4} {bar} {state:<13} {name:<name_width$}");
-    if let Some(actions) = actions {
+    let mut line = format!("{marker}{id:>4} {bar} {state:<13}");
+    if let Some(metrics) = extras.0 {
+        line.push_str(metrics);
+    }
+    line.push_str(&format!(" {name:<name_width$}"));
+    if let Some(actions) = extras.1 {
         line.push(' ');
         line.push_str(actions);
     }
     line
+}
+
+/// Placeholder das colunas de métricas de rede (US-033) para origens
+/// pendentes (ainda em resolução, sem stats): todos os campos em `—`.
+fn empty_metrics_text() -> String {
+    format!(" {:<10} {:<10} {:<8} {:<6}", "—", "—", "—", "—")
 }
 
 /// Linhas do diálogo de confirmação de exclusão (US-027). O nome é truncado
@@ -2944,7 +3117,15 @@ mod tests {
     #[test]
     fn session_table_line_aligns_columns() {
         let bar = progress_bar(50.0);
-        let line = session_table_line("> ", 1, &bar, "em andamento", "arquivo.iso", 12, None);
+        let line = session_table_line(
+            "> ",
+            1,
+            &bar,
+            "em andamento",
+            "arquivo.iso",
+            12,
+            (None, None),
+        );
         // marcador + ID
         assert_eq!(&line[0..6], ">    1");
         // barra ocupa a coluna de progresso a partir da coluna 7
@@ -2963,7 +3144,15 @@ mod tests {
     #[test]
     fn session_table_line_truncates_long_names() {
         let bar = progress_bar(100.0);
-        let line = session_table_line("  ", 2, &bar, "concluído", "nome-muito-longo", 8, None);
+        let line = session_table_line(
+            "  ",
+            2,
+            &bar,
+            "concluído",
+            "nome-muito-longo",
+            8,
+            (None, None),
+        );
         assert!(line.contains("nome-mu…"));
         assert_eq!(line.chars().count(), ROW_FIXED_W + 8);
     }
@@ -2978,7 +3167,7 @@ mod tests {
             "pausado",
             "x",
             10,
-            Some("[Retomar] [Parar  ] [Excluir]"),
+            (None, Some("[Retomar] [Parar  ] [Excluir]")),
         );
         assert_eq!(
             line.chars().count(),
@@ -2990,7 +3179,7 @@ mod tests {
     #[test]
     fn session_table_header_matches_data_width() {
         let bar = progress_bar(0.0);
-        let header = session_table_header(12, true);
+        let header = session_table_header(12, true, false);
         let data = session_table_line(
             "  ",
             1,
@@ -2998,12 +3187,86 @@ mod tests {
             "erro",
             "abc",
             12,
-            Some("[Pausar ] [Parar  ] [Excluir]"),
+            (None, Some("[Pausar ] [Parar  ] [Excluir]")),
         );
         assert_eq!(header.chars().count(), data.chars().count());
         assert!(header.contains("ID"));
         assert!(header.contains("PROGRESSO"));
         assert!(header.contains("AÇÕES"));
+    }
+
+    #[test]
+    fn format_speed_uses_mib_per_s() {
+        assert_eq!(format_speed(0.0), "0.0 MiB/s");
+        assert_eq!(format_speed(12.35), "12.3 MiB/s");
+        assert_eq!(format_speed(120.0), "120.0 MiB/s");
+    }
+
+    #[test]
+    fn format_eta_is_hh_mm_ss() {
+        assert_eq!(format_eta(0), "00:00:00");
+        assert_eq!(format_eta(252), "00:04:12");
+        assert_eq!(format_eta(3661), "01:01:01");
+    }
+
+    #[test]
+    fn format_ratio_guards_division_by_zero() {
+        assert_eq!(format_ratio(100, 0), "0.00");
+        assert_eq!(format_ratio(0, 100), "0.00");
+        assert_eq!(format_ratio(145, 100), "1.45");
+        assert_eq!(format_ratio(300, 100), "3.00");
+    }
+
+    #[test]
+    fn row_metrics_text_fills_columns_for_live_rows() {
+        let text = row_metrics_text(false, Some(12.34), Some(2.0), Some(252), 50, 100);
+        assert_eq!(text.chars().count(), METRICS_FIXED_W);
+        assert!(text.contains("12.3 MiB/s"));
+        assert!(text.contains("2.0 MiB/s"));
+        assert!(text.contains("00:04:12"));
+        assert!(text.contains("0.50"));
+    }
+
+    #[test]
+    fn row_metrics_text_places_em_dash_without_live_stats() {
+        let text = row_metrics_text(false, None, None, None, 0, 100);
+        assert_eq!(text.chars().count(), METRICS_FIXED_W);
+        // velocidade e eta em —; ratio computado mesmo pausado.
+        assert_eq!(text.matches('—').count(), 3);
+    }
+
+    #[test]
+    fn row_metrics_text_shows_done_eta_when_finished() {
+        let text = row_metrics_text(true, Some(1.0), Some(1.0), Some(999), 200, 200);
+        assert_eq!(text.chars().count(), METRICS_FIXED_W);
+        assert!(text.contains("Done"));
+        assert!(text.contains("1.00")); // ratio 200/200
+        assert!(!text.contains("00:16:39")); // eta real ignorado
+    }
+
+    #[test]
+    fn empty_metrics_text_matches_metrics_width() {
+        assert_eq!(empty_metrics_text().chars().count(), METRICS_FIXED_W);
+    }
+
+    #[test]
+    fn session_table_header_with_metrics_matches_data_width() {
+        let bar = progress_bar(50.0);
+        let header = session_table_header(12, false, true);
+        let metrics = row_metrics_text(false, Some(1.2), Some(0.0), Some(252), 145, 100);
+        let data = session_table_line(
+            "  ",
+            1,
+            &bar,
+            "em andamento",
+            "arquivo.iso",
+            12,
+            (Some(&metrics), None),
+        );
+        assert_eq!(header.chars().count(), data.chars().count());
+        assert!(header.contains("DOWN SPEED"));
+        assert!(header.contains("RATIO"));
+        assert!(data.contains("00:04:12"));
     }
 
     #[test]
@@ -3052,7 +3315,7 @@ mod tests {
         // O divisor fino tem a mesma largura do cabeçalho e da linha de dados
         // com ações — as colunas permanecem alinhadas (AC-2/AC-3).
         let name_width = 12;
-        let header = session_table_header(name_width, true);
+        let header = session_table_header(name_width, true, false);
         let sep = separator_line(header.chars().count());
         assert!(sep.chars().all(|c| c == '─'));
         assert_eq!(sep.chars().count(), header.chars().count());
@@ -3063,7 +3326,7 @@ mod tests {
             "erro",
             "abc",
             name_width,
-            Some("[Pausar ] [Parar  ] [Excluir]"),
+            (None, Some("[Pausar ] [Parar  ] [Excluir]")),
         );
         assert_eq!(sep.chars().count(), data.chars().count());
     }
