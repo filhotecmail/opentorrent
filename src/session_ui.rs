@@ -534,6 +534,9 @@ impl Tui {
                     self.confirming_delete = None;
                     self.notice = Some("exclusão cancelada".into());
                 }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.running = false;
+                }
                 _ => {}
             }
             return Ok(());
@@ -740,7 +743,12 @@ impl Tui {
             "/history" => self.view = View::Completed,
             "/pause" => self.pause_row().await?,
             "/resume" => self.resume_row().await?,
-            "/delete" => self.request_delete(self.row_index),
+            "/delete" => {
+                // US-035: a confirmação é exibida no prompt da Home — garante
+                // a view mesmo quando o /delete vem do popup de comandos.
+                self.request_delete(self.row_index);
+                self.view = View::Home;
+            }
             "/help" => {
                 let help: Vec<String> = COMMANDS
                     .iter()
@@ -755,29 +763,17 @@ impl Tui {
     }
 
     async fn handle_session_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        // US-027: com a confirmação de exclusão aberta, apenas S/N/Esc agem.
-        if self.confirming_delete.is_some() {
-            match key.code {
-                KeyCode::Char('s')
-                | KeyCode::Char('S')
-                | KeyCode::Char('y')
-                | KeyCode::Char('Y') => self.confirm_delete().await?,
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.confirming_delete = None;
-                    self.notice = Some("exclusão cancelada".into());
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_row(1),
             KeyCode::Char('p') | KeyCode::Char('P') => self.pause_row().await?,
             KeyCode::Char('r') | KeyCode::Char('R') => self.resume_row().await?,
             KeyCode::Char('x') | KeyCode::Char('X') => self.remove_row().await?,
-            KeyCode::Delete => self.request_delete(self.row_index),
+            // US-035: a tecla Delete abre a confirmação no prompt da Home.
+            KeyCode::Delete => {
+                self.request_delete(self.row_index);
+                self.view = View::Home;
+            }
             KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('+') => {
                 self.include_index = 0;
                 self.include_input.clear();
@@ -1044,8 +1040,10 @@ impl Tui {
                 }
             }
             2 => {
-                // Excluir: confirmação Y/N antes de apagar os arquivos (AC-4).
+                // Excluir: confirmação no prompt da Home (US-035) antes de
+                // apagar os arquivos.
                 self.request_delete(idx);
+                self.view = View::Home;
             }
             _ => {}
         }
@@ -1395,12 +1393,8 @@ impl Tui {
             View::Completed => self.render_completed(&mut frame, cols, body_top, body_height),
         }
 
-        // US-027: diálogo de confirmação Y/N sobreposto (AC-4). Como o /delete
-        // também pode ser acionado a partir da Home (US-031), o modal aparece
-        // sobre qualquer uma das duas telas.
-        if matches!(self.view, View::Session | View::Home) && self.confirming_delete.is_some() {
-            self.render_confirm_delete(&mut frame, cols, body_top, body_height);
-        }
+        // US-035: a confirmação de exclusão é exibida no próprio prompt da Home
+        // (`render_home_prompt`), sem modal/overlay central sobre o Body.
 
         self.render_footer(&mut frame, cols, rows);
 
@@ -1670,6 +1664,16 @@ impl Tui {
     fn render_home_prompt(&mut self, frame: &mut Frame, cols: u16, row: u16) {
         let left = LAYOUT_MARGIN_COLS;
         let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS);
+        // US-035: com a confirmação de exclusão aberta, o prompt exibe a
+        // pergunta com o nome do alvo (sem input e sem cursor).
+        if let Some(target) = &self.confirming_delete {
+            let label = confirm_delete_prompt_label(target.name());
+            let max_w = (width as usize).saturating_sub(4);
+            let shown = Self::truncate(&label, max_w);
+            frame.fill(row, left, width, ' ', None, Some(THEME.footer_bg));
+            frame.put_styled(row, left, &shown, Some(THEME.accent), Some(THEME.footer_bg));
+            return;
+        }
         // US-034: no modo "insira o link:", o rótulo muda e o placeholder
         // padrão é suprimido (o texto digitado é a origem a adicionar).
         let prompt = home_prompt_label(self.prompt_add_mode);
@@ -1730,7 +1734,11 @@ impl Tui {
         let row = rows.saturating_sub(1);
         frame.fill(row, 0, cols, ' ', None, Some(THEME.footer_bg));
 
-        let hints = footer_hints(&self.view, self.prompt_add_mode);
+        let hints = footer_hints(
+            &self.view,
+            self.prompt_add_mode,
+            self.confirming_delete.is_some(),
+        );
         frame.put_styled(row, 1, hints, Some(THEME.muted), Some(THEME.footer_bg));
 
         if let Some(notice) = &self.notice {
@@ -2064,60 +2072,6 @@ impl Tui {
         }
     }
 
-    /// Diálogo de confirmação de exclusão definitiva (US-027): modal pequeno
-    /// centralizado sobre o Body, pedindo S/N antes de apagar os arquivos.
-    fn render_confirm_delete(
-        &mut self,
-        frame: &mut Frame,
-        cols: u16,
-        body_top: u16,
-        body_height: u16,
-    ) {
-        let Some(target) = &self.confirming_delete else {
-            return;
-        };
-        // Escurece o Body para destacar o diálogo (mesmo overlay do modal).
-        frame.fill_rect(
-            body_top,
-            0,
-            body_height,
-            cols,
-            ' ',
-            None,
-            Some(THEME.overlay_bg),
-        );
-
-        // O prompt varia conforme o alvo: torrent com arquivos ou pendente.
-        let detail = if matches!(target, DeleteTarget::Torrent { .. }) {
-            "o torrent e seus arquivos serão removidos"
-        } else {
-            "a origem pendente será descartada"
-        };
-        let lines = confirm_delete_modal_lines(target.name(), detail);
-        let width = lines
-            .iter()
-            .map(|l| l.chars().count() as u16)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(4)
-            .min(cols.saturating_sub(2))
-            .max(8);
-        // +3 (não +2): `write_boxed_lines` limita a `height - 3` linhas, então
-        // a linha final (o prompt) precisa caber dentro desse limite.
-        let height = (lines.len() as u16).saturating_add(3);
-        let left = cols.saturating_sub(width) / 2;
-        let top = body_top.saturating_add(body_height.saturating_sub(height) / 2);
-
-        draw_box(frame, left, top, width, height);
-        // Trunca cada linha à largura interna para nunca estourar as bordas.
-        let inner_width = (width as usize).saturating_sub(4);
-        let lines: Vec<String> = lines
-            .iter()
-            .map(|l| Self::truncate(l, inner_width))
-            .collect();
-        write_boxed_lines(frame, left + 2, top + 1, &lines, &[], height);
-    }
-
     fn render_include(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
         // US-019: o formulário de adição é um Modal centralizado sobreposto à
         // tela principal — o Body é escurecido (overlay) e o diálogo com
@@ -2426,6 +2380,12 @@ fn home_prompt_label(prompt_add_mode: bool) -> &'static str {
     }
 }
 
+/// Rótulo da pergunta de confirmação de exclusão no prompt da Home (US-035):
+/// `excluir '<nome>'? [Y] ou [N] `. O nome é o do alvo (`DeleteTarget::name()`).
+fn confirm_delete_prompt_label(name: &str) -> String {
+    format!("excluir '{name}'? [Y] ou [N] ")
+}
+
 /// Extrai a origem de um `/add <origem>` digitado inline no prompt da Home
 /// (US-034). Retorna `None` quando o texto não é um `/add` com conteúdo após o
 /// espaço (ex.: `/add` puro, `/add ` vazio, outros comandos).
@@ -2658,19 +2618,6 @@ fn empty_metrics_text() -> String {
     format!(" {:<10} {:<10} {:<8} {:<6}", "—", "—", "—", "—")
 }
 
-/// Linhas do diálogo de confirmação de exclusão (US-027). O nome é truncado
-/// para não alargar o modal em terminais estreitos; `detail` descreve a ação
-/// conforme o tipo de alvo (torrent com arquivos ou pendente sem handle).
-fn confirm_delete_modal_lines(name: &str, detail: &str) -> Vec<String> {
-    vec![
-        "excluir definitivamente?".to_string(),
-        String::new(),
-        Tui::truncate(name, 56),
-        String::new(),
-        format!("{detail} — [S]im [N]ão"),
-    ]
-}
-
 /// Rótulo da view atual, exibido no canto direito do Header (US-019).
 fn view_label(view: &View) -> &'static str {
     match view {
@@ -2683,8 +2630,9 @@ fn view_label(view: &View) -> &'static str {
 }
 
 /// Atalhos da view atual, exibidos no lado esquerdo do Footer (US-019).
-fn footer_hints(view: &View, prompt_add_mode: bool) -> &'static str {
+fn footer_hints(view: &View, prompt_add_mode: bool, confirming_delete: bool) -> &'static str {
     match view {
+        View::Home if confirming_delete => "Y exclui · N/Esc cancela",
         View::Home if prompt_add_mode => "digite/cole a origem · Enter adiciona · Esc cancela",
         View::Home => "/ para comandos · Enter executa · ↑/↓ seleciona",
         View::Menu => "↑/↓ navegar · Enter executa · Tab completa · Esc fecha",
@@ -3415,37 +3363,11 @@ mod tests {
     }
 
     #[test]
-    fn confirm_delete_modal_asks_yes_no() {
-        let lines = confirm_delete_modal_lines("arquivo.iso", "o torrent será removido");
-        assert!(lines[0].contains("excluir definitivamente"));
-        assert_eq!(lines[2], "arquivo.iso");
-        assert!(lines[4].contains("[S]im"));
-        assert!(lines[4].contains("[N]ão"));
-        assert!(lines[4].contains("o torrent será removido"));
-    }
-
-    #[test]
-    fn confirm_delete_modal_truncates_long_names() {
-        let long = "m".repeat(200);
-        let lines = confirm_delete_modal_lines(&long, "x");
-        assert_eq!(lines[2].chars().count(), 56);
-        assert!(lines[2].ends_with('…'));
-    }
-
-    #[test]
-    fn confirm_modal_prompt_fits_within_write_boxed_limit() {
-        // `write_boxed_lines` escreve no máximo `height - 3` linhas; o modal
-        // tem 5 linhas, então a altura precisa ser >= 8 para o prompt final
-        // (índice 4) não ser cortado.
-        let lines = confirm_delete_modal_lines("x", "d");
-        let height = (lines.len() as u16).saturating_add(3);
-        assert!(height as usize - 3 >= lines.len());
-    }
-
-    #[test]
     fn session_footer_hints_mention_delete_shortcut() {
-        assert!(footer_hints(&View::Session, false).contains("[Del]"));
-        assert!(footer_hints(&View::Home, true).contains("Esc cancela"));
+        assert!(footer_hints(&View::Session, false, false).contains("[Del]"));
+        assert!(footer_hints(&View::Home, true, false).contains("Esc cancela"));
+        assert!(footer_hints(&View::Home, false, true).contains("Y exclui"));
+        assert!(footer_hints(&View::Home, false, true).contains("N/Esc cancela"));
     }
 
     #[test]
@@ -3586,9 +3508,24 @@ mod tests {
     }
 
     #[test]
+    fn confirm_delete_prompt_label_shows_name_and_yes_no() {
+        let label = confirm_delete_prompt_label("arquivo.iso");
+        assert!(label.contains("excluir 'arquivo.iso'?"));
+        assert!(label.contains("[Y] ou [N]"));
+        assert!(label.ends_with(' '));
+    }
+
+    #[test]
+    fn confirm_delete_prompt_label_handles_pending_source() {
+        let label = confirm_delete_prompt_label("magnet:?xt=urn:btih:abc");
+        assert!(label.contains("excluir 'magnet:?xt=urn:btih:abc'?"));
+    }
+
+    #[test]
     fn home_footer_hints_change_in_add_mode() {
-        assert!(footer_hints(&View::Home, false).contains("Enter executa"));
-        assert!(footer_hints(&View::Home, true).contains("Esc cancela"));
+        assert!(footer_hints(&View::Home, false, false).contains("Enter executa"));
+        assert!(footer_hints(&View::Home, true, false).contains("Esc cancela"));
+        assert!(footer_hints(&View::Home, false, true).contains("Y exclui"));
     }
 
     #[test]
