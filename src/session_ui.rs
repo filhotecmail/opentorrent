@@ -1121,8 +1121,7 @@ impl Tui {
 
         // O destaque (fundo + texto) acompanha exatamente a linha com o cursor
         // `> ... <` (itens começam na linha `MENU_ITEMS_OFFSET`).
-        let mut highlighted = vec![0usize];
-        highlighted.push(MENU_ITEMS_OFFSET + self.menu_index);
+        let highlighted = vec![MENU_ITEMS_OFFSET + self.menu_index];
 
         draw_box(frame, left, top, width, height);
         write_boxed_lines(
@@ -1239,13 +1238,11 @@ impl Tui {
         }
 
         lines.push(String::new());
-        if let Some(notice) = &self.notice {
-            lines.push(notice.clone());
-        }
 
-        // Highlight a linha selecionada. Estrutura das linhas:
+        // Highlight apenas a linha de dados selecionada (o notice é exibido no
+        // Footer, sem duplicação). Estrutura das linhas:
         // 0 título, 1 vazio, 2 cabeçalho, 3 separador, 4+ entradas.
-        let mut highlighted = vec![0usize];
+        let mut highlighted = Vec::new();
         if !rows_data.is_empty() || !pending.is_empty() {
             highlighted.push(4 + self.row_index);
         }
@@ -1345,9 +1342,8 @@ impl Tui {
             center_content_top(top, height, lines.len())
         };
 
-        // Highlight the title and the selected option
-        let mut highlighted = vec![0usize];
-        highlighted.push(2 + self.include_index);
+        // Highlight apenas a opção selecionada (AC-4: fundo + indicador).
+        let highlighted = vec![2 + self.include_index];
 
         draw_box(frame, left, top, width, height);
         write_boxed_lines(
@@ -1475,7 +1471,7 @@ impl Tui {
         }
         let content_top = center_content_top(top, height, lines.len());
 
-        let mut highlighted = vec![0usize];
+        let mut highlighted = Vec::new();
         if items.is_empty() {
             // Destaque o estado vazio (linha 3 = "nenhum download completo").
             highlighted.push(3);
@@ -1709,8 +1705,10 @@ fn draw_box(frame: &mut Frame, left: u16, top: u16, width: u16, height: u16) {
     frame.put_colored(top + height - 1, left, &bottom_line, Some(THEME.border));
 }
 
-/// Escreve linhas de conteúdo dentro do quadro no buffer, destacando as
-/// selecionadas.
+/// Escreve linhas de conteúdo dentro do quadro no buffer. As linhas
+/// selecionadas recebem o mesmo tratamento de `centered_write` (AC-4): fundo
+/// de destaque (`THEME.highlight_bg`) + texto branco, cobrindo a largura
+/// máxima do bloco; as demais ficam com texto padrão.
 fn write_boxed_lines(
     frame: &mut Frame,
     content_left: u16,
@@ -1720,13 +1718,32 @@ fn write_boxed_lines(
     frame_height: u16,
 ) {
     let max_lines = (frame_height as usize).saturating_sub(3);
+    let max_width = lines
+        .iter()
+        .map(|l| l.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
     for (idx, line) in lines.iter().take(max_lines).enumerate() {
-        frame.put(
-            content_top + idx as u16,
-            content_left,
-            line,
-            highlighted.contains(&idx),
-        );
+        let row = content_top + idx as u16;
+        if highlighted.contains(&idx) {
+            frame.fill(
+                row,
+                content_left,
+                max_width,
+                ' ',
+                None,
+                Some(THEME.highlight_bg),
+            );
+            frame.put_styled(
+                row,
+                content_left,
+                line,
+                Some(THEME.text),
+                Some(THEME.highlight_bg),
+            );
+        } else {
+            frame.put(row, content_left, line, false);
+        }
     }
 }
 
