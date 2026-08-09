@@ -52,7 +52,15 @@ const ACTION_1_START: u16 = ACTION_BTN_WIDTH + ACTION_GAP;
 /// Início da área do botão "excluir" (após dois botões + dois espaços).
 const ACTION_2_START: u16 = 2 * (ACTION_BTN_WIDTH + ACTION_GAP);
 /// Largura máxima da parte informativa da linha da sessão (antes dos botões).
-const ROW_INFO_WIDTH: u16 = 60;
+const ROW_INFO_WIDTH: u16 = 90;
+/// Largura do prefixo da linha: marcador (2) + ID (4) + espaço (1).
+const ROW_PREFIX_W: usize = 7;
+/// Largura da coluna de progresso: barra de blocos + percentual adjacente.
+const PROGRESS_COL_W: usize = 31;
+/// Largura da coluna de status.
+const STATE_W: usize = 13;
+/// Largura fixa da parte não-nome de cada linha da tabela da sessão.
+const ROW_FIXED_W: usize = ROW_PREFIX_W + PROGRESS_COL_W + 1 + STATE_W + 1;
 
 /// Resolução alvo da área amostrada: 1024x768 pixels. Considerando uma célula
 /// de terminal de ~8x16 px, isso equivale a 128 colunas x 48 linhas.
@@ -1142,7 +1150,8 @@ impl Tui {
     }
 
     /// Renderiza a sessão como uma tabela estruturada com colunas alinhadas
-    /// (US-019): ID, PROGRESSO, STATUS, NOME e AÇÕES.
+    /// (US-019): ID, PROGRESSO (barra em blocos), STATUS, NOME e AÇÕES — com a
+    /// barra de progresso visual colorida por estado (US-020).
     fn render_session(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
         let rows_data = self.session_rows();
         let pending = self.pending.lock().unwrap().clone();
@@ -1150,17 +1159,18 @@ impl Tui {
         lines.push("sessão de downloads".into());
         lines.push(String::new());
 
-        // Largura da parte informativa de cada linha. Os botões de ação são
-        // renderizados à direita em colunas fixas apenas quando o terminal é
-        // largo o suficiente — em terminais estreitos as linhas ficam sem
-        // botões para evitar estouro (que desalinharia o mapeamento do clique).
-        let show_actions = cols >= ROW_INFO_WIDTH + 1 + ACTIONS_WIDTH;
-        let info_width = if show_actions {
-            ROW_INFO_WIDTH.min(cols.saturating_sub(1 + ACTIONS_WIDTH)) as usize
+        // Largura da parte informativa de cada linha. A coluna de progresso
+        // (barra + percentual) é fixa; o nome absorve o espaço restante. Os
+        // botões de ação aparecem apenas quando o terminal é largo o
+        // suficiente (evita estouro que desalinharia o mapeamento do clique).
+        let show_actions = cols >= ROW_FIXED_W as u16 + 10 + 1 + ACTIONS_WIDTH;
+        let info_width = (if show_actions {
+            cols.saturating_sub(1 + ACTIONS_WIDTH)
         } else {
-            ROW_INFO_WIDTH.min(cols.saturating_sub(2)) as usize
-        };
-        let name_width = info_width.saturating_sub(31);
+            cols.saturating_sub(2)
+        })
+        .min(ROW_INFO_WIDTH) as usize;
+        let name_width = info_width.saturating_sub(ROW_FIXED_W).max(1);
 
         // Cabeçalho + separador da tabela (colunas alinhadas).
         lines.push(session_table_header(name_width, show_actions));
@@ -1172,6 +1182,11 @@ impl Tui {
                     0
                 },
         ));
+
+        // Barras de progresso renderizadas com cor por estado (US-020): a
+        // linha é desenhada com o texto completo e a barra é sobreposta em
+        // seguida com `put_styled` (verde/amarelo/vermelho/ciano).
+        let mut bars: Vec<(usize, String, Color)> = Vec::new();
 
         if rows_data.is_empty() && pending.is_empty() {
             lines.push("nenhum torrent na fila".into());
@@ -1202,28 +1217,32 @@ impl Tui {
                 } else {
                     None
                 };
+                let bar = progress_bar(pct);
+                let color = progress_color(row.state, row.finished);
                 lines.push(session_table_line(
                     marker,
                     row.id,
-                    pct,
+                    &bar,
                     state,
                     &row.name,
                     name_width,
                     actions.as_deref(),
                 ));
+                bars.push((idx, bar, color));
             }
 
             // Origens adicionadas em segundo plano, ainda sem handle.
             let mut idx = rows_data.len();
             for pt in &pending {
                 let marker = if idx == self.row_index { "> " } else { "  " };
-                let (state, detail) = match &pt.status {
-                    PendingStatus::Resolving => ("inicializando", ""),
-                    PendingStatus::Error(err) => ("erro", err.as_str()),
+                let (state, detail, color) = match &pt.status {
+                    PendingStatus::Resolving => ("inicializando", "", THEME.accent),
+                    PendingStatus::Error(err) => ("erro", err.as_str(), THEME.error),
                     PendingStatus::Done(_) => continue, // já consumido no render
                 };
+                let bar = progress_bar(0.0);
                 let mut line =
-                    session_table_line(marker, 0, 0.0, state, &pt.source, name_width, None);
+                    session_table_line(marker, 0, &bar, state, &pt.source, name_width, None);
                 if !detail.is_empty() {
                     line = Self::truncate(
                         &format!("{line} — {}", Self::truncate(detail, 28)),
@@ -1231,6 +1250,7 @@ impl Tui {
                     );
                 }
                 lines.push(line);
+                bars.push((idx, bar, color));
                 idx += 1;
             }
         }
@@ -1246,6 +1266,18 @@ impl Tui {
         }
         let (left, top) =
             self.centered_write(frame, lines, cols, body_top, body_height, &highlighted);
+
+        // Sobreposição da barra com cor por estado. Na linha selecionada o
+        // fundo de destaque é preservado (a barra mantém sua cor por cima).
+        for (line_idx, bar, color) in &bars {
+            let row = top + 4 + *line_idx as u16;
+            let bg = if *line_idx == self.row_index {
+                Some(THEME.highlight_bg)
+            } else {
+                None
+            };
+            frame.put_styled(row, left + ROW_PREFIX_W as u16, bar, Some(*color), bg);
+        }
 
         // Registra a geometria para o mapeamento de cliques do mouse.
         let total_rows = rows_data.len() + pending.len();
@@ -1559,6 +1591,39 @@ fn menu_item_line(idx: usize, selected: bool) -> String {
     }
 }
 
+/// Barra de progresso em blocos contínuos estilo VCL/GUI (US-020): `█` para o
+/// trecho concluído e `░` para o restante, com o percentual exato adjacente
+/// (ex.: `████████████░░░░░░░░░░░░░░  50.0%`). Ocupa toda a largura da coluna.
+fn progress_bar(pct: f64) -> String {
+    let bar_width = PROGRESS_COL_W - 7; // 7 = espaço + percentual (ex.: " 50.0%")
+    let pct = pct.clamp(0.0, 100.0);
+    let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+    let filled = filled.min(bar_width);
+    // `█`/`░` ocupam 3 bytes cada; a capacidade evita realocação por frame.
+    let mut bar = String::with_capacity(bar_width * 3 + 7);
+    bar.push_str(&"█".repeat(filled));
+    bar.push_str(&"░".repeat(bar_width - filled));
+    bar.push(' ');
+    bar.push_str(&format!("{pct:>5.1}%"));
+    bar
+}
+
+/// Cor da barra de progresso conforme o estado do download (US-020): verde
+/// para em andamento/concluído, amarelo para pausado, vermelho para erro e
+/// ciano (azul) para inicializando.
+fn progress_color(state: TorrentStatsState, finished: bool) -> Color {
+    if finished {
+        THEME.success
+    } else {
+        match state {
+            TorrentStatsState::Live => THEME.success,
+            TorrentStatsState::Paused => THEME.warning,
+            TorrentStatsState::Error => THEME.error,
+            TorrentStatsState::Initializing => THEME.accent,
+        }
+    }
+}
+
 /// Cabeçalho da tabela estruturada da sessão (US-019): colunas alinhadas
 /// ID/PROGRESSO/STATUS/NOME, com a coluna AÇÕES apenas quando há espaço para
 /// renderizar os botões à direita.
@@ -1567,7 +1632,7 @@ fn session_table_header(name_width: usize, show_actions: bool) -> String {
     // colunas de texto alinhadas à esquerda — alinhamento perfeito com os
     // valores das linhas de dados.
     let mut line = format!(
-        "  {:>4} {:>9} {:<13} {:<name_width$}",
+        "  {:>4} {:<31} {:<13} {:<name_width$}",
         "ID", "PROGRESSO", "STATUS", "NOME"
     );
     if show_actions {
@@ -1580,21 +1645,21 @@ fn session_table_header(name_width: usize, show_actions: bool) -> String {
     line
 }
 
-/// Linha de dados da tabela estruturada da sessão (US-019). Todas as colunas
-/// permanecem perfeitamente alinhadas entre si: marcador + ID, progresso,
-/// status, nome (truncado para `name_width`) e, opcionalmente, os botões de
-/// ação.
+/// Linha de dados da tabela estruturada da sessão (US-019/US-020). Todas as
+/// colunas permanecem perfeitamente alinhadas entre si: marcador + ID, barra
+/// de progresso + percentual, status, nome (truncado para `name_width`) e,
+/// opcionalmente, os botões de ação.
 fn session_table_line(
     marker: &str,
     id: usize,
-    pct: f64,
+    bar: &str,
     state: &str,
     name: &str,
     name_width: usize,
     actions: Option<&str>,
 ) -> String {
     let name = Tui::truncate(name, name_width);
-    let mut line = format!("{marker}{id:>4} {pct:>8.1}% {state:<13} {name:<name_width$}");
+    let mut line = format!("{marker}{id:>4} {bar} {state:<13} {name:<name_width$}");
     if let Some(actions) = actions {
         line.push(' ');
         line.push_str(actions);
@@ -2140,48 +2205,104 @@ mod tests {
     }
 
     #[test]
+    fn progress_bar_fills_half_with_blocks() {
+        let bar = progress_bar(50.0);
+        // barra de 24 blocos: metade cheia + metade vazia, percentual adjacente
+        assert!(bar.starts_with(&"█".repeat(12)));
+        assert!(bar.contains(&"░".repeat(12)));
+        assert!(bar.ends_with(" 50.0%"));
+        assert_eq!(bar.chars().count(), PROGRESS_COL_W);
+    }
+
+    #[test]
+    fn progress_bar_full_and_empty() {
+        let full = progress_bar(100.0);
+        assert!(full.starts_with(&"█".repeat(24)));
+        assert!(full.ends_with("100.0%"));
+        let empty = progress_bar(0.0);
+        assert!(empty.starts_with(&"░".repeat(24)));
+        assert!(empty.ends_with("  0.0%"));
+    }
+
+    #[test]
+    fn progress_bar_clamps_out_of_range() {
+        assert_eq!(progress_bar(150.0), progress_bar(100.0));
+        assert_eq!(progress_bar(-10.0), progress_bar(0.0));
+    }
+
+    #[test]
+    fn progress_color_matches_state() {
+        assert_eq!(
+            progress_color(TorrentStatsState::Live, false),
+            THEME.success
+        );
+        assert_eq!(
+            progress_color(TorrentStatsState::Paused, false),
+            THEME.warning
+        );
+        assert_eq!(progress_color(TorrentStatsState::Error, false), THEME.error);
+        assert_eq!(
+            progress_color(TorrentStatsState::Initializing, false),
+            THEME.accent
+        );
+        // concluído também verde
+        assert_eq!(progress_color(TorrentStatsState::Live, true), THEME.success);
+    }
+
+    #[test]
     fn session_table_line_aligns_columns() {
-        let line = session_table_line("> ", 1, 42.5, "em andamento", "arquivo.iso", 12, None);
+        let bar = progress_bar(50.0);
+        let line = session_table_line("> ", 1, &bar, "em andamento", "arquivo.iso", 12, None);
         // marcador + ID
         assert_eq!(&line[0..6], ">    1");
-        // progresso right-aligned em 8 chars + %
-        assert_eq!(&line[7..16], "    42.5%");
+        // barra ocupa a coluna de progresso a partir da coluna 7
+        let chars: Vec<char> = line.chars().collect();
+        let bar_seg: String = chars[7..7 + PROGRESS_COL_W].iter().collect();
+        assert_eq!(bar_seg, bar);
         // status alinhado à esquerda em 13 (com o padding)
-        assert_eq!(&line[17..30], "em andamento ");
+        let state_col = 7 + PROGRESS_COL_W + 1;
+        let state_seg: String = chars[state_col..state_col + 13].iter().collect();
+        assert_eq!(state_seg, "em andamento ");
         // nome truncado para name_width
-        assert_eq!(line.chars().count(), 31 + 12);
+        assert_eq!(line.chars().count(), ROW_FIXED_W + 12);
         assert!(line.contains("arquivo.iso"));
     }
 
     #[test]
     fn session_table_line_truncates_long_names() {
-        let line = session_table_line("  ", 2, 100.0, "concluído", "nome-muito-longo", 8, None);
+        let bar = progress_bar(100.0);
+        let line = session_table_line("  ", 2, &bar, "concluído", "nome-muito-longo", 8, None);
         assert!(line.contains("nome-mu…"));
-        assert_eq!(line.chars().count(), 31 + 8);
+        assert_eq!(line.chars().count(), ROW_FIXED_W + 8);
     }
 
     #[test]
     fn session_table_line_appends_actions_when_provided() {
+        let bar = progress_bar(0.0);
         let line = session_table_line(
             "  ",
             3,
-            0.0,
+            &bar,
             "pausado",
             "x",
             10,
             Some("[Retomar] [Parar  ] [Excluir]"),
         );
-        assert_eq!(line.chars().count(), 31 + 10 + 1 + ACTIONS_WIDTH as usize);
+        assert_eq!(
+            line.chars().count(),
+            ROW_FIXED_W + 10 + 1 + ACTIONS_WIDTH as usize
+        );
         assert!(line.ends_with("[Excluir]"));
     }
 
     #[test]
     fn session_table_header_matches_data_width() {
+        let bar = progress_bar(0.0);
         let header = session_table_header(12, true);
         let data = session_table_line(
             "  ",
             1,
-            0.0,
+            &bar,
             "erro",
             "abc",
             12,
