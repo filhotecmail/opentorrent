@@ -113,6 +113,25 @@ struct PendingTorrent {
     status: PendingStatus,
 }
 
+/// Alvo de uma exclusão definitiva solicitada (US-027): um torrent real na
+/// sessão (com arquivos no disco) ou uma origem pendente (ainda sem handle).
+#[derive(Clone, Debug)]
+enum DeleteTarget {
+    /// Torrent real gerenciado pela sessão (id + nome exibido).
+    Torrent { id: usize, name: String },
+    /// Origem pendente, ainda sem handle — apenas descarta a requisição.
+    Pending { name: String },
+}
+
+impl DeleteTarget {
+    /// Nome exibido no diálogo de confirmação.
+    fn name(&self) -> &str {
+        match self {
+            DeleteTarget::Torrent { name, .. } | DeleteTarget::Pending { name } => name,
+        }
+    }
+}
+
 /// Resultado da adição em segundo plano.
 #[derive(Debug)]
 enum AddOutcome {
@@ -375,6 +394,8 @@ struct Tui {
     typing: bool,
     /// Transient status/error message.
     notice: Option<String>,
+    /// Exclusão definitiva aguardando confirmação Y/N (US-027).
+    confirming_delete: Option<DeleteTarget>,
     /// Keys received from the keyboard thread.
     keys: mpsc::UnboundedReceiver<Event>,
     /// Geometria do último render (usada para mapear cliques do mouse).
@@ -406,6 +427,7 @@ impl Tui {
             input_cursor_pos: 0,
             typing: false,
             notice: None,
+            confirming_delete: None,
             keys,
             layout: None,
             pending: Arc::new(Mutex::new(Vec::new())),
@@ -525,12 +547,29 @@ impl Tui {
     }
 
     async fn handle_session_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // US-027: com a confirmação de exclusão aberta, apenas S/N/Esc agem.
+        if self.confirming_delete.is_some() {
+            match key.code {
+                KeyCode::Char('s')
+                | KeyCode::Char('S')
+                | KeyCode::Char('y')
+                | KeyCode::Char('Y') => self.confirm_delete().await?,
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirming_delete = None;
+                    self.notice = Some("exclusão cancelada".into());
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_row(1),
             KeyCode::Char('p') | KeyCode::Char('P') => self.pause_row().await?,
             KeyCode::Char('r') | KeyCode::Char('R') => self.resume_row().await?,
             KeyCode::Char('x') | KeyCode::Char('X') => self.remove_row().await?,
+            KeyCode::Delete => self.request_delete(self.row_index),
             KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('+') => {
                 self.include_index = 0;
                 self.include_input.clear();
@@ -675,6 +714,10 @@ impl Tui {
         if me.kind != MouseEventKind::Down(MouseButton::Left) {
             return Ok(());
         }
+        // Durante a confirmação de exclusão o mouse não interfere (US-027).
+        if self.confirming_delete.is_some() {
+            return Ok(());
+        }
         match self.view {
             View::Session => self.mouse_session(me.column, me.row).await,
             View::Menu => {
@@ -738,41 +781,45 @@ impl Tui {
             return Ok(());
         }
 
-        let rows = self.session_rows();
-        let Some(row_data) = rows.get(idx) else {
-            return Ok(());
-        };
-
         let Some(button) = action_button_at(col - actions_col) else {
             return Ok(());
         };
+
+        // O clique em um botão foca a linha clicada (o highlight acompanha).
+        self.row_index = idx;
+
+        let rows = self.session_rows();
         match button {
-            0 => {
-                let paused = matches!(
-                    row_data.state,
-                    TorrentStatsState::Paused | TorrentStatsState::Error
-                );
-                if paused {
-                    self.session.clone().unpause(&row_data.handle).await?;
-                    self.notice = Some(format!("retomado: {}", row_data.name));
+            0 | 1 => {
+                // Pendentes ainda não têm handle para pausar/parar (US-027).
+                let Some(row_data) = rows.get(idx) else {
+                    self.notice =
+                        Some("torrent em inicialização — aguarde a resolução dos metadados".into());
+                    return Ok(());
+                };
+                if button == 0 {
+                    let paused = matches!(
+                        row_data.state,
+                        TorrentStatsState::Paused | TorrentStatsState::Error
+                    );
+                    if paused {
+                        self.session.clone().unpause(&row_data.handle).await?;
+                        self.notice = Some(format!("retomado: {}", row_data.name));
+                    } else {
+                        self.session.pause(&row_data.handle).await?;
+                        self.notice = Some(format!("pausado: {}", row_data.name));
+                    }
                 } else {
-                    self.session.pause(&row_data.handle).await?;
-                    self.notice = Some(format!("pausado: {}", row_data.name));
+                    self.session
+                        .delete(librqbit::api::TorrentIdOrHash::Id(row_data.id), false)
+                        .await?;
+                    self.notice = Some(format!("parado: {}", row_data.name));
+                    self.clamp_row_index();
                 }
             }
-            1 => {
-                self.session
-                    .delete(librqbit::api::TorrentIdOrHash::Id(row_data.id), false)
-                    .await?;
-                self.notice = Some(format!("parado: {}", row_data.name));
-                self.clamp_row_index();
-            }
             2 => {
-                self.session
-                    .delete(librqbit::api::TorrentIdOrHash::Id(row_data.id), true)
-                    .await?;
-                self.notice = Some(format!("excluído: {}", row_data.name));
-                self.clamp_row_index();
+                // Excluir: confirmação Y/N antes de apagar os arquivos (AC-4).
+                self.request_delete(idx);
             }
             _ => {}
         }
@@ -905,8 +952,61 @@ impl Tui {
                 .delete(librqbit::api::TorrentIdOrHash::Id(row.id), false)
                 .await?;
             self.notice = Some(format!("removido da fila: {}", row.name));
-            self.clamp_row_index();
+        } else {
+            // Origem pendente (ainda sem handle): apenas descarta a requisição.
+            let rel = self.row_index.saturating_sub(rows.len());
+            let mut guard = self.pending.lock().unwrap();
+            if rel < guard.len() {
+                let source = guard.remove(rel).source;
+                self.notice = Some(format!("removido da fila: {source}"));
+            }
         }
+        self.clamp_row_index();
+        Ok(())
+    }
+
+    /// Solicita a exclusão definitiva do item focado (tecla Delete ou botão
+    /// Excluir): registra o alvo exato e abre a confirmação Y/N (US-027).
+    fn request_delete(&mut self, entry_index: usize) {
+        let rows = self.session_rows();
+        let target = if let Some(row) = rows.get(entry_index) {
+            DeleteTarget::Torrent {
+                id: row.id,
+                name: row.name.clone(),
+            }
+        } else {
+            let rel = entry_index.saturating_sub(rows.len());
+            let guard = self.pending.lock().unwrap();
+            let Some(entry) = guard.get(rel) else {
+                return;
+            };
+            DeleteTarget::Pending {
+                name: entry.source.clone(),
+            }
+        };
+        self.confirming_delete = Some(target);
+        self.notice = None;
+    }
+
+    /// Efetiva a exclusão confirmada: remove o torrent da sessão e apaga os
+    /// arquivos do disco (`delete_files = true`); pendentes são descartados.
+    async fn confirm_delete(&mut self) -> anyhow::Result<()> {
+        let Some(target) = self.confirming_delete.take() else {
+            return Ok(());
+        };
+        match target {
+            DeleteTarget::Torrent { id, name } => {
+                self.session
+                    .delete(librqbit::api::TorrentIdOrHash::Id(id), true)
+                    .await?;
+                self.notice = Some(format!("excluído: {name} (arquivos removidos)"));
+            }
+            DeleteTarget::Pending { name } => {
+                self.pending.lock().unwrap().retain(|p| p.source != name);
+                self.notice = Some(format!("excluído: {name} (pendente descartado)"));
+            }
+        }
+        self.clamp_row_index();
         Ok(())
     }
 
@@ -999,6 +1099,11 @@ impl Tui {
             View::Session => self.render_session(&mut frame, cols, body_top, body_height),
             View::Include => self.render_include(&mut frame, cols, body_top, body_height),
             View::Completed => self.render_completed(&mut frame, cols, body_top, body_height),
+        }
+
+        // US-027: diálogo de confirmação Y/N sobreposto à sessão (AC-4).
+        if matches!(self.view, View::Session) && self.confirming_delete.is_some() {
+            self.render_confirm_delete(&mut frame, cols, body_top, body_height);
         }
 
         self.render_footer(&mut frame, cols, rows);
@@ -1257,8 +1362,22 @@ impl Tui {
                     PendingStatus::Done(_) => continue, // já consumido no render
                 };
                 let bar = progress_bar(0.0);
-                let mut line =
-                    session_table_line(marker, 0, &bar, state, &pt.source, name_width, None);
+                // US-027: pendentes em "inicializando" exibem a coluna de ações
+                // completa, alinhada com os demais itens (AC-1).
+                let actions = if matches!(&pt.status, PendingStatus::Resolving) && show_actions {
+                    Some(actions_string(false))
+                } else {
+                    None
+                };
+                let mut line = session_table_line(
+                    marker,
+                    0,
+                    &bar,
+                    state,
+                    &pt.source,
+                    name_width,
+                    actions.as_deref(),
+                );
                 if !detail.is_empty() {
                     line = Self::truncate(
                         &format!("{line} — {}", Self::truncate(detail, 28)),
@@ -1317,6 +1436,52 @@ impl Tui {
                 show_actions,
             });
         }
+    }
+
+    /// Diálogo de confirmação de exclusão definitiva (US-027): modal pequeno
+    /// centralizado sobre o Body, pedindo S/N antes de apagar os arquivos.
+    fn render_confirm_delete(
+        &mut self,
+        frame: &mut Frame,
+        cols: u16,
+        body_top: u16,
+        body_height: u16,
+    ) {
+        let Some(target) = &self.confirming_delete else {
+            return;
+        };
+        // Escurece o Body para destacar o diálogo (mesmo overlay do modal).
+        frame.fill_rect(
+            body_top,
+            0,
+            body_height,
+            cols,
+            ' ',
+            None,
+            Some(THEME.overlay_bg),
+        );
+
+        let lines = confirm_delete_modal_lines(target.name());
+        let width = lines
+            .iter()
+            .map(|l| l.chars().count() as u16)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(4)
+            .min(cols.saturating_sub(2))
+            .max(8);
+        let height = (lines.len() as u16).saturating_add(2);
+        let left = cols.saturating_sub(width) / 2;
+        let top = body_top.saturating_add(body_height.saturating_sub(height) / 2);
+
+        draw_box(frame, left, top, width, height);
+        // Trunca cada linha à largura interna para nunca estourar as bordas.
+        let inner_width = (width as usize).saturating_sub(4);
+        let lines: Vec<String> = lines
+            .iter()
+            .map(|l| Self::truncate(l, inner_width))
+            .collect();
+        write_boxed_lines(frame, left + 2, top + 1, &lines, &[], height);
     }
 
     fn render_include(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
@@ -1721,6 +1886,18 @@ fn session_table_line(
     line
 }
 
+/// Linhas do diálogo de confirmação de exclusão (US-027). O nome é truncado
+/// para não alargar o modal em terminais estreitos.
+fn confirm_delete_modal_lines(name: &str) -> Vec<String> {
+    vec![
+        "excluir definitivamente?".to_string(),
+        String::new(),
+        Tui::truncate(name, 56),
+        String::new(),
+        "o torrent e seus arquivos serão removidos — [S]im [N]ão".to_string(),
+    ]
+}
+
 /// Rótulo da view atual, exibido no canto direito do Header (US-019).
 fn view_label(view: &View) -> &'static str {
     match view {
@@ -1737,7 +1914,9 @@ fn footer_hints(view: &View) -> &'static str {
     match view {
         View::Title => "digite / para abrir o menu",
         View::Menu => "↑/↓ ou j/k navegar · Enter selecionar · Esc voltar",
-        View::Session => "[P] pausar  [R] retomar  [X] remover  [A/+] adicionar  [Esc] voltar",
+        View::Session => {
+            "[P] pausar  [R] retomar  [X] remover  [Del] excluir  [A/+] adicionar  [Esc] voltar"
+        }
         View::Include => "Enter confirmar · Esc cancelar",
         View::Completed => "Esc voltar ao menu",
     }
@@ -2366,6 +2545,28 @@ mod tests {
         assert!(header.contains("ID"));
         assert!(header.contains("PROGRESSO"));
         assert!(header.contains("AÇÕES"));
+    }
+
+    #[test]
+    fn confirm_delete_modal_asks_yes_no() {
+        let lines = confirm_delete_modal_lines("arquivo.iso");
+        assert!(lines[0].contains("excluir definitivamente"));
+        assert_eq!(lines[2], "arquivo.iso");
+        assert!(lines[4].contains("[S]im"));
+        assert!(lines[4].contains("[N]ão"));
+    }
+
+    #[test]
+    fn confirm_delete_modal_truncates_long_names() {
+        let long = "m".repeat(200);
+        let lines = confirm_delete_modal_lines(&long);
+        assert_eq!(lines[2].chars().count(), 56);
+        assert!(lines[2].ends_with('…'));
+    }
+
+    #[test]
+    fn session_footer_hints_mention_delete_shortcut() {
+        assert!(footer_hints(&View::Session).contains("[Del]"));
     }
 
     #[test]
