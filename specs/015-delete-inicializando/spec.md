@@ -16,8 +16,9 @@ dos metadados) e remover arquivos rapidamente via teclado.
 - [x] A exclusão via `Delete` remove a entrada da sessão e apaga os arquivos do
       armazenamento local (`delete_files = true`).
 - [x] Confirmação rápida (modal Y/N) antes da remoção definitiva dos dados.
-- [x] A lista atualiza e re-indexa os IDs imediatamente após a remoção
-      (`clamp_row_index` + re-leitura da sessão a cada frame).
+- [x] A lista atualiza e re-indexa os IDs imediatamente após a remoção: o ID
+      exibido é a posição contígua na tabela (o id real do librqbit segue
+      sendo usado nas operações internas) + `clamp_row_index`.
 
 ## Cenários de teste
 
