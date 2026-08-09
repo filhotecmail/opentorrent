@@ -21,25 +21,17 @@ use tokio::sync::mpsc;
 
 use crate::downloads::{format_completed, list_completed_downloads};
 
-const BANNER: [&str; 5] = [
-    "  ___   _ __   ____  _  _  _____  ___   ____   ____   ____  _  _  _____",
-    " / _ \\ |  __| |  _ \\ | \\/ | |_   _| / _ \\ |  _ \\ |  _ \\ |  _ \\ | \\/ | |_   _|",
-    "| | | || |_   | |_) || \\/ |   | |  | | | || |_) || |_) || |_) || \\/ |   | |",
-    "| |_| ||  _|  |  _ < | |\\/| |  | |  | |_| ||  _ < |  _ < |  _ < | |\\/| |  | |",
-    " \\___/ |_|    |_| \\_\\ |_|  |_|  |_|   \\___/ |_| \\_\\ |_| \\_\\ |_| \\_\\ |_|  |_|  |_|",
+/// Comandos do menu flutuante (US-031): comando e descrição funcional.
+const COMMANDS: [(&str, &str); 8] = [
+    ("/add", "adicionar torrent a lista"),
+    ("/list", "acompanhar progresso"),
+    ("/history", "listar downloads completos"),
+    ("/pause", "pausar torrent selecionado"),
+    ("/resume", "retomar torrent selecionado"),
+    ("/delete", "excluir torrent selecionado"),
+    ("/help", "exibir ajuda de comandos"),
+    ("/exit", "sair do OpenTorrent"),
 ];
-
-const MENU_ITEMS: [&str; 4] = [
-    "Adicionar torrent a lista",
-    "Acompanhar progresso",
-    "Listar downloads completos",
-    "Sair",
-];
-
-const MENU_SHORTCUTS: [char; 4] = ['a', 'c', 'l', 's'];
-
-/// Índice (na lista de linhas renderizadas) da primeira opção do menu.
-const MENU_ITEMS_OFFSET: usize = 3;
 
 /// Largura de cada botão de ação renderizado nas linhas da sessão (ex.: `[Pausar ]`).
 const ACTION_BTN_WIDTH: u16 = 9;
@@ -66,16 +58,17 @@ const ROW_FIXED_W: usize = ROW_PREFIX_W + PROGRESS_COL_W + 1 + STATE_W + 1;
 /// cliques (evita divergência entre `session_row_line` e `Layout.rows_offset`).
 const SESSION_HEADER_LINES: usize = 4;
 
-/// Resolução alvo da área amostrada: 1024x768 pixels. Considerando uma célula
-/// de terminal de ~8x16 px, isso equivale a 128 colunas x 48 linhas.
-const FRAME_WIDTH: u16 = 128;
-const FRAME_HEIGHT: u16 = 48;
+/// Margens do layout full-window (US-031, estilo opencode): 2 colunas em
+/// cada lateral e 1 linha no topo/base, ocupando todo o terminal disponível.
+const LAYOUT_MARGIN_COLS: u16 = 2;
+const LAYOUT_MARGIN_ROWS: u16 = 1;
 
 /// The state machine driving the interactive UI.
 enum View {
-    /// Title screen with ASCII art and the command input field.
-    Title,
-    /// Dropdown menu opened by typing `/`.
+    /// Home screen with panels (Biblioteca/Histórico) and the prompt at the
+    /// bottom (US-031).
+    Home,
+    /// Command palette floating popup opened by typing `/` (US-031).
     Menu,
     /// US-009 session list with per-row actions.
     Session,
@@ -204,6 +197,9 @@ struct Theme {
     footer_bg: Color,
     /// Fundo do overlay do modal (escurece a tela principal).
     overlay_bg: Color,
+    /// Fundo sólido do popup flutuante de comandos (US-031): evita que o
+    /// conteúdo do painel por trás vaze nas linhas do popup.
+    popup_bg: Color,
 }
 
 const THEME: Theme = Theme {
@@ -218,6 +214,7 @@ const THEME: Theme = Theme {
     header_bg: Color::Blue,
     footer_bg: Color::DarkGrey,
     overlay_bg: Color::DarkGrey,
+    popup_bg: Color::DarkGrey,
 };
 
 /// Buffer de tela (US-016): o render desenha o estado atual neste buffer e, ao
@@ -390,6 +387,8 @@ struct Tui {
     include_input: String,
     /// Cursor position within `include_input` (byte index).
     input_cursor_pos: usize,
+    /// Cursor position within the home prompt `input` (byte index).
+    prompt_cursor: usize,
     /// Whether the include dialog is in "typing" mode (entering the source).
     typing: bool,
     /// Transient status/error message.
@@ -418,13 +417,14 @@ impl Tui {
         Self {
             session,
             output_folder,
-            view: View::Title,
+            view: View::Home,
             input: String::new(),
             menu_index: 0,
             row_index: 0,
             include_index: 0,
             include_input: String::new(),
             input_cursor_pos: 0,
+            prompt_cursor: 0,
             typing: false,
             notice: None,
             confirming_delete: None,
@@ -452,6 +452,20 @@ impl Tui {
                     self.include_input = format!("{before}{text}{after}");
                     self.input_cursor_pos += text.len();
                     self.notice = None;
+                } else if matches!(self.view, View::Home | View::Menu) {
+                    // Paste no prompt da base (US-031): insere na posição do
+                    // cursor; se começar com `/`, abre o popup de comandos.
+                    let before = &self.input[..self.prompt_cursor];
+                    let after = &self.input[self.prompt_cursor..];
+                    self.input = format!("{before}{text}{after}");
+                    self.prompt_cursor += text.len();
+                    self.notice = None;
+                    // A seleção do popup volta ao topo após o paste (a lista
+                    // filtrada pode ter mudado de tamanho).
+                    self.menu_index = 0;
+                    if self.input.starts_with('/') && !matches!(self.view, View::Menu) {
+                        self.view = View::Menu;
+                    }
                 }
                 (true, true)
             }
@@ -474,8 +488,8 @@ impl Tui {
         }
 
         match self.view {
-            View::Title => self.handle_title_key(key)?,
-            View::Menu => self.handle_menu_key(key)?,
+            View::Home => self.handle_home_key(key).await?,
+            View::Menu => self.handle_menu_key(key).await?,
             View::Session => self.handle_session_key(key).await?,
             View::Include => self.handle_include_key(key).await?,
             View::Completed => self.handle_completed_key(key)?,
@@ -483,14 +497,58 @@ impl Tui {
         Ok(self.running)
     }
 
-    fn handle_title_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+    /// Teclas da Home (US-031): qualquer caractere vai para o prompt fixo da
+    /// base; `/` (ou um prompt iniciado com `/`) abre o menu flutuante; Enter
+    /// executa o comando digitado; ↑/↓ navegam na Biblioteca.
+    async fn handle_home_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // US-027: com a confirmação de exclusão aberta (via /delete), apenas
+        // S/N/Esc agem — mesmo estando na Home (comando do menu flutuante).
+        if self.confirming_delete.is_some() {
+            match key.code {
+                KeyCode::Char('s')
+                | KeyCode::Char('S')
+                | KeyCode::Char('y')
+                | KeyCode::Char('Y') => self.confirm_delete().await?,
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirming_delete = None;
+                    self.notice = Some("exclusão cancelada".into());
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Char('/') => {
                 self.input = "/".into();
+                self.prompt_cursor = 1;
                 self.menu_index = 0;
                 self.view = View::Menu;
             }
-            // FR-003a: keys that do not start with `/` are inert input.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_prompt_char(c);
+                self.notice = None;
+                // Filtragem dinâmica: qualquer texto iniciado com `/` abre o popup.
+                if self.input.starts_with('/') {
+                    self.menu_index = 0;
+                    self.view = View::Menu;
+                }
+            }
+            KeyCode::Enter => {
+                let cmd = self.input.trim().to_string();
+                self.input.clear();
+                self.prompt_cursor = 0;
+                if cmd.starts_with('/') {
+                    self.execute_command(&cmd).await?;
+                }
+            }
+            KeyCode::Backspace => self.backspace_prompt(),
+            KeyCode::Esc => {
+                self.input.clear();
+                self.prompt_cursor = 0;
+            }
+            KeyCode::Up => self.move_row(-1),
+            KeyCode::Down => self.move_row(1),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.running = false;
             }
@@ -499,51 +557,109 @@ impl Tui {
         Ok(())
     }
 
-    fn handle_menu_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+    /// Insere um caractere no prompt da Home na posição do cursor (byte index).
+    fn insert_prompt_char(&mut self, c: char) {
+        self.prompt_cursor = insert_char_at(&mut self.input, self.prompt_cursor, c);
+    }
+
+    /// Apaga o caractere anterior ao cursor no prompt da Home.
+    fn backspace_prompt(&mut self) {
+        self.prompt_cursor = backspace_char_at(&mut self.input, self.prompt_cursor);
+    }
+
+    /// Teclas do popup de comandos (US-031): ↑/↓ navegam, Enter executa o
+    /// comando selecionado, Tab completa o prompt, caracteres filtram a lista
+    /// conforme o texto digitado após `/` e Esc fecha.
+    async fn handle_menu_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        let filtered = self.filtered_commands();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.menu_index = (self.menu_index + MENU_ITEMS.len() - 1) % MENU_ITEMS.len();
+                if !filtered.is_empty() {
+                    self.menu_index = (self.menu_index + filtered.len() - 1) % filtered.len();
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.menu_index = (self.menu_index + 1) % MENU_ITEMS.len();
-            }
-            KeyCode::Enter => self.select_menu_item(),
-            KeyCode::Char(c) => {
-                if let Some(idx) = MENU_SHORTCUTS
-                    .iter()
-                    .position(|&s| s == c.to_ascii_lowercase())
-                {
-                    // AC-4: o destaque visual acompanha a opção acionada antes
-                    // de executar o comando correspondente.
-                    self.menu_index = idx;
-                    self.select_menu_item();
+                if !filtered.is_empty() {
+                    self.menu_index = (self.menu_index + 1) % filtered.len();
                 }
-                // FR: unknown commands are silently ignored, field stays clean.
+            }
+            KeyCode::Enter => {
+                if let Some((cmd, _)) = filtered.get(self.menu_index) {
+                    self.input = cmd.clone();
+                    self.prompt_cursor = self.input.len();
+                    self.execute_command(cmd).await?;
+                }
+            }
+            KeyCode::Tab => {
+                // Tab completa o prompt com o comando selecionado (AC: seleção
+                // via Enter ou Tab) e volta para a Home para edição/execução.
+                if let Some((cmd, _)) = filtered.get(self.menu_index) {
+                    self.input = cmd.clone();
+                    self.prompt_cursor = self.input.len();
+                    self.view = View::Home;
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_prompt_char(c);
+                self.menu_index = 0;
+            }
+            KeyCode::Backspace => {
+                self.backspace_prompt();
+                self.menu_index = 0;
+                // Fecha o popup quando o prompt volta a ficar sem `/`.
+                if !self.input.starts_with('/') {
+                    self.input.clear();
+                    self.prompt_cursor = 0;
+                    self.view = View::Home;
+                }
             }
             KeyCode::Esc => {
                 self.input.clear();
-                self.view = View::Title;
+                self.prompt_cursor = 0;
+                self.view = View::Home;
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.running = false;
             }
             _ => {}
         }
         Ok(())
     }
 
-    fn select_menu_item(&mut self) {
-        match self.menu_index {
-            0 => {
+    /// Comandos disponíveis filtrados pelo texto digitado após `/`.
+    fn filtered_commands(&self) -> Vec<(String, String)> {
+        filter_commands(&self.input)
+    }
+
+    /// Executa um comando digitado/selecionado (US-031): mapeia cada comando
+    /// do menu flutuante para a ação correspondente na interface.
+    async fn execute_command(&mut self, cmd: &str) -> anyhow::Result<()> {
+        match cmd {
+            "/add" => {
                 self.include_index = 0;
                 self.include_input.clear();
+                self.typing = false;
                 self.view = View::Include;
             }
-            1 => {
+            "/list" => {
                 self.row_index = 0;
                 self.view = View::Session;
             }
-            2 => self.view = View::Completed,
-            3 => self.running = false,
-            _ => unreachable!("menu index out of range"),
+            "/history" => self.view = View::Completed,
+            "/pause" => self.pause_row().await?,
+            "/resume" => self.resume_row().await?,
+            "/delete" => self.request_delete(self.row_index),
+            "/help" => {
+                let help: Vec<String> = COMMANDS
+                    .iter()
+                    .map(|(cmd, desc)| format!("{cmd} — {desc}"))
+                    .collect();
+                self.notice = Some(format!("comandos: {}", help.join(" · ")));
+            }
+            "/exit" => self.running = false,
+            other => self.notice = Some(format!("comando desconhecido: {other}")),
         }
+        Ok(())
     }
 
     async fn handle_session_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
@@ -575,7 +691,7 @@ impl Tui {
                 self.include_input.clear();
                 self.view = View::Include;
             }
-            KeyCode::Esc => self.view = View::Menu,
+            KeyCode::Esc => self.view = View::Home,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.running = false;
             }
@@ -700,7 +816,7 @@ impl Tui {
 
     fn handle_completed_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         match key.code {
-            KeyCode::Esc => self.view = View::Menu,
+            KeyCode::Esc => self.view = View::Home,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.running = false;
             }
@@ -724,12 +840,30 @@ impl Tui {
                 self.mouse_menu(me.row);
                 Ok(())
             }
+            View::Home => {
+                // Clique na Biblioteca move a seleção da linha clicada.
+                self.mouse_home(me.row);
+                Ok(())
+            }
             View::Include if !self.typing => {
                 self.mouse_include(me.row);
                 Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    /// Clique na Biblioteca da Home: move a seleção para a linha clicada.
+    fn mouse_home(&mut self, row: u16) {
+        let Some(layout) = self.layout else {
+            return;
+        };
+        let first_row = layout.top.saturating_add(layout.rows_offset);
+        let Some(idx) = table_row_to_index(row, first_row, layout.row_count, layout.row_stride)
+        else {
+            return;
+        };
+        self.row_index = idx;
     }
 
     /// Clique no menu: move o cursor de seleção (indicador + destaque) para a
@@ -932,6 +1066,9 @@ impl Tui {
         if let Some(row) = rows.get(self.row_index) {
             self.session.pause(&row.handle).await?;
             self.notice = Some(format!("pausado: {}", row.name));
+        } else {
+            // Linha selecionada é uma origem pendente (ainda sem handle).
+            self.notice = Some("torrent em inicialização — aguarde a resolução".into());
         }
         Ok(())
     }
@@ -941,6 +1078,8 @@ impl Tui {
         if let Some(row) = rows.get(self.row_index) {
             self.session.clone().unpause(&row.handle).await?;
             self.notice = Some(format!("retomado: {}", row.name));
+        } else {
+            self.notice = Some("torrent em inicialização — aguarde a resolução".into());
         }
         Ok(())
     }
@@ -1109,15 +1248,17 @@ impl Tui {
         let body_top = 1u16;
         let body_height = rows.saturating_sub(2).max(1);
         match self.view {
-            View::Title => self.render_title(&mut frame, cols, body_top, body_height),
+            View::Home => self.render_home(&mut frame, cols, body_top, body_height),
             View::Menu => self.render_menu(&mut frame, cols, body_top, body_height),
             View::Session => self.render_session(&mut frame, cols, body_top, body_height),
             View::Include => self.render_include(&mut frame, cols, body_top, body_height),
             View::Completed => self.render_completed(&mut frame, cols, body_top, body_height),
         }
 
-        // US-027: diálogo de confirmação Y/N sobreposto à sessão (AC-4).
-        if matches!(self.view, View::Session) && self.confirming_delete.is_some() {
+        // US-027: diálogo de confirmação Y/N sobreposto (AC-4). Como o /delete
+        // também pode ser acionado a partir da Home (US-031), o modal aparece
+        // sobre qualquer uma das duas telas.
+        if matches!(self.view, View::Session | View::Home) && self.confirming_delete.is_some() {
             self.render_confirm_delete(&mut frame, cols, body_top, body_height);
         }
 
@@ -1158,25 +1299,220 @@ impl Tui {
         Ok(())
     }
 
-    fn render_title(&self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
-        let mut lines: Vec<String> = Vec::new();
-        for line in BANNER.iter() {
-            lines.push(line.to_string());
+    /// Tela inicial (US-031, estilo opencode): dois painéis de linha fina —
+    /// "Biblioteca de downloads" (torrents da sessão) no topo e "Histórico de
+    /// downloads" (completos) no meio — com o prompt fixo na base.
+    fn render_home(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
+        // O prompt fixo ocupa a última linha do Body; os painéis ficam acima.
+        let prompt_row = body_top.saturating_add(body_height).saturating_sub(1);
+        let panels_height = body_height.saturating_sub(1).max(2);
+        // Divisão vertical: Biblioteca (topo, ~55%) e Histórico (~45%). Em
+        // terminais muito baixos os dois painéis somam exatamente o espaço
+        // disponível (sem sobrepor o prompt): o histórico encolhe primeiro e
+        // desaparece abaixo de 6 linhas de painel.
+        let lib_height = (panels_height * 55 / 100)
+            .max(3)
+            .min(panels_height.saturating_sub(3));
+        let hist_height = panels_height.saturating_sub(lib_height);
+
+        if hist_height >= 3 {
+            let hist_top = body_top.saturating_add(lib_height);
+            self.render_library_panel(frame, cols, body_top, lib_height);
+            self.render_history_panel(frame, cols, hist_top, hist_height);
+        } else {
+            // Espaço só para a Biblioteca: o histórico é omitido.
+            self.render_library_panel(frame, cols, body_top, panels_height);
         }
-        lines.push(String::new());
-        lines.push("Bem-vindo ao OpenTorrent".into());
-        lines.push("digite / para abrir o menu".into());
+        self.render_home_prompt(frame, cols, prompt_row);
+    }
+
+    /// Painel superior da Home: tabela compacta da sessão (sem ações),
+    /// com a linha selecionada destacada e as barras coloridas por estado.
+    fn render_library_panel(&mut self, frame: &mut Frame, cols: u16, top: u16, height: u16) {
+        let left = LAYOUT_MARGIN_COLS;
+        let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS);
+        let content_left = left + 2;
+        let inner_width = (width as usize).saturating_sub(4);
+
+        let rows_data = self.session_rows();
+        let pending = self.pending.lock().unwrap().clone();
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("Biblioteca de downloads".into());
         lines.push(String::new());
 
-        let prompt = format!("{} {}", ">", self.input);
-        lines.push(prompt);
-        lines.push(String::new());
-        lines.push("atalhos: A adicionar | C acompanhar | L listar | S sair".into());
+        let name_width = inner_width.saturating_sub(ROW_FIXED_W).max(1);
+        lines.push(session_table_header(name_width, false));
+        lines.push(separator_line(inner_width));
 
-        // Elemento ativo da tela inicial: a linha de boas-vindas recebe o
-        // highlight de fundo (US-019).
-        let highlighted: Vec<usize> = vec![6];
-        self.centered_write(frame, lines, cols, body_top, body_height, &highlighted);
+        let total = rows_data.len() + pending.len();
+        let max_rows = (height as usize).saturating_sub(5);
+        // (índice de linha no bloco, barra, cor) para sobrepor após a base.
+        let mut bars: Vec<(usize, String, Color)> = Vec::new();
+        // 0 título, 1 vazio, 2 cabeçalho, 3 separador, 4+ dados.
+        let mut row_line = 4usize;
+
+        if total == 0 {
+            lines.push("nenhum torrent na fila".into());
+        } else {
+            for (idx, row) in rows_data.iter().take(max_rows).enumerate() {
+                let marker = if idx == self.row_index { "> " } else { "  " };
+                let state = if row.finished {
+                    "concluído"
+                } else {
+                    match row.state {
+                        TorrentStatsState::Live => "em andamento",
+                        TorrentStatsState::Paused => "pausado",
+                        TorrentStatsState::Error => "erro",
+                        TorrentStatsState::Initializing => "inicializando",
+                    }
+                };
+                let pct = if row.total_bytes == 0 {
+                    0.0
+                } else {
+                    row.progress_bytes as f64 / row.total_bytes as f64 * 100.0
+                };
+                let bar = progress_bar(pct);
+                let color = progress_color(row.state, row.finished);
+                lines.push(session_table_line(
+                    marker, idx, &bar, state, &row.name, name_width, None,
+                ));
+                bars.push((row_line, bar, color));
+                row_line += 1;
+            }
+            // Origens pendentes (adição assíncrona) também aparecem.
+            let mut idx = rows_data.len();
+            for pt in &pending {
+                if row_line >= 4 + max_rows {
+                    break;
+                }
+                let marker = if idx == self.row_index { "> " } else { "  " };
+                let (state, color) = match &pt.status {
+                    PendingStatus::Resolving => ("inicializando", THEME.accent),
+                    PendingStatus::Error(_) => ("erro", THEME.error),
+                    PendingStatus::Done(_) => continue,
+                };
+                let bar = progress_bar(0.0);
+                lines.push(session_table_line(
+                    marker, idx, &bar, state, &pt.source, name_width, None,
+                ));
+                bars.push((row_line, bar, color));
+                row_line += 1;
+                idx += 1;
+            }
+        }
+
+        let mut highlighted = Vec::new();
+        if self.row_index < total && self.row_index < max_rows {
+            highlighted.push(4 + self.row_index);
+        }
+
+        draw_box(frame, left, top, width, height);
+        write_boxed_lines(frame, content_left, top + 1, &lines, &highlighted, height);
+
+        // Barras coloridas por estado por cima da linha base.
+        for (line_idx, bar, color) in &bars {
+            let row = top + 1 + *line_idx as u16;
+            frame.put_styled(
+                row,
+                content_left + ROW_PREFIX_W as u16,
+                bar,
+                Some(*color),
+                None,
+            );
+        }
+
+        // Geometria para cliques do mouse na Biblioteca (move a seleção).
+        self.layout = Some(Layout {
+            top: top + 1,
+            left: content_left,
+            rows_offset: 4,
+            row_count: bars.len().max(1),
+            row_stride: 1,
+            info_width: 0,
+            show_actions: false,
+        });
+    }
+
+    /// Painel intermediário da Home: downloads completos em verde.
+    fn render_history_panel(&mut self, frame: &mut Frame, cols: u16, top: u16, height: u16) {
+        let left = LAYOUT_MARGIN_COLS;
+        let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS);
+        let content_left = left + 2;
+        let inner_width = (width as usize).saturating_sub(4);
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("Histórico de downloads".into());
+        lines.push(String::new());
+
+        let items = match list_completed_downloads(&self.output_folder) {
+            Ok(items) => items,
+            Err(err) => {
+                lines.push(format!("erro ao listar: {err:#}"));
+                Vec::new()
+            }
+        };
+        let item_texts: Vec<String> = items
+            .iter()
+            .map(|item| Self::truncate(&format_completed(item), inner_width))
+            .collect();
+
+        if item_texts.is_empty() {
+            lines.push("nenhum download completo".into());
+        } else {
+            let max_items = (height as usize).saturating_sub(3);
+            for text in item_texts.iter().take(max_items) {
+                lines.push(text.clone());
+            }
+        }
+
+        draw_box(frame, left, top, width, height);
+        write_boxed_lines(frame, content_left, top + 1, &lines, &[], height);
+
+        // Completos em verde (sucesso da paleta).
+        let items_start = top + 1 + 2;
+        for (i, text) in item_texts
+            .iter()
+            .take((height as usize).saturating_sub(3))
+            .enumerate()
+        {
+            frame.put_colored(
+                items_start + i as u16,
+                content_left,
+                text,
+                Some(THEME.success),
+            );
+        }
+    }
+
+    /// Prompt fixo da base (US-031): `> ` + texto digitado (ou placeholder) com
+    /// cursor ativo, preenchendo a largura do terminal com as margens laterais.
+    fn render_home_prompt(&mut self, frame: &mut Frame, cols: u16, row: u16) {
+        let left = LAYOUT_MARGIN_COLS;
+        let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS);
+        let prompt = "> ";
+        let text = if self.input.is_empty() {
+            "Enter a command or / for options".to_string()
+        } else {
+            self.input.clone()
+        };
+        let max_w = (width as usize).saturating_sub(4);
+        let shown = Self::truncate(&text, max_w);
+        frame.fill(row, left, width, ' ', None, Some(THEME.footer_bg));
+        frame.put_styled(row, left, prompt, Some(THEME.accent), Some(THEME.footer_bg));
+        let text_col = left + prompt.chars().count() as u16;
+        frame.put_styled(
+            row,
+            text_col,
+            &shown,
+            Some(THEME.text),
+            Some(THEME.footer_bg),
+        );
+        // Cursor: converte o índice de bytes para coluna de caracteres (evita
+        // desalinhamento com acentos/Unicode) e limita ao texto visível.
+        let cursor_chars =
+            prompt_cursor_col(&self.input, self.prompt_cursor, shown.chars().count());
+        let cursor_col = text_col.saturating_add(cursor_chars as u16);
+        frame.set_cursor(row, cursor_col);
     }
 
     /// Header fixo (US-019): título + versão à esquerda, view atual à direita.
@@ -1227,49 +1563,90 @@ impl Tui {
         }
     }
 
+    /// Popup flutuante de comandos (US-031): desenhado imediatamente acima do
+    /// prompt da Home, listando os comandos filtrados com a descrição alinhada
+    /// à direita. O item selecionado recebe highlight de fundo (AC-3).
     fn render_menu(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
-        // Interface de navegação delimitada pelo quadro com bordas duplas,
-        // contida na região do Body (entre Header e Footer).
-        let (left, top, width, height) = body_frame(cols, body_top, body_height);
-        let content_left = left + 2;
-        let inner_width = (width as usize).saturating_sub(4);
+        // Home por baixo (painéis + prompt); o popup sobrepõe-se acima do prompt.
+        self.render_home(frame, cols, body_top, body_height);
 
-        let mut lines: Vec<String> = Vec::new();
-        lines.push("OPENTORRENT".into());
-        lines.push("menu".into());
-        lines.push(String::new());
-
-        for idx in 0..MENU_ITEMS.len() {
-            lines.push(menu_item_line(idx, idx == self.menu_index));
+        let prompt_row = body_top.saturating_add(body_height).saturating_sub(1);
+        let filtered = self.filtered_commands();
+        let mut lines: Vec<String> = filtered
+            .iter()
+            .enumerate()
+            .map(|(i, (cmd, desc))| command_item_line(cmd, desc, i == self.menu_index))
+            .collect();
+        if lines.is_empty() {
+            lines.push("nenhum comando encontrado".into());
         }
-        lines.push(String::new());
-        lines.push("use ↑/↓ + Enter, ou digite a letra do atalho".into());
-
+        let inner_w = (cols as usize).saturating_sub(8);
         for line in &mut lines {
-            *line = Self::truncate(line, inner_width);
+            *line = Self::truncate(line, inner_w);
+        }
+        let width = lines
+            .iter()
+            .map(|l| l.chars().count() as u16)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(4)
+            .min(cols.saturating_sub(4));
+        // Altura mínima de 3 (bordas) e máxima limitada pelo espaço acima do
+        // prompt; cada linha de comando cabe (sem o -3 do write_boxed_lines).
+        let height = (lines.len() as u16)
+            .saturating_add(2)
+            .clamp(3, prompt_row.saturating_sub(body_top).max(3));
+        let left = LAYOUT_MARGIN_COLS;
+        let top = prompt_row.saturating_sub(height);
+        let content_left = left + 2;
+        let content_w = width.saturating_sub(4) as usize;
+
+        // Fundo sólido do popup (evita vazar o conteúdo dos painéis por trás).
+        frame.fill_rect(top, left, height, width, ' ', None, Some(THEME.popup_bg));
+        draw_box(frame, left, top, width, height);
+
+        // Desenha cada linha manualmente: a selecionada com highlight de fundo
+        // (AC-3) e as demais com o fundo sólido do popup. Como o popup pode ser
+        // pequeno (1 item filtrado), não usa `write_boxed_lines` (que limita a
+        // `height - 3` linhas e zeraria um popup de 3 linhas).
+        let max_lines = (height as usize).saturating_sub(2);
+        for (idx, line) in lines.iter().take(max_lines).enumerate() {
+            let row = top + 1 + idx as u16;
+            let text = Self::truncate(line, content_w);
+            if idx == self.menu_index {
+                // O highlight cobre apenas o interior (não invade a borda direita).
+                frame.fill(
+                    row,
+                    content_left,
+                    width - 3,
+                    ' ',
+                    None,
+                    Some(THEME.highlight_bg),
+                );
+                frame.put_styled(
+                    row,
+                    content_left,
+                    &text,
+                    Some(THEME.text),
+                    Some(THEME.highlight_bg),
+                );
+            } else {
+                frame.put_styled(
+                    row,
+                    content_left,
+                    &text,
+                    Some(THEME.text),
+                    Some(THEME.popup_bg),
+                );
+            }
         }
 
-        let content_top = center_content_top(top, height, lines.len());
-
-        // O destaque (fundo + texto) acompanha exatamente a linha com o cursor
-        // `> ... <` (itens começam na linha `MENU_ITEMS_OFFSET`).
-        let highlighted = vec![MENU_ITEMS_OFFSET + self.menu_index];
-
-        draw_box(frame, left, top, width, height);
-        write_boxed_lines(
-            frame,
-            content_left,
-            content_top,
-            &lines,
-            &highlighted,
-            height,
-        );
-
+        // Geometria para cliques do mouse nos itens do popup.
         self.layout = Some(Layout {
-            top: content_top,
+            top: top + 1,
             left: content_left,
-            rows_offset: MENU_ITEMS_OFFSET as u16,
-            row_count: MENU_ITEMS.len(),
+            rows_offset: 0,
+            row_count: filtered.len(),
             row_stride: 1,
             info_width: 0,
             show_actions: false,
@@ -1801,22 +2178,55 @@ fn actions_string(paused: bool) -> String {
     format!("{toggle} [Parar  ] [Excluir]")
 }
 
-/// Linha de uma opção do menu. A opção selecionada recebe o cursor `> ... <`
-/// e o destaque de cor (renderizado pelo mesmo `menu_index`).
-fn menu_item_line(idx: usize, selected: bool) -> String {
-    if selected {
-        format!(
-            "> [{}] {} <",
-            MENU_SHORTCUTS[idx].to_ascii_uppercase(),
-            MENU_ITEMS[idx]
-        )
-    } else {
-        format!(
-            "  [{}] {}",
-            MENU_SHORTCUTS[idx].to_ascii_uppercase(),
-            MENU_ITEMS[idx]
-        )
+/// Linha de um comando do popup flutuante (US-031): comando à esquerda e
+/// descrição funcional alinhada à direita. O comando selecionado recebe o
+/// marcador `>` (o destaque de fundo é aplicado pelo `write_boxed_lines`).
+fn command_item_line(cmd: &str, desc: &str, selected: bool) -> String {
+    let marker = if selected { "> " } else { "  " };
+    format!("{marker}{cmd:<8} {desc}")
+}
+
+/// Comandos disponíveis filtrados pelo texto digitado após `/` (US-031): a
+/// consulta vazia retorna todos; senão, apenas os comandos que a contêm.
+fn filter_commands(input: &str) -> Vec<(String, String)> {
+    let query = input.trim_start_matches('/');
+    COMMANDS
+        .iter()
+        .filter(|(cmd, _)| query.is_empty() || cmd.contains(query))
+        .map(|(cmd, desc)| (cmd.to_string(), desc.to_string()))
+        .collect()
+}
+
+/// Insere um caractere em `s` na posição do cursor (byte index) e retorna a
+/// nova posição do cursor.
+fn insert_char_at(s: &mut String, pos: usize, c: char) -> usize {
+    let before = &s[..pos];
+    let after = &s[pos..];
+    *s = format!("{before}{c}{after}");
+    pos + c.len_utf8()
+}
+
+/// Apaga o caractere anterior à posição do cursor (byte index) em `s` e
+/// retorna a nova posição do cursor (0 se já estava no início).
+fn backspace_char_at(s: &mut String, pos: usize) -> usize {
+    if pos == 0 {
+        return 0;
     }
+    let before = &s[..pos];
+    if let Some((new_pos, _)) = before.char_indices().next_back() {
+        *s = format!("{}{}", &before[..new_pos], &s[pos..]);
+        new_pos
+    } else {
+        0
+    }
+}
+
+/// Coluna (em caracteres) do cursor do prompt a partir do índice de bytes,
+/// limitada ao número de caracteres visíveis (US-031). Converte bytes → chars
+/// para não desalinhar com texto multi-byte (acentos, emoji, etc.).
+fn prompt_cursor_col(input: &str, cursor_bytes: usize, max_visible: usize) -> usize {
+    let bytes = cursor_bytes.min(input.len());
+    input[..bytes].chars().count().min(max_visible)
 }
 
 /// Barra de progresso em blocos contínuos estilo VCL/GUI (US-020): `█` para o
@@ -1947,8 +2357,8 @@ fn confirm_delete_modal_lines(name: &str, detail: &str) -> Vec<String> {
 /// Rótulo da view atual, exibido no canto direito do Header (US-019).
 fn view_label(view: &View) -> &'static str {
     match view {
-        View::Title => "INÍCIO",
-        View::Menu => "MENU",
+        View::Home => "INÍCIO",
+        View::Menu => "COMANDOS",
         View::Session => "SESSÃO",
         View::Include => "ADICIONAR",
         View::Completed => "COMPLETOS",
@@ -1958,13 +2368,13 @@ fn view_label(view: &View) -> &'static str {
 /// Atalhos da view atual, exibidos no lado esquerdo do Footer (US-019).
 fn footer_hints(view: &View) -> &'static str {
     match view {
-        View::Title => "digite / para abrir o menu",
-        View::Menu => "↑/↓ ou j/k navegar · Enter selecionar · Esc voltar",
+        View::Home => "/ para comandos · Enter executa · ↑/↓ seleciona",
+        View::Menu => "↑/↓ navegar · Enter executa · Tab completa · Esc fecha",
         View::Session => {
             "[P] pausar  [R] retomar  [X] remover  [Del] excluir  [A/+] adicionar  [Esc] voltar"
         }
         View::Include => "Enter confirmar · Esc cancelar",
-        View::Completed => "Esc voltar ao menu",
+        View::Completed => "Esc voltar ao início",
     }
 }
 
@@ -2003,31 +2413,27 @@ async fn add_torrent_background(
     }
 }
 
-/// Dimensões do quadro com borda dupla, limitadas ao terminal e centralizadas.
-/// A área interna corresponde à resolução fixa de 1024x768 (128x48 células).
+/// Dimensões do quadro full-window (US-031, estilo opencode): ocupa todo o
+/// terminal disponível respeitando as margens laterais (2 colunas) e a margem
+/// de 1 linha no topo/base — recalculado a cada frame com o tamanho real.
 fn frame_rect(cols: u16, rows: u16) -> (u16, u16, u16, u16) {
-    // O mínimo é apenas o necessário para as duas bordas: em terminais
-    // minúsculos o quadro encolhe em vez de estourar os limites da tela.
-    let width = FRAME_WIDTH.min(cols.saturating_sub(2)).max(2);
-    let height = FRAME_HEIGHT.min(rows.saturating_sub(2)).max(2);
-    let left = cols.saturating_sub(width) / 2;
-    let top = rows.saturating_sub(height) / 2;
-    (left, top, width, height)
+    let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS).max(2);
+    let height = rows.saturating_sub(2 * LAYOUT_MARGIN_ROWS).max(2);
+    (LAYOUT_MARGIN_COLS, LAYOUT_MARGIN_ROWS, width, height)
 }
 
-/// Dimensões do quadro do Body (US-019): mesma equivalência 1024x768, porém
-/// contido entre o Header (topo) e o Footer (base), com margem lateral de 2
-/// caracteres e centralizado na área disponível.
+/// Dimensões do quadro do Body (US-019): full-window contido entre o Header
+/// (topo) e o Footer (base), com as mesmas margens laterais do layout.
 fn body_frame(cols: u16, body_top: u16, body_height: u16) -> (u16, u16, u16, u16) {
     let (left, rel_top, width, height) = frame_rect(cols, body_height);
     let top = body_top.saturating_add(rel_top);
     (left, top, width, height)
 }
 
-/// Linhas superior e inferior do quadro (bordas duplas).
+/// Linhas superior e inferior do quadro (bordas de linha fina, estilo opencode).
 fn frame_top_bottom(width: u16) -> (String, String) {
-    let inner = "═".repeat(width.saturating_sub(2) as usize);
-    (format!("╔{inner}╗"), format!("╚{inner}╝"))
+    let inner = "─".repeat(width.saturating_sub(2) as usize);
+    (format!("┌{inner}┐"), format!("└{inner}┘"))
 }
 
 /// Linha inicial do conteúdo para centralizá-lo verticalmente no quadro
@@ -2038,14 +2444,14 @@ fn center_content_top(frame_top: u16, frame_height: u16, line_count: usize) -> u
     frame_top + 1 + (spare / 2) as u16
 }
 
-/// Desenha o quadro com bordas duplas no buffer, centralizado, usando a cor
-/// de borda da paleta unificada (US-019).
+/// Desenha o quadro de linha fina no buffer usando a cor de borda da paleta
+/// unificada (US-019/US-031 — bordas finas estilo opencode).
 fn draw_box(frame: &mut Frame, left: u16, top: u16, width: u16, height: u16) {
     let (top_line, bottom_line) = frame_top_bottom(width);
     frame.put_colored(top, left, &top_line, Some(THEME.border));
     for row in top + 1..top + height - 1 {
-        frame.put_colored(row, left, "║", Some(THEME.border));
-        frame.put_colored(row, left + width - 1, "║", Some(THEME.border));
+        frame.put_colored(row, left, "│", Some(THEME.border));
+        frame.put_colored(row, left + width - 1, "│", Some(THEME.border));
     }
     frame.put_colored(top + height - 1, left, &bottom_line, Some(THEME.border));
 }
@@ -2300,33 +2706,40 @@ mod tests {
     }
 
     #[test]
-    fn menu_item_line_marks_selected_only() {
-        assert_eq!(menu_item_line(0, true), "> [A] Adicionar torrent a lista <");
-        assert_eq!(menu_item_line(0, false), "  [A] Adicionar torrent a lista");
-        assert!(menu_item_line(1, true).starts_with('>'));
-        assert!(menu_item_line(2, true).ends_with('<'));
-        assert!(!menu_item_line(3, false).starts_with('>'));
-        assert!(!menu_item_line(3, false).ends_with('<'));
-        // O destaque (índice de linha) aponta para a opção selecionada.
-        assert_eq!(MENU_ITEMS_OFFSET, 3);
-        assert_eq!(MENU_ITEMS.len(), 4);
+    fn command_item_line_marks_selected_only() {
+        let line = command_item_line("/add", "adicionar torrent a lista", true);
+        assert!(line.starts_with("> /add"));
+        assert!(line.contains("adicionar torrent a lista"));
+        let unselected = command_item_line("/list", "acompanhar progresso", false);
+        assert!(unselected.starts_with("  /list"));
+        assert!(!unselected.starts_with('>'));
     }
 
     #[test]
-    fn frame_rect_uses_1024x768_equivalence_when_terminal_is_large() {
+    fn commands_cover_all_shortcuts() {
+        assert_eq!(COMMANDS.len(), 8);
+        for (cmd, desc) in COMMANDS {
+            assert!(cmd.starts_with('/'));
+            assert!(!desc.is_empty());
+        }
+    }
+
+    #[test]
+    fn frame_rect_uses_margins_full_window_when_terminal_is_large() {
+        // Full-window (estilo opencode): ocupa todo o terminal com margens.
         let (left, top, w, h) = frame_rect(200, 60);
-        assert_eq!(w, FRAME_WIDTH);
-        assert_eq!(h, FRAME_HEIGHT);
-        assert_eq!(left, (200 - 128) / 2);
-        assert_eq!(top, (60 - 48) / 2);
+        assert_eq!(w, 200 - 4);
+        assert_eq!(h, 60 - 2);
+        assert_eq!(left, 2);
+        assert_eq!(top, 1);
     }
 
     #[test]
-    fn frame_rect_clamps_and_centers_on_small_terminal() {
+    fn frame_rect_fills_small_terminal_with_margins() {
         let (left, top, w, h) = frame_rect(80, 24);
-        assert_eq!(w, 78);
+        assert_eq!(w, 76);
         assert_eq!(h, 22);
-        assert_eq!(left, 1);
+        assert_eq!(left, 2);
         assert_eq!(top, 1);
     }
 
@@ -2348,14 +2761,14 @@ mod tests {
     }
 
     #[test]
-    fn frame_borders_use_double_lines() {
+    fn frame_borders_use_thin_lines() {
         let (top, bottom) = frame_top_bottom(78);
-        assert_eq!(top.chars().next(), Some('╔'));
-        assert_eq!(top.chars().last(), Some('╗'));
-        assert_eq!(bottom.chars().next(), Some('╚'));
-        assert_eq!(bottom.chars().last(), Some('╝'));
+        assert_eq!(top.chars().next(), Some('┌'));
+        assert_eq!(top.chars().last(), Some('┐'));
+        assert_eq!(bottom.chars().next(), Some('└'));
+        assert_eq!(bottom.chars().last(), Some('┘'));
         assert_eq!(top.chars().count(), 78);
-        assert!(top.chars().all(|c| matches!(c, '╔' | '═' | '╗')));
+        assert!(top.chars().all(|c| matches!(c, '┌' | '─' | '┐')));
     }
 
     #[test]
@@ -2464,13 +2877,13 @@ mod tests {
 
     #[test]
     fn body_frame_keeps_box_inside_body_region() {
-        // Body de 46 linhas entre Header e Footer: o quadro usa a equivalência
-        // 1024x768 limitada ao corpo e centralizada.
+        // Body de 46 linhas entre Header e Footer: o quadro full-window usa as
+        // margens do layout (2 colunas laterais, 1 linha no topo).
         let (left, top, width, height) = body_frame(128, 1, 46);
-        assert_eq!(width, 126); // 128 - 2 (margem lateral de 1 char)
+        assert_eq!(width, 124); // 128 - 4 (margens laterais)
         assert_eq!(height, 44); // 46 - 2 (margens do Body)
-        assert_eq!(left, 1);
-        assert_eq!(top, 2); // centralizado: 1 + (46 - 44) / 2
+        assert_eq!(left, 2);
+        assert_eq!(top, 2); // 1 (body_top) + 1 (margem)
         assert!(top + height <= 1 + 46);
     }
 
@@ -2691,5 +3104,72 @@ mod tests {
         }
         assert_eq!(f.cell(0, 1).ch, ' ');
         assert_eq!(f.cell(4, 1).ch, ' ');
+    }
+
+    // ---- US-031: prompt fixo, painéis e menu flutuante de comandos ----
+
+    #[test]
+    fn filtered_commands_matches_by_query() {
+        // Consulta vazia (após `/`): todos os comandos.
+        assert_eq!(filter_commands("/").len(), COMMANDS.len());
+        // Filtro por prefixo/substring do comando.
+        let filtered = filter_commands("/li");
+        assert!(filtered.iter().any(|(c, _)| c == "/list"));
+        assert!(!filtered.iter().any(|(c, _)| c == "/add"));
+        // Sem correspondência: lista vazia.
+        assert!(filter_commands("/zzz").is_empty());
+        // Texto sem barra também filtra (usado ao digitar no popup).
+        assert_eq!(filter_commands("add").len(), 1);
+    }
+
+    #[test]
+    fn insert_char_at_respects_cursor_position() {
+        let mut s = String::from("abc");
+        let pos = insert_char_at(&mut s, 1, 'X');
+        assert_eq!(s, "aXbc");
+        assert_eq!(pos, 2);
+        // No fim e no início também funcionam.
+        let len = s.len();
+        let new_pos = insert_char_at(&mut s, len, 'Z');
+        assert_eq!(new_pos, len + 1);
+        assert_eq!(s, "aXbcZ");
+    }
+
+    #[test]
+    fn backspace_char_at_removes_char_before_cursor() {
+        let mut s = String::from("abc");
+        let pos = backspace_char_at(&mut s, 3);
+        assert_eq!(s, "ab");
+        assert_eq!(pos, 2);
+        // No início: não apaga nada.
+        assert_eq!(backspace_char_at(&mut s, 0), 0);
+        assert_eq!(s, "ab");
+    }
+
+    #[test]
+    fn prompt_cursor_col_converts_bytes_to_chars() {
+        // "ação" = 3 caracteres, 5 bytes (2 bytes por acento). Cursor no fim
+        // em bytes (6? não — 5) deve resultar em coluna 3.
+        assert_eq!(prompt_cursor_col("ação", 5, 10), 3);
+        // Cursor no meio, após "aç" (3 bytes, 2 chars).
+        assert_eq!(prompt_cursor_col("ação", 3, 10), 2);
+        // Limite de visibilidade é respeitado.
+        assert_eq!(prompt_cursor_col("ação", 5, 2), 2);
+        // Cursor além do fim é clampado.
+        assert_eq!(prompt_cursor_col("abc", 99, 10), 3);
+        // ASCII puro: coluna == bytes.
+        assert_eq!(prompt_cursor_col("abc", 2, 10), 2);
+    }
+
+    #[test]
+    fn execute_command_notice_for_unknown() {
+        // `/help` constrói um notice com todos os comandos (sem session).
+        let help: Vec<String> = COMMANDS
+            .iter()
+            .map(|(cmd, desc)| format!("{cmd} — {desc}"))
+            .collect();
+        let notice = format!("comandos: {}", help.join(" · "));
+        assert!(notice.contains("/add"));
+        assert!(notice.contains("/exit"));
     }
 }
