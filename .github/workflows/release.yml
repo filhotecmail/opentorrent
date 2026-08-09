@@ -210,5 +210,15 @@ jobs:
             Invoke-WebRequest -Uri https://github.com/filhotecmail/opentorrent/releases/latest/download/opentorrent-windows-x86_64.exe -OutFile opentorrent.exe
             .\opentorrent.exe --version
             ```
+
+            Para executar o comando `opentorrent` de qualquer diretório (sem o
+            prefixo `.\`), adicione a pasta do binário ao `PATH`:
+
+            ```powershell
+            New-Item -ItemType Directory -Force -Path "$HOME\bin" | Out-Null
+            Move-Item -Force .\opentorrent.exe "$HOME\bin\opentorrent.exe"
+            $env:Path += ";$HOME\bin"
+            opentorrent --version
+            ```
           files: dist/*
           fail_on_unmatched_files: true
