@@ -41,7 +41,7 @@ dependências externas de runtime.
 | Estado | Valor |
 | --- | --- |
 | Branch principal | `master` |
-| Última release | `v0.1.16` |
+| Última release | `v0.1.18` |
 | Milestone atual | v1.0 |
 | Issues abertas | 0 |
 | Labels do projeto | 18 |
@@ -51,7 +51,7 @@ dependências externas de runtime.
 | Metadado | Valor |
 | --- | --- |
 | Pacote | `opentorrent` |
-| Versão | `0.1.16` |
+| Versão | `0.1.18` |
 | Edição Rust | 2024 |
 <!-- CARGO_END -->
 
@@ -153,6 +153,10 @@ opentorrent --version
 **Para atualizar:** basta repetir o download do comando acima — o endpoint
 `/releases/latest` sempre aponta para a versão mais recente. O próprio
 `opentorrent --version` já informa se há uma release nova disponível.
+
+> **Releases automáticas:** cada push na `master` que incremente a versão do
+> `Cargo.toml` publica automaticamente uma nova release (binário assinado +
+> `.sig`) pelo workflow `Release` — não é preciso criar a release manualmente.
 
 ### Opção 2 — Compilar a partir do código-fonte
 
@@ -314,6 +318,7 @@ O repositório usa **GitHub Actions** em `.github/workflows/`, executado a cada
 | **Qualidade de issues** | `issue-quality.yml` | comenta e sinaliza issues sem label/milestone |
 | **Notificações** | `notify.yml` | emails para `filhotecmail@gmail.com` (commits, issues, PRs, discussões, CI, releases) |
 | **README vivo** | `readme-live.yml` | regenera badges e estado do projeto no README |
+| **Release** | `release.yml` | publica release automática no push de tag `v*` ou push na master com bump de versão (US-030) |
 | **Dependabot** | `dependabot.yml` | atualizações semanais de deps Cargo e Actions |
 
 Benefícios: PRs são bloqueados se qualquer verificação falhar; métricas de
