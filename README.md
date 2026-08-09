@@ -376,6 +376,25 @@ cargo watch -c                 # (opcional) re-executa a cada mudança de arquiv
 > **Dica:** se `cargo` não estiver no `PATH` do seu shell, adicione
 > `export PATH="$HOME/.cargo/bin:$PATH"`.
 
+### Scripts de build, assinatura e PRs
+
+Automatizam o ciclo dev → release:
+
+- **`./build.sh [release|debug] [build|verbose|clean|check|test|clippy|fmt]`** —
+  compila com bump automático de versão patch em `Cargo.toml`. Em `release`, ao
+  final do build, assina digitalmente o binário (US-018).
+- **`./scripts/sign-release.sh [init|sign|verify]`** — assinatura digital do
+  binário release: gera CA local + certificado com
+  `extendedKeyUsage=codeSigning` em `~/.local/share/opentorrent/signing` (fora
+  do git), assina com RSA-SHA256 (assinatura desanexada `<bin>.sig`) e valida a
+  integridade contra a CA raiz.
+- **`./scripts/create-new-us.sh`** — ciclo de vida de uma User Story:
+  - `start US-038 "título" [descrição]` — sincroniza `master`, cria a branch
+    local `feat/us-038-slug` e abre a Issue com **milestone + label**;
+  - `execute-pipeline-gh [mensagem]` — valida (fmt/clippy/test/machete), faz
+    commit, push e abre o **PR** para `master` com "Closes #N" (entra no CI/CD);
+  - `state` — mostra a US em andamento.
+
 ### Perfis de compilação
 
 Configurados em `Cargo.toml` para equilibrar velocidade de dev e binários de
@@ -453,16 +472,17 @@ CODECOV_TOKEN` (o passo de CI não falha sem ele).
 
 ### Fluxo de trabalho com issues (US)
 
-O projeto usa issues rotuladas como **US (User Stories)** numeradas. Para cada
-US:
+O projeto usa issues rotuladas como **US (User Stories)** numeradas. O ciclo é
+automatizado por `./scripts/create-new-us.sh`:
 
-1. Criar branch descritiva: `feat/us-NNN-descricao-curta`;
-2. Criar issue com critérios de aceite e testes;
-3. Implementar seguindo os padrões acima e validar com as ferramentas de
+1. `./scripts/create-new-us.sh start US-038 "título"` — cria a branch local a
+   partir de `master` e abre a Issue com milestone e label;
+2. Implementar seguindo os padrões acima e validar com as ferramentas de
    verificação;
-4. Commit com mensagem descritiva e `Closes #N`;
-5. Push e abrir **Pull Request** com base em `master`;
-6. Merge com squash, mantendo `master` sempre estável.
+3. `./scripts/create-new-us.sh execute-pipeline-gh "mensagem"` — valida, faz
+   commit, push e abre o **Pull Request** com base em `master` (referenciando a
+   issue com "Closes #N");
+4. Merge com squash, mantendo `master` sempre estável.
 
 ### API do librqbit (referência rápida)
 

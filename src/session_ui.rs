@@ -909,18 +909,14 @@ impl Tui {
         match key.code {
             KeyCode::Up => {
                 let len = self.current_context_options().len();
-                if let Some(cm) = &mut self.context_menu
-                    && len > 1
-                {
-                    cm.selected = (cm.selected + len - 1) % len;
+                if let Some(cm) = &mut self.context_menu {
+                    cm.selected = cycle_context_selection(cm.selected, len, -1);
                 }
             }
             KeyCode::Down => {
                 let len = self.current_context_options().len();
-                if let Some(cm) = &mut self.context_menu
-                    && len > 1
-                {
-                    cm.selected = (cm.selected + 1) % len;
+                if let Some(cm) = &mut self.context_menu {
+                    cm.selected = cycle_context_selection(cm.selected, len, 1);
                 }
             }
             KeyCode::Enter => {
@@ -2041,6 +2037,15 @@ fn context_option_at(row: u16, rect: (u16, u16, u16, u16), option_count: usize) 
     (rel < option_count).then_some(rel)
 }
 
+/// Cicla a opção destacada do menu de contexto (US-036) por `delta` (±1),
+/// envolvendo nos limites. Listas com 0 ou 1 opção ficam no índice 0.
+fn cycle_context_selection(selected: usize, len: usize, delta: isize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    (selected as isize + delta).rem_euclid(len as isize) as usize
+}
+
 /// Linha de uma opção do menu de contexto (US-036): marcador `>` na opção
 /// destacada (o fundo é aplicado pelo render com `write_boxed_lines`).
 fn context_item_line(label: &str, selected: bool) -> String {
@@ -2916,5 +2921,356 @@ mod tests {
         let notice = format!("comandos: {}", help.join(" · "));
         assert!(notice.contains("/add"));
         assert!(notice.contains("/exit"));
+    }
+
+    // ---- US-036/US-037: menu de contexto, atalhos e mouse (com Tui real) ----
+
+    /// Cria uma Tui com uma sessão librqbit vazia (offline): sem DHT, sem
+    /// UPnP e com porta efêmera (0..1) — nada de rede é usado nos testes.
+    async fn test_tui_async() -> (Tui, Arc<Session>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "opentorrent-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = librqbit::Session::new_with_opts(
+            dir.clone(),
+            librqbit::SessionOptions {
+                disable_dht: true,
+                disable_dht_persistence: true,
+                enable_upnp_port_forwarding: false,
+                fastresume: false,
+                listen_port_range: Some(0..1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Tui::new(session.clone(), dir.clone(), rx), session, dir)
+    }
+
+    /// Layout padrão dos testes: bloco no topo 2 com 1 linha de offset e 3
+    /// entradas consecutivas (linhas 3..=5).
+    fn test_layout() -> Layout {
+        Layout {
+            top: 2,
+            rows_offset: 1,
+            row_count: 3,
+            row_stride: 1,
+        }
+    }
+
+    fn right_click(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn left_click(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn cycle_context_selection_wraps_around_limits() {
+        assert_eq!(cycle_context_selection(0, 4, 1), 1);
+        assert_eq!(cycle_context_selection(3, 4, 1), 0);
+        assert_eq!(cycle_context_selection(0, 4, -1), 3);
+        assert_eq!(cycle_context_selection(1, 4, -1), 0);
+        // Listas de 0/1 opção ficam no índice 0.
+        assert_eq!(cycle_context_selection(0, 1, 1), 0);
+        assert_eq!(cycle_context_selection(0, 0, 1), 0);
+    }
+
+    #[tokio::test]
+    async fn open_context_menu_anchors_popup_on_clicked_row() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.open_context_menu(3); // primeira entrada (linha 3)
+        let cm = tui.context_menu.expect("popup deve abrir");
+        assert_eq!(cm.entry_index, 0);
+        assert_eq!(cm.anchor_row, 3);
+        assert_eq!(cm.selected, 0);
+        assert_eq!(tui.row_index, 0);
+        assert_eq!(tui.context_rect, None);
+    }
+
+    #[tokio::test]
+    async fn open_context_menu_ignores_clicks_outside_rows() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        // Sem layout definido o clique é ignorado.
+        tui.open_context_menu(3);
+        assert!(tui.context_menu.is_none());
+        // Acima e abaixo do bloco de entradas (linhas 3..=5).
+        tui.layout = Some(test_layout());
+        tui.open_context_menu(2);
+        assert!(tui.context_menu.is_none());
+        tui.open_context_menu(6);
+        assert!(tui.context_menu.is_none());
+        // Fora do bloco não altera um popup já aberto.
+        tui.open_context_menu(3);
+        assert!(tui.context_menu.is_some());
+        tui.open_context_menu(2);
+        assert!(tui.context_menu.is_some());
+    }
+
+    #[tokio::test]
+    async fn close_context_menu_clears_anchor_and_rect() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.open_context_menu(3);
+        tui.context_rect = Some((2, 3, 13, 3));
+        tui.close_context_menu();
+        assert!(tui.context_menu.is_none());
+        assert!(tui.context_rect.is_none());
+    }
+
+    #[tokio::test]
+    async fn mouse_home_moves_selection_to_clicked_row() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.row_index = 0;
+        tui.mouse_home(5); // terceira entrada
+        assert_eq!(tui.row_index, 2);
+        tui.mouse_home(0); // fora do bloco: nada muda
+        assert_eq!(tui.row_index, 2);
+    }
+
+    #[tokio::test]
+    async fn mouse_menu_moves_menu_selection() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.view = View::Menu;
+        tui.layout = Some(Layout {
+            top: 10,
+            rows_offset: 0,
+            row_count: 3,
+            row_stride: 1,
+        });
+        tui.menu_index = 0;
+        tui.mouse_menu(11);
+        assert_eq!(tui.menu_index, 1);
+    }
+
+    #[tokio::test]
+    async fn request_delete_targets_pending_entry() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().push(PendingTorrent {
+            source: "magnet:?xt=urn:btih:abc".into(),
+            status: PendingStatus::Resolving,
+        });
+        tui.request_delete(0); // sessão vazia → entrada 0 é o pendente
+        match tui.confirming_delete {
+            Some(DeleteTarget::Pending { name }) => assert!(name.contains("btih:abc")),
+            _ => panic!("esperava DeleteTarget::Pending"),
+        }
+        assert!(tui.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn request_delete_out_of_bounds_is_noop() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.request_delete(5); // sem pendentes e sem torrents
+        assert!(tui.confirming_delete.is_none());
+    }
+
+    #[tokio::test]
+    async fn confirm_delete_discards_pending_entry() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().push(PendingTorrent {
+            source: "magnet:?xt=urn:btih:xyz".into(),
+            status: PendingStatus::Resolving,
+        });
+        tui.confirming_delete = Some(DeleteTarget::Pending {
+            name: "magnet:?xt=urn:btih:xyz".into(),
+        });
+        tui.confirm_delete().await.unwrap();
+        assert!(tui.pending.lock().unwrap().is_empty());
+        assert!(tui.confirming_delete.is_none());
+        assert!(tui.notice.as_deref().unwrap().contains("excluído"));
+    }
+
+    #[tokio::test]
+    async fn confirm_delete_without_target_is_noop() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.confirm_delete().await.unwrap();
+        assert!(tui.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn context_menu_esc_closes_popup() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.open_context_menu(3);
+        tui.handle_context_menu_key(KeyEvent::from(KeyCode::Esc))
+            .await
+            .unwrap();
+        assert!(tui.context_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn context_menu_enter_requests_delete_for_pending() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().push(PendingTorrent {
+            source: "magnet:?xt=urn:btih:abc".into(),
+            status: PendingStatus::Resolving,
+        });
+        tui.layout = Some(test_layout());
+        tui.open_context_menu(3);
+        // Sessão vazia → única opção é Excluir; Enter a executa.
+        tui.handle_context_menu_key(KeyEvent::from(KeyCode::Enter))
+            .await
+            .unwrap();
+        assert!(tui.context_menu.is_none());
+        assert!(matches!(
+            tui.confirming_delete,
+            Some(DeleteTarget::Pending { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn context_menu_single_option_navigation_is_noop() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.open_context_menu(3); // sessão vazia → só Excluir
+        tui.handle_context_menu_key(KeyEvent::from(KeyCode::Down))
+            .await
+            .unwrap();
+        tui.handle_context_menu_key(KeyEvent::from(KeyCode::Up))
+            .await
+            .unwrap();
+        assert_eq!(tui.context_menu.unwrap().selected, 0);
+    }
+
+    #[tokio::test]
+    async fn render_context_menu_records_clickable_rect() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.open_context_menu(3);
+        let mut frame = Frame::new(80, 30);
+        tui.render_context_menu(&mut frame, 80, 1, 28);
+        // Popup com 1 opção ("  Excluir"): width = 9 + 4 = 13, height = 3,
+        // ancorado na linha clicada (3).
+        let rect = tui.context_rect.expect("rect deve ser gravado");
+        assert_eq!(rect, (2, 3, 13, 3));
+    }
+
+    #[tokio::test]
+    async fn render_context_menu_without_open_popup_is_noop() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.context_rect = Some((2, 3, 13, 3));
+        let mut frame = Frame::new(80, 30);
+        tui.render_context_menu(&mut frame, 80, 1, 28);
+        assert!(tui.context_menu.is_none());
+        assert_eq!(tui.context_rect, Some((2, 3, 13, 3)));
+    }
+
+    #[tokio::test]
+    async fn mouse_ignores_non_click_events() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        let move_event = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        };
+        tui.handle_mouse(move_event).await.unwrap();
+        assert!(tui.context_menu.is_none());
+        assert_eq!(tui.row_index, 0);
+    }
+
+    #[tokio::test]
+    async fn mouse_ignores_clicks_during_delete_confirmation() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.confirming_delete = Some(DeleteTarget::Pending {
+            name: "magnet:?xt=urn:btih:abc".into(),
+        });
+        tui.handle_mouse(right_click(5, 3)).await.unwrap();
+        assert!(tui.context_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn mouse_right_click_opens_context_menu() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.handle_mouse(right_click(5, 3)).await.unwrap();
+        let cm = tui.context_menu.expect("clique direito deve abrir o popup");
+        assert_eq!(cm.entry_index, 0);
+        assert_eq!(tui.row_index, 0);
+    }
+
+    #[tokio::test]
+    async fn mouse_left_click_outside_context_menu_selects_row() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.handle_mouse(left_click(5, 5)).await.unwrap();
+        assert_eq!(tui.row_index, 2);
+        assert!(tui.context_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn mouse_left_click_inside_context_menu_executes_option() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().push(PendingTorrent {
+            source: "magnet:?xt=urn:btih:abc".into(),
+            status: PendingStatus::Resolving,
+        });
+        tui.layout = Some(test_layout());
+        tui.open_context_menu(3);
+        tui.context_rect = Some((2, 4, 20, 3)); // popup: item na linha 5
+        tui.handle_mouse(left_click(3, 5)).await.unwrap();
+        // A opção clicada (Excluir) foi executada e o popup fechado.
+        assert!(tui.context_menu.is_none());
+        assert!(matches!(
+            tui.confirming_delete,
+            Some(DeleteTarget::Pending { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn mouse_left_click_outside_context_menu_closes_it() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.open_context_menu(3);
+        tui.context_rect = Some((2, 4, 20, 3));
+        tui.handle_mouse(left_click(60, 8)).await.unwrap(); // fora do popup
+        assert!(tui.context_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn mouse_left_click_without_rect_closes_context_menu() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.layout = Some(test_layout());
+        tui.open_context_menu(3); // context_rect ainda None
+        tui.handle_mouse(left_click(5, 5)).await.unwrap();
+        assert!(tui.context_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn mouse_right_click_in_menu_view_moves_selection() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.view = View::Menu;
+        tui.layout = Some(Layout {
+            top: 10,
+            rows_offset: 0,
+            row_count: 3,
+            row_stride: 1,
+        });
+        tui.menu_index = 0;
+        tui.handle_mouse(right_click(5, 11)).await.unwrap();
+        assert_eq!(tui.menu_index, 1);
     }
 }
