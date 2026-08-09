@@ -61,6 +61,10 @@ const PROGRESS_COL_W: usize = 31;
 const STATE_W: usize = 13;
 /// Largura fixa da parte não-nome de cada linha da tabela da sessão.
 const ROW_FIXED_W: usize = ROW_PREFIX_W + PROGRESS_COL_W + 1 + STATE_W + 1;
+/// Linhas fixas do bloco da tabela de sessão antes das entradas: título,
+/// linha vazia, cabeçalho e separador. Usado pelo render e pelo mapeamento de
+/// cliques (evita divergência entre `session_row_line` e `Layout.rows_offset`).
+const SESSION_HEADER_LINES: usize = 4;
 
 /// Resolução alvo da área amostrada: 1024x768 pixels. Considerando uma célula
 /// de terminal de ~8x16 px, isso equivale a 128 colunas x 48 linhas.
@@ -1306,7 +1310,7 @@ impl Tui {
             self.layout = Some(Layout {
                 top,
                 left,
-                rows_offset: 4,
+                rows_offset: SESSION_HEADER_LINES as u16,
                 row_count: bars.len(),
                 row_stride: 2,
                 info_width: info_width as u16,
@@ -1653,7 +1657,7 @@ fn progress_color(state: TorrentStatsState, finished: bool) -> Color {
 /// (título, vazio, cabeçalho e separador) e, com o espaçamento vertical
 /// (US-026), cada entrada ocupa 2 linhas: a própria linha + o gap.
 fn session_row_line(entry_idx: usize) -> usize {
-    4 + entry_idx * 2
+    SESSION_HEADER_LINES + entry_idx * 2
 }
 
 /// Mapeia uma linha da tela para o índice da entrada de um bloco listado
