@@ -1599,7 +1599,8 @@ fn progress_bar(pct: f64) -> String {
     let pct = pct.clamp(0.0, 100.0);
     let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
     let filled = filled.min(bar_width);
-    let mut bar = String::with_capacity(PROGRESS_COL_W);
+    // `█`/`░` ocupam 3 bytes cada; a capacidade evita realocação por frame.
+    let mut bar = String::with_capacity(bar_width * 3 + 7);
     bar.push_str(&"█".repeat(filled));
     bar.push_str(&"░".repeat(bar_width - filled));
     bar.push(' ');
