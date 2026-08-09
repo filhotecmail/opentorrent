@@ -460,8 +460,10 @@ impl Tui {
                     self.input = format!("{before}{text}{after}");
                     self.prompt_cursor += text.len();
                     self.notice = None;
+                    // A seleção do popup volta ao topo após o paste (a lista
+                    // filtrada pode ter mudado de tamanho).
+                    self.menu_index = 0;
                     if self.input.starts_with('/') && !matches!(self.view, View::Menu) {
-                        self.menu_index = 0;
                         self.view = View::Menu;
                     }
                 }
@@ -499,6 +501,23 @@ impl Tui {
     /// base; `/` (ou um prompt iniciado com `/`) abre o menu flutuante; Enter
     /// executa o comando digitado; ↑/↓ navegam na Biblioteca.
     async fn handle_home_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // US-027: com a confirmação de exclusão aberta (via /delete), apenas
+        // S/N/Esc agem — mesmo estando na Home (comando do menu flutuante).
+        if self.confirming_delete.is_some() {
+            match key.code {
+                KeyCode::Char('s')
+                | KeyCode::Char('S')
+                | KeyCode::Char('y')
+                | KeyCode::Char('Y') => self.confirm_delete().await?,
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirming_delete = None;
+                    self.notice = Some("exclusão cancelada".into());
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Char('/') => {
                 self.input = "/".into();
@@ -1047,6 +1066,9 @@ impl Tui {
         if let Some(row) = rows.get(self.row_index) {
             self.session.pause(&row.handle).await?;
             self.notice = Some(format!("pausado: {}", row.name));
+        } else {
+            // Linha selecionada é uma origem pendente (ainda sem handle).
+            self.notice = Some("torrent em inicialização — aguarde a resolução".into());
         }
         Ok(())
     }
@@ -1056,6 +1078,8 @@ impl Tui {
         if let Some(row) = rows.get(self.row_index) {
             self.session.clone().unpause(&row.handle).await?;
             self.notice = Some(format!("retomado: {}", row.name));
+        } else {
+            self.notice = Some("torrent em inicialização — aguarde a resolução".into());
         }
         Ok(())
     }
@@ -1231,8 +1255,10 @@ impl Tui {
             View::Completed => self.render_completed(&mut frame, cols, body_top, body_height),
         }
 
-        // US-027: diálogo de confirmação Y/N sobreposto à sessão (AC-4).
-        if matches!(self.view, View::Session) && self.confirming_delete.is_some() {
+        // US-027: diálogo de confirmação Y/N sobreposto (AC-4). Como o /delete
+        // também pode ser acionado a partir da Home (US-031), o modal aparece
+        // sobre qualquer uma das duas telas.
+        if matches!(self.view, View::Session | View::Home) && self.confirming_delete.is_some() {
             self.render_confirm_delete(&mut frame, cols, body_top, body_height);
         }
 
@@ -1280,13 +1306,23 @@ impl Tui {
         // O prompt fixo ocupa a última linha do Body; os painéis ficam acima.
         let prompt_row = body_top.saturating_add(body_height).saturating_sub(1);
         let panels_height = body_height.saturating_sub(1).max(2);
-        // Divisão vertical: Biblioteca (topo, ~55%) e Histórico (~45%).
-        let lib_height = (panels_height * 55 / 100).max(3);
-        let hist_height = panels_height.saturating_sub(lib_height).max(3);
-        let hist_top = body_top.saturating_add(lib_height);
+        // Divisão vertical: Biblioteca (topo, ~55%) e Histórico (~45%). Em
+        // terminais muito baixos os dois painéis somam exatamente o espaço
+        // disponível (sem sobrepor o prompt): o histórico encolhe primeiro e
+        // desaparece abaixo de 6 linhas de painel.
+        let lib_height = (panels_height * 55 / 100)
+            .max(3)
+            .min(panels_height.saturating_sub(3));
+        let hist_height = panels_height.saturating_sub(lib_height);
 
-        self.render_library_panel(frame, cols, body_top, lib_height);
-        self.render_history_panel(frame, cols, hist_top, hist_height);
+        if hist_height >= 3 {
+            let hist_top = body_top.saturating_add(lib_height);
+            self.render_library_panel(frame, cols, body_top, lib_height);
+            self.render_history_panel(frame, cols, hist_top, hist_height);
+        } else {
+            // Espaço só para a Biblioteca: o histórico é omitido.
+            self.render_library_panel(frame, cols, body_top, panels_height);
+        }
         self.render_home_prompt(frame, cols, prompt_row);
     }
 
@@ -1471,8 +1507,11 @@ impl Tui {
             Some(THEME.text),
             Some(THEME.footer_bg),
         );
-        let cursor_col =
-            text_col.saturating_add(self.prompt_cursor.min(shown.chars().count()) as u16);
+        // Cursor: converte o índice de bytes para coluna de caracteres (evita
+        // desalinhamento com acentos/Unicode) e limita ao texto visível.
+        let cursor_chars =
+            prompt_cursor_col(&self.input, self.prompt_cursor, shown.chars().count());
+        let cursor_col = text_col.saturating_add(cursor_chars as u16);
         frame.set_cursor(row, cursor_col);
     }
 
@@ -2180,6 +2219,14 @@ fn backspace_char_at(s: &mut String, pos: usize) -> usize {
     } else {
         0
     }
+}
+
+/// Coluna (em caracteres) do cursor do prompt a partir do índice de bytes,
+/// limitada ao número de caracteres visíveis (US-031). Converte bytes → chars
+/// para não desalinhar com texto multi-byte (acentos, emoji, etc.).
+fn prompt_cursor_col(input: &str, cursor_bytes: usize, max_visible: usize) -> usize {
+    let bytes = cursor_bytes.min(input.len());
+    input[..bytes].chars().count().min(max_visible)
 }
 
 /// Barra de progresso em blocos contínuos estilo VCL/GUI (US-020): `█` para o
@@ -3097,6 +3144,21 @@ mod tests {
         // No início: não apaga nada.
         assert_eq!(backspace_char_at(&mut s, 0), 0);
         assert_eq!(s, "ab");
+    }
+
+    #[test]
+    fn prompt_cursor_col_converts_bytes_to_chars() {
+        // "ação" = 3 caracteres, 5 bytes (2 bytes por acento). Cursor no fim
+        // em bytes (6? não — 5) deve resultar em coluna 3.
+        assert_eq!(prompt_cursor_col("ação", 5, 10), 3);
+        // Cursor no meio, após "aç" (3 bytes, 2 chars).
+        assert_eq!(prompt_cursor_col("ação", 3, 10), 2);
+        // Limite de visibilidade é respeitado.
+        assert_eq!(prompt_cursor_col("ação", 5, 2), 2);
+        // Cursor além do fim é clampado.
+        assert_eq!(prompt_cursor_col("abc", 99, 10), 3);
+        // ASCII puro: coluna == bytes.
+        assert_eq!(prompt_cursor_col("abc", 2, 10), 2);
     }
 
     #[test]
