@@ -1344,9 +1344,12 @@ impl Tui {
                 };
                 let bar = progress_bar(pct);
                 let color = progress_color(row.state, row.finished);
+                // O ID exibido é a posição contígua na tabela (AC-5: re-indexa
+                // imediatamente após remoções); o id real do librqbit continua
+                // sendo usado internamente nas operações de pausar/excluir.
                 lines.push(session_table_line(
                     marker,
-                    row.id,
+                    idx,
                     &bar,
                     state,
                     &row.name,
@@ -1379,7 +1382,7 @@ impl Tui {
                 };
                 let mut line = session_table_line(
                     marker,
-                    0,
+                    idx,
                     &bar,
                     state,
                     &pt.source,
