@@ -3,7 +3,7 @@
 <!-- BADGES_START -->
 [![CI](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
 [![Cobertura](https://codecov.io/gh/filhotecmail/opentorrent/branch/master/graph/badge.svg)](https://codecov.io/gh/filhotecmail/opentorrent)
-[![Release](https://img.shields.io/badge/release-—-blue)](https://github.com/filhotecmail/opentorrent/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.19-blue)](https://github.com/filhotecmail/opentorrent/releases)
 [![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
 <!-- BADGES_END -->
 
@@ -41,7 +41,7 @@ dependências externas de runtime.
 | Estado | Valor |
 | --- | --- |
 | Branch principal | `master` |
-| Última release | `v0.1.18` |
+| Última release | `v0.1.19` |
 | Milestone atual | v1.0 |
 | Issues abertas | 0 |
 | Labels do projeto | 18 |
@@ -51,7 +51,7 @@ dependências externas de runtime.
 | Metadado | Valor |
 | --- | --- |
 | Pacote | `opentorrent` |
-| Versão | `0.1.18` |
+| Versão | `0.1.19` |
 | Edição Rust | 2024 |
 <!-- CARGO_END -->
 
@@ -71,8 +71,8 @@ opentorrent/
 ├── scripts/
 │   ├── sign-release.sh     # Assinatura digital do binário (CA local, RSA-SHA256) — US-018
 │   ├── update-readme.sh    # Gerador do README vivo (estado do projeto)
-│   └── us-pipeline.sh      # Automação de execução de user stories
-├── specs/                  # Especificações das user stories (US-001 a US-030)
+│   └── us-pipeline.sh      # Automação do pipeline de US (start/finish/state) — US-017
+├── specs/                  # Especificações das user stories (specs/001 a specs/018)
 ├── .github/
 │   └── workflows/          # CI, Release (US-030), README vivo, auto-merge, notificações
 ├── .cargo/config.toml      # Linker mold (linkagem rápida em dev)
@@ -152,11 +152,21 @@ opentorrent --version
 
 **Para atualizar:** basta repetir o download do comando acima — o endpoint
 `/releases/latest` sempre aponta para a versão mais recente. O próprio
-`opentorrent --version` já informa se há uma release nova disponível.
+`opentorrent --version` já consulta o GitHub e informa se há uma release nova
+disponível, com o comando de atualização sugerido (US-029).
 
 > **Releases automáticas:** cada push na `master` que incremente a versão do
 > `Cargo.toml` publica automaticamente uma nova release (binário assinado +
 > `.sig`) pelo workflow `Release` — não é preciso criar a release manualmente.
+
+> **Verificação da assinatura (US-018):** cada release publica o binário com
+> seu arquivo `.sig` (RSA-SHA256, CA local). Para conferir a integridade do
+> binário baixado:
+>
+> ```bash
+> curl -LO https://github.com/filhotecmail/opentorrent/releases/latest/download/opentorrent-linux-x86_64.sig
+> openssl dgst -sha256 -verify ~/.local/share/opentorrent/signing/code-signing.pub -signature opentorrent-linux-x86_64.sig opentorrent-linux-x86_64
+> ```
 
 ### Opção 2 — Compilar a partir do código-fonte
 
@@ -175,6 +185,26 @@ cargo build --release
 ```
 
 O binário estará em `target/release/opentorrent`.
+
+## Quickstart
+
+Em 4 comandos:
+
+```bash
+# 1. Instala a última release (Linux x86_64)
+curl -L -o opentorrent https://github.com/filhotecmail/opentorrent/releases/latest/download/opentorrent-linux-x86_64
+chmod +x opentorrent
+sudo mv opentorrent /usr/local/bin/
+
+# 2. Confere a versão instalada (e se há atualização disponível)
+opentorrent --version
+
+# 3. Baixa um torrent/magnet link (diretório padrão ~/downloads/torrent-downloads/)
+opentorrent add "magnet:?xt=urn:btih:..."
+
+# 4. Acompanha a sessão interativa (menu, fila e barra de progresso com mouse)
+opentorrent
+```
 
 ## Uso
 
@@ -228,20 +258,31 @@ opentorrent add ./arquivo.torrent -o videos
 # - arquivos parciais   → "partial files found, resuming download"
 ```
 
-### Interação por mouse
+### Interface interativa (TUI)
 
-Quando executado em um terminal interativo (TTY), cada barra de progresso exibe
-botões clicáveis à direita:
+Ao executar `opentorrent` sem argumentos, a TUI abre com **Header** (título +
+versão), **Body** (menu/área de conteúdo) e **Footer** (atalhos) — estrutura
+padronizada com tema escuro e destaque de seleção com cor de fundo (US-019).
+A sessão exibe uma tabela com colunas `ID`, `PROGRESSO`, `STATUS`, `NOME` e
+`AÇÕES`, com barra de progresso em blocos contínuos coloridos por estado
+(US-020) e separadores sutis entre os registros (US-028).
+
+Em um terminal interativo (TTY), cada linha exibe botões clicáveis à direita:
 
 ```text
-[0] debian.iso [======>-----------] [Pausar ] [Parar  ] [Excluir]
+>  [0] ██████████░░░░░░░░░░ 45.2% baixando  debian.iso  [Pausar ] [Parar  ] [Excluir]
 ```
 
-| Botão | Ação |
+| Botão / Tecla | Ação |
 | --- | --- |
 | `[Pausar ]` / `[Retomar]` | Alterna entre pausar e retomar o torrent |
 | `[Parar  ]` | Para o torrent, mantendo os arquivos em disco |
-| `[Excluir]` | Para o torrent e exclui os arquivos baixados |
+| `[Excluir]` | Para o torrent e exclui os arquivos baixados (com confirmação) |
+| `Delete` | Exclui o torrent selecionado (com confirmação Y/N) e apaga os arquivos do disco (US-027) |
+
+A barra de progresso usa blocos sólidos (`█`) para o percentual concluído e
+neutros (`░`) para o restante, com cor por estado: **verde** em andamento/
+concluído, **azul/amarelo** pausado e **vermelho** em erro (US-020).
 
 ## Desenvolvimento
 
@@ -388,6 +429,30 @@ US:
   resolução em background e status de erro sem bloquear a interface.
 - **US-015** — Telas delimitadas por quadro de bordas duplas com área limitada
   na equivalência de 1024x768 (128×48 células) e quebra de linha interna.
+- **US-016** — Renderização estável com double buffering/diff-rendering e
+  redraw sob demanda (sem cintilação).
+- **US-017** — Pipeline de automação de User Stories (`scripts/us-pipeline.sh`:
+  `start` → branch + issue; `finish` → commit, push e PR vinculado).
+- **US-018** — Assinatura digital do binário de release (`scripts/sign-release.sh`,
+  RSA-SHA256 com CA local) e verificação de integridade na esteira.
+- **US-019** — Redesign arquitetural da TUI: Header/Body/Footer fixos, tabela
+  estruturada e paleta de tema escuro profissional com highlight de fundo.
+- **US-020** — Barra de progresso visual em blocos contínuos (`█`/`░`) com cor
+  por estado e percentual centralizado.
+- **US-021** — Injeção de metadados do projeto (nome, repositório e objetivo) na
+  seção `.note.opentorrent` do ELF (`strings`/`readelf`).
+- **US-026** — Espaçamento vertical/separadores na tabela para isolamento
+  visual das barras de progresso.
+- **US-027** — Ações completas (`[Pausar] [Parar] [Excluir]`) para torrents em
+  inicialização e exclusão com tecla `Delete` + confirmação Y/N e remoção dos
+  arquivos do disco.
+- **US-028** — Divisores sutis em linha fina (`─`) entre os registros da tabela
+  com densidade compacta.
+- **US-029** — `--version`/`-V` consulta o GitHub (timeout 3s) e avisa se há
+  versão mais recente, sugerindo o comando de atualização.
+- **US-030** — Pipeline de CI/CD de release no GitHub Actions: publica o binário
+  assinado automaticamente no push de tag `v*` ou push na master com bump de
+  versão (instalação via `/releases/latest`).
 
 ## Licença
 
