@@ -1002,8 +1002,16 @@ impl Tui {
                 self.notice = Some(format!("excluído: {name} (arquivos removidos)"));
             }
             DeleteTarget::Pending { name } => {
-                self.pending.lock().unwrap().retain(|p| p.source != name);
-                self.notice = Some(format!("excluído: {name} (pendente descartado)"));
+                let mut guard = self.pending.lock().unwrap();
+                let before = guard.len();
+                guard.retain(|p| p.source != name);
+                if guard.len() == before {
+                    // Já foi resolvido (virou torrent real) entre o pedido e a
+                    // confirmação — não há pendente a descartar.
+                    self.notice = Some(format!("{name} já não está pendente"));
+                } else {
+                    self.notice = Some(format!("excluído: {name} (pendente descartado)"));
+                }
             }
         }
         self.clamp_row_index();
@@ -1461,7 +1469,13 @@ impl Tui {
             Some(THEME.overlay_bg),
         );
 
-        let lines = confirm_delete_modal_lines(target.name());
+        // O prompt varia conforme o alvo: torrent com arquivos ou pendente.
+        let detail = if matches!(target, DeleteTarget::Torrent { .. }) {
+            "o torrent e seus arquivos serão removidos"
+        } else {
+            "a origem pendente será descartada"
+        };
+        let lines = confirm_delete_modal_lines(target.name(), detail);
         let width = lines
             .iter()
             .map(|l| l.chars().count() as u16)
@@ -1470,7 +1484,9 @@ impl Tui {
             .saturating_add(4)
             .min(cols.saturating_sub(2))
             .max(8);
-        let height = (lines.len() as u16).saturating_add(2);
+        // +3 (não +2): `write_boxed_lines` limita a `height - 3` linhas, então
+        // a linha final (o prompt) precisa caber dentro desse limite.
+        let height = (lines.len() as u16).saturating_add(3);
         let left = cols.saturating_sub(width) / 2;
         let top = body_top.saturating_add(body_height.saturating_sub(height) / 2);
 
@@ -1887,14 +1903,15 @@ fn session_table_line(
 }
 
 /// Linhas do diálogo de confirmação de exclusão (US-027). O nome é truncado
-/// para não alargar o modal em terminais estreitos.
-fn confirm_delete_modal_lines(name: &str) -> Vec<String> {
+/// para não alargar o modal em terminais estreitos; `detail` descreve a ação
+/// conforme o tipo de alvo (torrent com arquivos ou pendente sem handle).
+fn confirm_delete_modal_lines(name: &str, detail: &str) -> Vec<String> {
     vec![
         "excluir definitivamente?".to_string(),
         String::new(),
         Tui::truncate(name, 56),
         String::new(),
-        "o torrent e seus arquivos serão removidos — [S]im [N]ão".to_string(),
+        format!("{detail} — [S]im [N]ão"),
     ]
 }
 
@@ -2549,19 +2566,30 @@ mod tests {
 
     #[test]
     fn confirm_delete_modal_asks_yes_no() {
-        let lines = confirm_delete_modal_lines("arquivo.iso");
+        let lines = confirm_delete_modal_lines("arquivo.iso", "o torrent será removido");
         assert!(lines[0].contains("excluir definitivamente"));
         assert_eq!(lines[2], "arquivo.iso");
         assert!(lines[4].contains("[S]im"));
         assert!(lines[4].contains("[N]ão"));
+        assert!(lines[4].contains("o torrent será removido"));
     }
 
     #[test]
     fn confirm_delete_modal_truncates_long_names() {
         let long = "m".repeat(200);
-        let lines = confirm_delete_modal_lines(&long);
+        let lines = confirm_delete_modal_lines(&long, "x");
         assert_eq!(lines[2].chars().count(), 56);
         assert!(lines[2].ends_with('…'));
+    }
+
+    #[test]
+    fn confirm_modal_prompt_fits_within_write_boxed_limit() {
+        // `write_boxed_lines` escreve no máximo `height - 3` linhas; o modal
+        // tem 5 linhas, então a altura precisa ser >= 8 para o prompt final
+        // (índice 4) não ser cortado.
+        let lines = confirm_delete_modal_lines("x", "d");
+        let height = (lines.len() as u16).saturating_add(3);
+        assert!(height as usize - 3 >= lines.len());
     }
 
     #[test]
