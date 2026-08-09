@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::Parser;
 use crossterm::{
     event::{
@@ -18,9 +18,9 @@ use crossterm::{
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use librqbit::{
-    api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, AddTorrentResponse, ByteBufOwned,
-    ListOnlyResponse, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
-    TorrentMetaV1Info, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ByteBufOwned, ListOnlyResponse,
+    ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig, TorrentMetaV1Info,
+    TorrentStatsState, api::TorrentIdOrHash,
 };
 use size_format::SizeFormatterBinary as SF;
 use tokio::sync::mpsc;
@@ -87,10 +87,8 @@ pub(crate) fn existing_state(
         if file.attrs().padding {
             continue;
         }
-        if let Some(files) = only_files {
-            if !files.contains(&idx) {
-                continue;
-            }
+        if only_files.is_some_and(|files| !files.contains(&idx)) {
+            continue;
         }
         let path = output_folder.join(file.filename.to_pathbuf()?);
         match std::fs::metadata(&path) {

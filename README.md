@@ -41,7 +41,7 @@ dependências externas de runtime.
 | Estado | Valor |
 | --- | --- |
 | Branch principal | `master` |
-| Última release | `—` |
+| Última release | `v0.1.16` |
 | Milestone atual | v1.0 |
 | Issues abertas | 0 |
 | Labels do projeto | 18 |
@@ -51,20 +51,33 @@ dependências externas de runtime.
 | Metadado | Valor |
 | --- | --- |
 | Pacote | `opentorrent` |
-| Versão | `0.1.0` |
-| Edição Rust | 2021 |
+| Versão | `0.1.16` |
+| Edição Rust | 2024 |
 <!-- CARGO_END -->
 
 ## Estrutura do projeto
 
 ```text
 opentorrent/
-├── Cargo.toml      # Manifesto do projeto: nome, versão, dependências e perfis
-├── Cargo.lock      # Versões exatas das dependências travadas (binário → commitado)
+├── Cargo.toml              # Manifesto: nome, versão, edição (2024), dependências e perfis
+├── Cargo.lock              # Versões exatas das dependências travadas (commitado)
+├── build.rs                # Gera a nota .note.opentorrent com metadados do projeto (US-021)
+├── build.sh                # Helper de build: bump de versão, build verbose e assinatura
 ├── src/
-│   └── main.rs     # CLI (clap) + sessão de download (librqbit) + UI (indicatif/crossterm)
-├── .gitignore      # Arquivos/pastas que não entram no repositório
-└── README.md       # Este arquivo
+│   ├── main.rs             # CLI (clap), sessão de download (librqbit) e checagem de versão (US-029)
+│   ├── session_ui.rs       # TUI interativa: Header/Body/Footer, tabela, modal, mouse
+│   ├── downloads.rs        # Lógica de download e estado de arquivos no disco
+│   └── metadata.rs         # Metadados embutidos na seção .note.opentorrent do ELF
+├── scripts/
+│   ├── sign-release.sh     # Assinatura digital do binário (CA local, RSA-SHA256) — US-018
+│   ├── update-readme.sh    # Gerador do README vivo (estado do projeto)
+│   └── us-pipeline.sh      # Automação de execução de user stories
+├── specs/                  # Especificações das user stories (US-001 a US-030)
+├── .github/
+│   └── workflows/          # CI, Release (US-030), README vivo, auto-merge, notificações
+├── .cargo/config.toml      # Linker mold (linkagem rápida em dev)
+├── .gitignore              # Arquivos/pastas que não entram no repositório
+└── README.md               # Este arquivo
 ```
 
 > **Nota:** arquivos de governança/automação local como `AGENTS.md` e `.specify/`
@@ -84,8 +97,12 @@ Todas as dependências são resolvidas automaticamente pelo Cargo no build.
 | `anyhow` | 1.x | Tratamento contextual de erros |
 | `futures` | 0.3 | Utilitários de futuro assíncrono (ex: `join_all` para múltiplos downloads) |
 | `indicatif` | 0.18 | Barras de progresso e MultiProgress na UI |
-| `crossterm` | 0.28 | Captura de eventos de mouse e controle do terminal |
+| `crossterm` | 0.29 | Captura de eventos de mouse e controle do terminal |
 | `size_format` | 1.x | Formatação de tamanhos de bytes (ex: 1.24 GiB) |
+| `reqwest` | 0.12 | Cliente HTTP para a checagem de versão/atualizações (US-029) |
+| `semver` | 1.x | Comparação SemVer de versões (US-029) |
+| `serde_json` | 1.x | Leitura do `tag_name` da API de releases (US-029) |
+| `chrono` | 0.4 | Datas/horários nos registros e na sessão |
 | `tracing` | 0.1 | Log estruturado (macros `info!`, `error!`, `warn!`) |
 | `tracing-subscriber` | 0.3 | Configuração dos logs no console (filtro por nível/`RUST_LOG`) |
 
@@ -107,11 +124,12 @@ Necessárias apenas para **compilar** (gerar o binário):
 ### Opção 1 — Instalar a partir do Release (recomendado)
 
 Cada release do GitHub publica o binário compilado para **Linux x86_64**. Para
-instalar, basta baixar o binário e colocá-lo no `PATH`:
+instalar, basta baixar o binário da última release (sem hardcode de versão) e
+colocá-lo no `PATH`:
 
 ```bash
-# Baixa o binário da última release (troque v0.1.5 pela versão desejada)
-curl -L -o opentorrent https://github.com/filhotecmail/opentorrent/releases/download/v0.1.5/opentorrent-v0.1.5-linux-x86_64
+# Baixa o binário da última release automaticamente
+curl -L -o opentorrent https://github.com/filhotecmail/opentorrent/releases/latest/download/opentorrent-linux-x86_64
 
 # Torna o binário executável
 chmod +x opentorrent
@@ -119,7 +137,7 @@ chmod +x opentorrent
 # Instala no PATH do sistema (todos os usuários)
 sudo mv opentorrent /usr/local/bin/
 
-# Verifica a instalação
+# Verifica a instalação (informa também se há versão mais recente)
 opentorrent --version
 ```
 
@@ -132,9 +150,9 @@ opentorrent --version
 > export PATH="$HOME/.local/bin:$PATH"
 > ```
 
-**Para atualizar:** basta repetir o download com a versão mais recente —
-consulte a página de [Releases](https://github.com/filhotecmail/opentorrent/releases)
-para ver as versões disponíveis.
+**Para atualizar:** basta repetir o download do comando acima — o endpoint
+`/releases/latest` sempre aponta para a versão mais recente. O próprio
+`opentorrent --version` já informa se há uma release nova disponível.
 
 ### Opção 2 — Compilar a partir do código-fonte
 
