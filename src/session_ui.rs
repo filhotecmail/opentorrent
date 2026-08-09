@@ -1049,28 +1049,26 @@ impl Tui {
     fn render_header(&self, frame: &mut Frame, cols: u16) {
         let version = env!("CARGO_PKG_VERSION");
         let title = format!(" OpenTorrent v{version} ");
-        frame.put_styled(0, 0, &title, Some(THEME.text), Some(THEME.header_bg));
-
+        let title_len = title.chars().count() as u16;
         let label = view_label(&self.view);
         let label_text = format!(" {label} ");
-        let label_col = cols.saturating_sub(label_text.chars().count() as u16);
-        frame.put_styled(
-            0,
-            label_col,
-            &label_text,
-            Some(THEME.accent),
-            Some(THEME.header_bg),
-        );
+        let label_len = label_text.chars().count() as u16;
 
-        // Preenche o restante do header com o fundo do tema (padding padrão).
-        frame.fill(
-            0,
-            title.chars().count() as u16,
-            cols.saturating_sub(title.chars().count() as u16),
-            ' ',
-            None,
-            Some(THEME.header_bg),
-        );
+        // Preenche todo o header com o fundo do tema primeiro; o título e o
+        // rótulo da view são desenhados por cima (sem serem sobrescritos).
+        frame.fill(0, 0, cols, ' ', None, Some(THEME.header_bg));
+        frame.put_styled(0, 0, &title, Some(THEME.text), Some(THEME.header_bg));
+
+        let label_col = cols.saturating_sub(label_len);
+        if label_col > title_len {
+            frame.put_styled(
+                0,
+                label_col,
+                &label_text,
+                Some(THEME.accent),
+                Some(THEME.header_bg),
+            );
+        }
     }
 
     /// Footer fixo (US-019): atalhos da view à esquerda e notice/status à
@@ -1565,8 +1563,11 @@ fn menu_item_line(idx: usize, selected: bool) -> String {
 /// ID/PROGRESSO/STATUS/NOME, com a coluna AÇÕES apenas quando há espaço para
 /// renderizar os botões à direita.
 fn session_table_header(name_width: usize, show_actions: bool) -> String {
+    // Colunas numéricas com rótulos alinhados à direita (sobre os dígitos);
+    // colunas de texto alinhadas à esquerda — alinhamento perfeito com os
+    // valores das linhas de dados.
     let mut line = format!(
-        "  {:<4} {:<9} {:<13} {:<name_width$}",
+        "  {:>4} {:>9} {:<13} {:<name_width$}",
         "ID", "PROGRESSO", "STATUS", "NOME"
     );
     if show_actions {
@@ -2187,7 +2188,8 @@ mod tests {
             Some("[Pausar ] [Parar  ] [Excluir]"),
         );
         assert_eq!(header.chars().count(), data.chars().count());
-        assert!(header.starts_with("  ID"));
+        assert!(header.contains("ID"));
+        assert!(header.contains("PROGRESSO"));
         assert!(header.contains("AÇÕES"));
     }
 
