@@ -63,7 +63,9 @@ jobs:
             gh pr edit "$PR_NUM" --title "$TITLE" --body "$BODY"
             gh pr ready "$PR_NUM" 2>/dev/null || true
           else
-            PR_NUM="$(gh pr create --base master --head "$BRANCH" --title "$TITLE" --body "$BODY" --json number --jq .number)"
+            # gh pr create imprime a URL do PR no stdout; o número é o último segmento.
+            PR_URL="$(gh pr create --base master --head "$BRANCH" --title "$TITLE" --body "$BODY")"
+            PR_NUM="$(basename "$PR_URL")"
           fi
           # Habilita o auto-merge (squash): o PR é mergeado assim que o CI passar.
           gh pr merge "$PR_NUM" --auto --squash || echo "aviso: auto-merge nao habilitado (PR #$PR_NUM aberto para merge manual)"
