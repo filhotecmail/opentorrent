@@ -69,8 +69,11 @@ jobs:
 
       # Push de tag ou dispatch manual: publica sempre (intenção explícita).
       # Push na master: pula se a release já existir (ex.: push sem bump).
+      # GH_TOKEN é necessário para o `gh` CLI autenticar no runner.
       - name: Verificar se a release já existe
         id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
           if [[ "${{ github.ref_type }}" == "tag" ]] || [[ -n "${{ inputs.tag }}" ]]; then
