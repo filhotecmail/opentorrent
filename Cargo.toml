@@ -1,7 +1,7 @@
 [package]
 name = "opentorrent"
 version = "0.1.16"
-edition = "2021"
+edition = "2024"
 description = "Terminal CLI to download torrents and magnet links"
 license = "MIT"
 repository = "https://github.com/filhotecmail/opentorrent"

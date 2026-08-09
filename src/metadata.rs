@@ -16,7 +16,8 @@ mod generated {
 /// seção `.note.opentorrent`. `#[used]` impede que o linker a remova (dead
 /// stripping) mesmo com LTO/`strip` do perfil release.
 #[used]
-#[link_section = ".note.opentorrent"]
+// Edição 2024: atributos de link são unsafe e exigem o wrapper `unsafe(...)`.
+#[unsafe(link_section = ".note.opentorrent")]
 static OPENTORRENT_NOTE: [u8; generated::OPENTORRENT_NOTE_LEN] =
     *include_bytes!(concat!(env!("OUT_DIR"), "/opentorrent-note.bin"));
 
