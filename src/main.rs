@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 mod downloads;
+mod metadata;
 mod session_ui;
 
 const MSG_WIDTH: u16 = 40;
