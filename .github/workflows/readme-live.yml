@@ -14,7 +14,7 @@ on:
 
 permissions:
   contents: write
-  pull_requests: write
+  pull-requests: write
 
 concurrency:
   group: readme-live
