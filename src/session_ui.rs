@@ -400,6 +400,9 @@ struct Tui {
     input_cursor_pos: usize,
     /// Cursor position within the home prompt `input` (byte index).
     prompt_cursor: usize,
+    /// Modo "insira o link:" do prompt da Home (US-034): ativo após `/add`
+    /// sem origem; o texto digitado é a origem a adicionar.
+    prompt_add_mode: bool,
     /// Whether the include dialog is in "typing" mode (entering the source).
     typing: bool,
     /// Transient status/error message.
@@ -436,6 +439,7 @@ impl Tui {
             include_input: String::new(),
             input_cursor_pos: 0,
             prompt_cursor: 0,
+            prompt_add_mode: false,
             typing: false,
             notice: None,
             confirming_delete: None,
@@ -474,8 +478,13 @@ impl Tui {
                     // A seleção do popup volta ao topo após o paste (a lista
                     // filtrada pode ter mudado de tamanho).
                     self.menu_index = 0;
-                    if self.input.starts_with('/') && !matches!(self.view, View::Menu) {
+                    if should_open_command_menu(&self.input)
+                        && !matches!(self.view, View::Menu)
+                        && !self.prompt_add_mode
+                    {
                         self.view = View::Menu;
+                    } else {
+                        self.leave_menu_for_inline_add();
                     }
                 }
                 (true, true)
@@ -510,7 +519,8 @@ impl Tui {
 
     /// Teclas da Home (US-031): qualquer caractere vai para o prompt fixo da
     /// base; `/` (ou um prompt iniciado com `/`) abre o menu flutuante; Enter
-    /// executa o comando digitado; ↑/↓ navegam na Biblioteca.
+    /// executa o comando digitado; ↑/↓ navegam na Biblioteca. No modo
+    /// "insira o link:" (US-034), delega para `handle_add_prompt_key`.
     async fn handle_home_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         // US-027: com a confirmação de exclusão aberta (via /delete), apenas
         // S/N/Esc agem — mesmo estando na Home (comando do menu flutuante).
@@ -529,6 +539,12 @@ impl Tui {
             return Ok(());
         }
 
+        // US-034: no modo "insira o link:", as teclas editam a origem no
+        // próprio prompt da Home (sem abrir o menu de comandos).
+        if self.prompt_add_mode {
+            return self.handle_add_prompt_key(key).await;
+        }
+
         match key.code {
             KeyCode::Char('/') => {
                 self.input = "/".into();
@@ -539,8 +555,10 @@ impl Tui {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_prompt_char(c);
                 self.notice = None;
-                // Filtragem dinâmica: qualquer texto iniciado com `/` abre o popup.
-                if self.input.starts_with('/') {
+                // Filtragem dinâmica: qualquer texto iniciado com `/` abre o
+                // popup — exceto o prefixo inline "/add " (US-034), cujo
+                // conteúdo após o espaço é a origem digitada no próprio prompt.
+                if should_open_command_menu(&self.input) {
                     self.menu_index = 0;
                     self.view = View::Menu;
                 }
@@ -549,17 +567,65 @@ impl Tui {
                 let cmd = self.input.trim().to_string();
                 self.input.clear();
                 self.prompt_cursor = 0;
-                if cmd.starts_with('/') {
+                if let Some(source) = parse_add_command(&cmd) {
+                    // `/add <origem>` inline (US-034): adiciona direto.
+                    // Em caso de erro, o comando é restaurado no prompt para
+                    // correção.
+                    if !self.submit_add_from_prompt(&source) {
+                        self.input = cmd;
+                        self.prompt_cursor = self.input.len();
+                    }
+                } else if cmd == "/add" {
+                    // `/add` sem origem: entra no modo "insira o link:".
+                    self.prompt_add_mode = true;
+                    self.notice = None;
+                } else if cmd.starts_with('/') {
                     self.execute_command(&cmd).await?;
                 }
             }
-            KeyCode::Backspace => self.backspace_prompt(),
+            KeyCode::Backspace => {
+                self.backspace_prompt();
+                // US-034: ao apagar o espaço de "/add ", a origem inline deixa
+                // de existir e o prompt volta a buscar comando no popup.
+                if should_open_command_menu(&self.input) {
+                    self.menu_index = 0;
+                    self.view = View::Menu;
+                }
+            }
             KeyCode::Esc => {
                 self.input.clear();
                 self.prompt_cursor = 0;
             }
             KeyCode::Up => self.move_row(-1),
             KeyCode::Down => self.move_row(1),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.running = false;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Teclas do modo "insira o link:" do prompt da Home (US-034): Enter
+    /// submete a origem digitada/colada, Esc cancela e volta ao prompt normal,
+    /// e caracteres/backspace editam o texto da origem no próprio prompt.
+    async fn handle_add_prompt_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        match key.code {
+            KeyCode::Enter => {
+                let source = self.input.clone();
+                self.submit_add_from_prompt(&source);
+            }
+            KeyCode::Esc => {
+                self.prompt_add_mode = false;
+                self.input.clear();
+                self.prompt_cursor = 0;
+                self.notice = None;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_prompt_char(c);
+                self.notice = None;
+            }
+            KeyCode::Backspace => self.backspace_prompt(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.running = false;
             }
@@ -613,6 +679,9 @@ impl Tui {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_prompt_char(c);
                 self.menu_index = 0;
+                // US-034: ao digitar o espaço após "/add", o popup sai da
+                // frente para a origem inline ser digitada no prompt da Home.
+                self.leave_menu_for_inline_add();
             }
             KeyCode::Backspace => {
                 self.backspace_prompt();
@@ -642,15 +711,27 @@ impl Tui {
         filter_commands(&self.input)
     }
 
+    /// US-034: quando o popup de comandos está aberto e o prompt assume o
+    /// prefixo inline `/add ` (origem digitada/colada após o espaço), o popup
+    /// é fechado para o usuário continuar digitando a origem no prompt da Home.
+    fn leave_menu_for_inline_add(&mut self) {
+        if self.input.starts_with("/add ") && matches!(self.view, View::Menu) {
+            self.view = View::Home;
+        }
+    }
+
     /// Executa um comando digitado/selecionado (US-031): mapeia cada comando
     /// do menu flutuante para a ação correspondente na interface.
     async fn execute_command(&mut self, cmd: &str) -> anyhow::Result<()> {
         match cmd {
             "/add" => {
-                self.include_index = 0;
-                self.include_input.clear();
-                self.typing = false;
-                self.view = View::Include;
+                // US-034: `/add` ativa o modo "insira o link:" no próprio
+                // prompt da Home — sem abrir a view Include.
+                self.prompt_add_mode = true;
+                self.input.clear();
+                self.prompt_cursor = 0;
+                self.view = View::Home;
+                self.notice = None;
             }
             "/list" => {
                 self.row_index = 0;
@@ -1214,13 +1295,44 @@ impl Tui {
 
         self.include_input.clear();
         self.input_cursor_pos = 0;
+        self.view = View::Session;
+        self.start_add_background(source);
+    }
 
-        // Registra a requisição e exibe a linha imediatamente (AC-2/AC-3).
+    /// Submete uma origem digitada/colada no prompt da Home (US-034): valida a
+    /// sintaxe e, se válida, registra a requisição e dispara a adição em
+    /// segundo plano — permanecendo na Home. Em erro/vazio o texto digitado é
+    /// preservado para correção. Retorna `false` quando a origem não foi
+    /// submetida (vazia ou inválida).
+    fn submit_add_from_prompt(&mut self, source: &str) -> bool {
+        let source = source.trim().to_string();
+        self.notice = None;
+
+        if source.is_empty() {
+            self.notice = Some("informe uma origem (magnet, .torrent ou URL)".into());
+            return false;
+        }
+
+        if let Err(err) = AddTorrent::from_cli_argument(&source) {
+            self.notice = Some(format!("origem inválida: {err:#}"));
+            return false;
+        }
+
+        // Origem válida: limpa o prompt, desativa o modo e inicia a adição.
+        self.input.clear();
+        self.prompt_cursor = 0;
+        self.prompt_add_mode = false;
+        self.start_add_background(source);
+        true
+    }
+
+    /// Registra a origem na fila de pendentes e dispara a adição assíncrona
+    /// (US-014/US-034), posicionando a seleção na nova entrada.
+    fn start_add_background(&mut self, source: String) {
         self.pending.lock().unwrap().push(PendingTorrent {
             source: source.clone(),
             status: PendingStatus::Resolving,
         });
-        self.view = View::Session;
         self.row_index =
             (self.session_rows().len() + self.pending.lock().unwrap().len()).saturating_sub(1);
 
@@ -1558,8 +1670,10 @@ impl Tui {
     fn render_home_prompt(&mut self, frame: &mut Frame, cols: u16, row: u16) {
         let left = LAYOUT_MARGIN_COLS;
         let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS);
-        let prompt = "> ";
-        let text = if self.input.is_empty() {
+        // US-034: no modo "insira o link:", o rótulo muda e o placeholder
+        // padrão é suprimido (o texto digitado é a origem a adicionar).
+        let prompt = home_prompt_label(self.prompt_add_mode);
+        let text = if self.input.is_empty() && !self.prompt_add_mode {
             "Enter a command or / for options".to_string()
         } else {
             self.input.clone()
@@ -1616,7 +1730,7 @@ impl Tui {
         let row = rows.saturating_sub(1);
         frame.fill(row, 0, cols, ' ', None, Some(THEME.footer_bg));
 
-        let hints = footer_hints(&self.view);
+        let hints = footer_hints(&self.view, self.prompt_add_mode);
         frame.put_styled(row, 1, hints, Some(THEME.muted), Some(THEME.footer_bg));
 
         if let Some(notice) = &self.notice {
@@ -2302,6 +2416,36 @@ fn filter_commands(input: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Rótulo do prompt fixo da Home (US-031/US-034): `> ` normal ou
+/// "insira o link: " no modo de adição.
+fn home_prompt_label(prompt_add_mode: bool) -> &'static str {
+    if prompt_add_mode {
+        "insira o link: "
+    } else {
+        "> "
+    }
+}
+
+/// Extrai a origem de um `/add <origem>` digitado inline no prompt da Home
+/// (US-034). Retorna `None` quando o texto não é um `/add` com conteúdo após o
+/// espaço (ex.: `/add` puro, `/add ` vazio, outros comandos).
+fn parse_add_command(input: &str) -> Option<String> {
+    let source = input.strip_prefix("/add ")?.trim();
+    if source.is_empty() {
+        None
+    } else {
+        Some(source.to_string())
+    }
+}
+
+/// Decide se a filtragem dinâmica abre o popup de comandos dado o texto do
+/// prompt da Home (US-031/US-034): abre para qualquer texto iniciado com `/`,
+/// exceto o prefixo inline `/add `, cujo conteúdo após o espaço é a origem a
+/// adicionar no próprio prompt.
+fn should_open_command_menu(input: &str) -> bool {
+    input.starts_with('/') && !input.starts_with("/add ")
+}
+
 /// Insere um caractere em `s` na posição do cursor (byte index) e retorna a
 /// nova posição do cursor.
 fn insert_char_at(s: &mut String, pos: usize, c: char) -> usize {
@@ -2539,8 +2683,9 @@ fn view_label(view: &View) -> &'static str {
 }
 
 /// Atalhos da view atual, exibidos no lado esquerdo do Footer (US-019).
-fn footer_hints(view: &View) -> &'static str {
+fn footer_hints(view: &View, prompt_add_mode: bool) -> &'static str {
     match view {
+        View::Home if prompt_add_mode => "digite/cole a origem · Enter adiciona · Esc cancela",
         View::Home => "/ para comandos · Enter executa · ↑/↓ seleciona",
         View::Menu => "↑/↓ navegar · Enter executa · Tab completa · Esc fecha",
         View::Session => {
@@ -3299,7 +3444,8 @@ mod tests {
 
     #[test]
     fn session_footer_hints_mention_delete_shortcut() {
-        assert!(footer_hints(&View::Session).contains("[Del]"));
+        assert!(footer_hints(&View::Session, false).contains("[Del]"));
+        assert!(footer_hints(&View::Home, true).contains("Esc cancela"));
     }
 
     #[test]
@@ -3383,6 +3529,66 @@ mod tests {
         assert!(filter_commands("/zzz").is_empty());
         // Texto sem barra também filtra (usado ao digitar no popup).
         assert_eq!(filter_commands("add").len(), 1);
+    }
+
+    // ---- US-034: /add com prompt "insira o link:" na Home ----
+
+    #[test]
+    fn parse_add_command_extracts_inline_source() {
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            parse_add_command(&format!("/add {magnet}")),
+            Some(magnet.to_string())
+        );
+    }
+
+    #[test]
+    fn parse_add_command_trims_extra_whitespace() {
+        assert_eq!(
+            parse_add_command("/add   magnet:?xt=urn:btih:abc  "),
+            Some("magnet:?xt=urn:btih:abc".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_add_command_returns_none_without_source() {
+        // `/add` puro e `/add ` vazio não têm origem.
+        assert_eq!(parse_add_command("/add"), None);
+        assert_eq!(parse_add_command("/add "), None);
+    }
+
+    #[test]
+    fn parse_add_command_returns_none_for_other_commands() {
+        assert_eq!(parse_add_command("/list"), None);
+        assert_eq!(parse_add_command("/history"), None);
+        assert_eq!(parse_add_command("olá"), None);
+    }
+
+    #[test]
+    fn should_open_command_menu_opens_for_command_prefixes() {
+        assert!(should_open_command_menu("/"));
+        assert!(should_open_command_menu("/add"));
+        assert!(should_open_command_menu("/li"));
+        assert!(!should_open_command_menu(""));
+    }
+
+    #[test]
+    fn should_open_command_menu_stays_closed_for_inline_add() {
+        // O prefixo "/add " é a origem inline (US-034), não uma busca de comando.
+        assert!(!should_open_command_menu("/add "));
+        assert!(!should_open_command_menu("/add magnet:?xt=urn:btih:abc"));
+    }
+
+    #[test]
+    fn home_prompt_label_changes_in_add_mode() {
+        assert_eq!(home_prompt_label(false), "> ");
+        assert_eq!(home_prompt_label(true), "insira o link: ");
+    }
+
+    #[test]
+    fn home_footer_hints_change_in_add_mode() {
+        assert!(footer_hints(&View::Home, false).contains("Enter executa"));
+        assert!(footer_hints(&View::Home, true).contains("Esc cancela"));
     }
 
     #[test]
