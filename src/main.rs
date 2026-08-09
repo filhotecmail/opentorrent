@@ -112,11 +112,15 @@ pub(crate) fn existing_state(
 
 /// OpenTorrent: download torrents and magnet links from the terminal.
 #[derive(Parser)]
-#[command(version, author, about)]
+#[command(author, about)]
 struct Opts {
     /// The console log level (trace, debug, info, warn, error, off). Defaults to off for a clean interface.
     #[arg(long, short = 'v', default_value = "off")]
     log_level: String,
+
+    /// Print the installed version and check for a newer release (US-029).
+    #[arg(long = "version", short = 'V')]
+    check_version: bool,
 
     #[command(subcommand)]
     subcommand: Option<SubCommand>,
@@ -166,6 +170,12 @@ struct AddOpts {
 fn main() -> anyhow::Result<()> {
     let opts = Opts::parse();
 
+    // US-029: `--version`/`-V` imprime a versão instalada e verifica se há uma
+    // release mais recente (com timeout curto e falha graciosa offline).
+    if opts.check_version {
+        return run_version_check();
+    }
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(format!(
             "librqbit={},opentorrent={}",
@@ -185,11 +195,7 @@ fn main() -> anyhow::Result<()> {
         let _ = execute!(std::io::stdout(), EnableMouseCapture);
     }
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_time()
-        .enable_io()
-        .build()
-        .context("failed to build tokio runtime")?;
+    let runtime = build_runtime()?;
 
     match runtime.block_on(run(opts, multi)) {
         Ok(()) => {
@@ -208,6 +214,84 @@ fn disable_mouse(mouse_enabled: bool) {
     if mouse_enabled {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
+}
+
+/// Constrói o runtime tokio compartilhado (time + io habilitados).
+fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .enable_io()
+        .build()
+        .context("failed to build tokio runtime")
+}
+
+/// URL da API de releases do GitHub usada pela checagem de versão (US-029).
+const RELEASES_LATEST_URL: &str =
+    "https://api.github.com/repos/filhotecmail/opentorrent/releases/latest";
+
+/// US-029: `--version`/`-V` — imprime a versão instalada e consulta o
+/// repositório remoto por uma release mais recente. Falhas de rede/timeout
+/// apenas omitem o aviso, nunca geram erros visíveis (falha graciosa).
+fn run_version_check() -> anyhow::Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("OpenTorrent v{current}");
+
+    let runtime = build_runtime()?;
+
+    // Falha de rede/timeout/resposta inválida (None): apenas a versão local.
+    if let Some(tag) = runtime.block_on(fetch_latest_release()) {
+        if has_update(&tag, current) {
+            println!("Nova versão disponível: {tag} (atual: v{current})");
+            println!("Execute para atualizar: {}", update_command(&tag));
+        } else {
+            println!("você está na versão mais recente (v{current})");
+        }
+    }
+    Ok(())
+}
+
+/// Busca o `tag_name` da última release publicada no GitHub, com timeout curto
+/// (máx. 3s). Retorna `None` em qualquer falha (rede, timeout, status, JSON).
+async fn fetch_latest_release() -> Option<String> {
+    let client = reqwest::Client::new();
+    let request = async {
+        let resp = client
+            .get(RELEASES_LATEST_URL)
+            .header("User-Agent", "opentorrent")
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
+        let json: serde_json::Value = resp.json().await.ok()?;
+        json.get("tag_name")?.as_str().map(String::from)
+    };
+    tokio::time::timeout(Duration::from_secs(3), request)
+        .await
+        .ok()?
+}
+
+/// Comparação SemVer: `true` quando a release remota (tag, ex.: `v0.1.16`) é
+/// estritamente superior à versão instalada. Versões malformadas não contam
+/// como atualização (falha graciosa).
+fn has_update(latest_tag: &str, current: &str) -> bool {
+    let latest = latest_tag.trim_start_matches('v');
+    match (
+        semver::Version::parse(latest),
+        semver::Version::parse(current),
+    ) {
+        (Ok(a), Ok(b)) => a > b,
+        _ => false,
+    }
+}
+
+/// Comando sugerido para atualizar o binário a partir da release mais recente.
+fn update_command(tag: &str) -> String {
+    format!(
+        "curl -L -o opentorrent \
+         https://github.com/filhotecmail/opentorrent/releases/download/{tag}/opentorrent-{tag}-linux-x86_64 \
+         && chmod +x opentorrent"
+    )
 }
 
 async fn run(opts: Opts, multi: MultiProgress) -> anyhow::Result<()> {
@@ -648,5 +732,36 @@ async fn stats_printer(
         }
 
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_update_detects_newer_release() {
+        assert!(has_update("v0.1.12", "0.1.10"));
+        assert!(has_update("v0.2.0", "0.1.99"));
+    }
+
+    #[test]
+    fn has_update_false_when_equal_or_older() {
+        assert!(!has_update("v0.1.11", "0.1.11"));
+        assert!(!has_update("v0.1.10", "0.1.11"));
+    }
+
+    #[test]
+    fn has_update_ignores_malformed_versions() {
+        assert!(!has_update("not-a-version", "0.1.15"));
+        assert!(!has_update("v0.1.16", "junk"));
+        assert!(!has_update("", "0.1.15"));
+    }
+
+    #[test]
+    fn update_command_targets_release_asset() {
+        let cmd = update_command("v0.1.16");
+        assert!(cmd.contains("opentorrent-v0.1.16-linux-x86_64"));
+        assert!(cmd.contains("chmod +x opentorrent"));
     }
 }
