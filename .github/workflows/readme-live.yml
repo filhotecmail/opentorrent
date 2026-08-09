@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  pull_requests: write
 
 concurrency:
   group: readme-live
@@ -37,7 +38,12 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: bash scripts/update-readme.sh
 
-      - name: Commitar mudanças se houver
+      # A branch master é protegida (exige PR), então o push direto é
+      # rejeitado. Em vez disso, abre (ou atualiza) um PR com auto-merge
+      # habilitado — o merge ocorre automaticamente quando o CI passa.
+      - name: Abrir PR com as mudanças do README
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if git diff --quiet; then
             echo "README inalterado."
@@ -47,4 +53,14 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add README.md
           git commit -m "docs: atualiza README com estado atual do projeto (auto)"
-          git push
+          BRANCH="docs/readme-live-update"
+          git push -f origin "HEAD:$BRANCH"
+          TITLE="docs: atualiza README com estado do projeto (auto)"
+          BODY="Atualização automática do README (badges, estado do projeto e metadados) pelo workflow README vivo."
+          PR_NUM="$(gh pr view "$BRANCH" --json number --jq .number 2>/dev/null || true)"
+          if [[ -n "$PR_NUM" ]]; then
+            gh pr edit "$PR_NUM" --title "$TITLE" --body "$BODY"
+            gh pr ready "$PR_NUM" 2>/dev/null || true
+          else
+            gh pr create --base master --head "$BRANCH" --title "$TITLE" --body "$BODY" --auto
+          fi
