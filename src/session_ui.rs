@@ -1298,30 +1298,33 @@ impl Tui {
         })
         .min(ROW_INFO_WIDTH) as usize;
         let name_width = info_width.saturating_sub(ROW_FIXED_W).max(1);
+        // Largura total da tabela (base do cabeçalho e dos divisores sutis).
+        let table_width = info_width
+            + if show_actions {
+                1 + ACTIONS_WIDTH as usize
+            } else {
+                0
+            };
 
         // Cabeçalho + separador da tabela (colunas alinhadas).
         lines.push(session_table_header(name_width, show_actions));
-        lines.push("─".repeat(
-            info_width
-                + if show_actions {
-                    1 + ACTIONS_WIDTH as usize
-                } else {
-                    0
-                },
-        ));
+        lines.push(separator_line(table_width));
 
         // Barras de progresso renderizadas com cor por estado (US-020): a
         // linha é desenhada com o texto completo e a barra é sobreposta em
         // seguida com `put_styled` (verde/amarelo/vermelho/ciano).
         let mut bars: Vec<(usize, String, Color)> = Vec::new();
+        // Índices (no bloco) das linhas divisoras sutis entre registros, para
+        // sobrepor a cor escura após a escrita base (US-028).
+        let mut seps: Vec<usize> = Vec::new();
 
         let total_entries = rows_data.len() + pending.len();
         if rows_data.is_empty() && pending.is_empty() {
             lines.push("nenhum torrent na fila".into());
         } else {
-            // Espaçamento vertical (US-026): cada entrada é seguida de uma
-            // linha de separação (gap), exceto a última — barras de progresso
-            // consecutivas não ficam coladas umas nas outras.
+            // Densidade compacta (US-028): sem linhas em branco — cada entrada
+            // é seguida de um divisor fino `─` (exceto a última), isolando as
+            // barras de progresso sem gastar altura da tela.
             let mut rendered = 0usize;
             for (idx, row) in rows_data.iter().enumerate() {
                 let marker = if idx == self.row_index { "> " } else { "  " };
@@ -1366,7 +1369,8 @@ impl Tui {
                 bars.push((idx, bar, color));
                 rendered += 1;
                 if rendered < total_entries {
-                    lines.push(String::new());
+                    seps.push(lines.len());
+                    lines.push(separator_line(table_width));
                 }
             }
 
@@ -1407,7 +1411,8 @@ impl Tui {
                 idx += 1;
                 rendered += 1;
                 if rendered < total_entries {
-                    lines.push(String::new());
+                    seps.push(lines.len());
+                    lines.push(separator_line(table_width));
                 }
             }
         }
@@ -1426,6 +1431,13 @@ impl Tui {
         let (left, top) =
             self.centered_write(frame, lines, cols, body_top, body_height, &highlighted);
 
+        // Divisores sutis entre registros em tom escuro (US-028, AC-2).
+        let sep_text = separator_line(table_width);
+        for sep_idx in &seps {
+            let row = top + *sep_idx as u16;
+            frame.put_styled(row, left, &sep_text, Some(THEME.muted), None);
+        }
+
         // Sobreposição da barra com cor por estado. Na linha selecionada o
         // fundo de destaque é preservado (a barra mantém sua cor por cima).
         for (line_idx, bar, color) in &bars {
@@ -1438,9 +1450,9 @@ impl Tui {
             frame.put_styled(row, left + ROW_PREFIX_W as u16, bar, Some(*color), bg);
         }
 
-        // Registra a geometria para o mapeamento de cliques do mouse. Com o
-        // espaçamento vertical (US-026) cada entrada ocupa 2 linhas de tela
-        // (stride 2); cliques na linha de gap não alteram a seleção.
+        // Registra a geometria para o mapeamento de cliques do mouse. Com os
+        // divisores sutis (US-028) cada entrada ocupa 2 linhas de tela
+        // (stride 2); cliques na linha do divisor não alteram a seleção.
         if bars.is_empty() {
             self.layout = None;
         } else {
@@ -1845,17 +1857,17 @@ fn progress_color(state: TorrentStatsState, finished: bool) -> Color {
 /// renderizar os botões à direita.
 /// Índice (linha do bloco) que uma entrada da tabela de sessão ocupa no
 /// conjunto de linhas renderizadas. O bloco começa com 4 linhas fixas
-/// (título, vazio, cabeçalho e separador) e, com o espaçamento vertical
-/// (US-026), cada entrada ocupa 2 linhas: a própria linha + o gap.
+/// (título, vazio, cabeçalho e separador) e, com os divisores sutis (US-028),
+/// cada entrada ocupa 2 linhas: a própria linha + o divisor fino.
 fn session_row_line(entry_idx: usize) -> usize {
     SESSION_HEADER_LINES + entry_idx * 2
 }
 
 /// Mapeia uma linha da tela para o índice da entrada de um bloco listado
-/// (menu, diálogo ou tabela), considerando o espaçamento vertical (`stride`
-/// linhas por entrada; 1 = linhas consecutivas, 2 = com linha de gap).
-/// Retorna `None` quando a linha está fora das entradas ou cai exatamente na
-/// linha de separação (gap) — um clique aí não altera a seleção.
+/// (menu, diálogo ou tabela), considerando a altura ocupada por entrada
+/// (`stride` linhas; 1 = consecutivas, 2 = com divisor fino). Retorna `None`
+/// quando a linha está fora das entradas ou cai exatamente no divisor — um
+/// clique aí não altera a seleção.
 fn table_row_to_index(row: u16, first_row: u16, row_count: usize, stride: u16) -> Option<usize> {
     if row_count == 0 || stride == 0 {
         return None;
@@ -1870,6 +1882,12 @@ fn table_row_to_index(row: u16, first_row: u16, row_count: usize, stride: u16) -
         return None;
     }
     Some((offset / stride) as usize)
+}
+
+/// Linha divisória sutil (US-028): `─` repetido pela largura da tabela, em tom
+/// escuro (`THEME.muted`), separando registros sem gastar linhas em branco.
+fn separator_line(width: usize) -> String {
+    "─".repeat(width)
 }
 
 fn session_table_header(name_width: usize, show_actions: bool) -> String {
@@ -2608,16 +2626,37 @@ mod tests {
     }
 
     #[test]
-    fn session_row_line_accounts_for_vertical_gap() {
-        // 4 linhas fixas + 2 linhas por entrada (linha + gap de separação).
+    fn session_row_line_accounts_for_thin_separator() {
+        // 4 linhas fixas + 2 linhas por entrada (linha + divisor fino).
         assert_eq!(session_row_line(0), 4);
         assert_eq!(session_row_line(1), 6);
         assert_eq!(session_row_line(3), 10);
     }
 
     #[test]
+    fn separator_line_matches_table_width() {
+        // O divisor fino tem a mesma largura do cabeçalho e da linha de dados
+        // com ações — as colunas permanecem alinhadas (AC-2/AC-3).
+        let name_width = 12;
+        let header = session_table_header(name_width, true);
+        let sep = separator_line(header.chars().count());
+        assert!(sep.chars().all(|c| c == '─'));
+        assert_eq!(sep.chars().count(), header.chars().count());
+        let data = session_table_line(
+            "  ",
+            1,
+            &progress_bar(0.0),
+            "erro",
+            "abc",
+            name_width,
+            Some("[Pausar ] [Parar  ] [Excluir]"),
+        );
+        assert_eq!(sep.chars().count(), data.chars().count());
+    }
+
+    #[test]
     fn table_row_to_index_maps_with_stride() {
-        // stride 2: entradas nas linhas pares do bloco; gaps ímpares ignorados.
+        // stride 2: entradas nas linhas pares do bloco; divisores ímpares ignorados.
         assert_eq!(table_row_to_index(10, 10, 5, 2), Some(0));
         assert_eq!(table_row_to_index(12, 10, 5, 2), Some(1));
         assert_eq!(table_row_to_index(11, 10, 5, 2), None); // gap
