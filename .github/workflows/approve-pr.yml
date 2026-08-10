@@ -1,0 +1,203 @@
+name: Aprovar PR
+
+# Governança: merge manual com aprovação explícita do dono do repositório.
+# Quando o dono (filhotecmail) aprova um PR via review ("Approve"), este
+# workflow executa, numa única execução:
+#   1. Merge squash do PR aprovado;
+#   2. Se a release da versão atual do Cargo.toml já estiver publicada e o PR
+#      tocar código, aplica bump patch, atualiza o README na área de versão
+#      (tabela de metadados) e mergea o PR de bump;
+#   3. Publica a release da versão do Cargo.toml via release.yml
+#      (workflow_dispatch, que também é isento do trigger pull_request.closed);
+#   4. Garante o README atualizado com a versão publicada (via PR, se mudou).
+# Processo 100% manual: nenhum merge ocorre sem aprovação do dono; revisões de
+# contribuidores são ignoradas.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: approve-pr
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  approve:
+    name: Merge squash e release após aprovação
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Validar aprovação (somente dono, base master)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REVIEWER="${{ github.event.review.user.login }}"
+          BASE="${{ github.event.pull_request.base.ref }}"
+          if [[ "$REVIEWER" != "filhotecmail" ]]; then
+            echo "Aprovação de $REVIEWER ignorada — apenas o dono (filhotecmail) pode aprovar."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$BASE" != "master" ]]; then
+            echo "PR para '$BASE' — fora do fluxo de release (base não é master)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Aprovação válida de $REVIEWER para o PR #${{ github.event.pull_request.number }}."
+          fi
+
+      - name: Merge squash do PR aprovado
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR_NUM="${{ github.event.pull_request.number }}"
+          if [[ "$(gh pr view "$PR_NUM" --json merged --jq .merged)" == "true" ]]; then
+            echo "PR #$PR_NUM já estava mergeado."
+            exit 0
+          fi
+          for _ in $(seq 1 120); do
+            if gh pr merge "$PR_NUM" --squash 2>/dev/null; then
+              echo "PR #$PR_NUM mergeado (squash)."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERRO: PR #$PR_NUM não ficou mergeable em tempo hábil (checks/conflito)." >&2
+          gh pr view "$PR_NUM" --json mergeStateStatus --jq '"mergeStateStatus: " + .mergeStateStatus' >&2
+          exit 1
+
+      - name: Bump de versão, README e release
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR_NUM="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+          git fetch origin master
+          git reset --hard origin/master
+
+          VER="$(awk -F'=' '/^version/ {gsub(/[" ]/,"",$2); print $2; exit}' Cargo.toml)"
+          TAG="v${VER}"
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            FILES="$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/files" --jq '.[].filename')"
+            RELEVANT="$(printf '%s\n' "$FILES" | grep -E '^(src/|Cargo\.toml|Cargo\.lock|\.github/|scripts/|build\.sh)' || true)"
+            if [[ -z "$RELEVANT" ]]; then
+              echo "PR #$PR_NUM sem mudanças relevantes e release $TAG já publicada — nada a fazer."
+              exit 0
+            fi
+            echo "Release $TAG já publicada — aplicando bump patch e atualizando o README."
+            IFS=. read -r major minor patch <<< "$VER"
+            NEXT="$major.$minor.$((patch + 1))"
+            sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$NEXT\"/" Cargo.toml
+            cargo update -p opentorrent
+            bash scripts/update-readme.sh
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            BRANCH="chore/bump-version-$NEXT"
+            git checkout -b "$BRANCH"
+            git add Cargo.toml Cargo.lock README.md
+            git commit -m "chore: bump versão para $NEXT e atualiza README (após aprovação)"
+            git push -f origin "HEAD:$BRANCH"
+            TITLE="chore: bump versão para $NEXT"
+            BODY="Bump automático de versão e atualização do README (área de versão) após aprovação manual do dono. A release é publicada ao mergear."
+            BUMP_PR="$(gh pr create --base master --head "$BRANCH" --title "$TITLE" --body "$BODY" --json number --jq .number)"
+            echo "PR de bump #$BUMP_PR aberto — aguardando CI para merge."
+            for _ in $(seq 1 120); do
+              if gh pr merge "$BUMP_PR" --squash 2>/dev/null; then
+                echo "PR de bump #$BUMP_PR mergeado."
+                break
+              fi
+              sleep 5
+            done
+            if [[ "$(gh pr view "$BUMP_PR" --json merged --jq .merged)" != "true" ]]; then
+              echo "ERRO: PR de bump #$BUMP_PR não mergeado em tempo hábil (checks/conflito)." >&2
+              gh pr view "$BUMP_PR" --json mergeStateStatus --jq '"mergeStateStatus: " + .mergeStateStatus' >&2
+              exit 1
+            fi
+            git fetch origin master
+            git reset --hard origin/master
+          fi
+
+          VER="$(awk -F'=' '/^version/ {gsub(/[" ]/,"",$2); print $2; exit}' Cargo.toml)"
+          TAG="v${VER}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG já publicada — nada a publicar."
+          else
+            echo "Publicando release $TAG."
+            gh workflow run release.yml --ref master -f tag="$TAG"
+            RUN_ID=""
+            for _ in $(seq 1 30); do
+              RUN_ID="$(gh run list --workflow=release.yml --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // ""' 2>/dev/null || true)"
+              [[ -n "$RUN_ID" ]] && break
+              sleep 5
+            done
+            if [[ -z "$RUN_ID" ]]; then
+              echo "ERRO: não localizou a run do release disparada." >&2
+              exit 1
+            fi
+            gh run watch "$RUN_ID" --exit-status
+            echo "Release $TAG publicada."
+          fi
+
+      - name: Atualizar README com a versão publicada
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch origin master
+          git reset --hard origin/master
+          bash scripts/update-readme.sh
+          if git diff --quiet; then
+            echo "README já está atualizado."
+            exit 0
+          fi
+          echo "README desatualizado — abrindo PR de atualização."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git branch -D docs/readme-live-update 2>/dev/null || true
+          git checkout -b docs/readme-live-update
+          git add README.md
+          git commit -m "docs: atualiza README com versão publicada (após aprovação)"
+          git push -f origin "HEAD:docs/readme-live-update"
+          TITLE="docs: atualiza README com versão publicada"
+          BODY="Atualização do README (área de versão) após aprovação manual e publicação de release."
+          PR="$(gh pr view docs/readme-live-update --json number --jq .number 2>/dev/null || true)"
+          if [[ -z "$PR" ]]; then
+            PR="$(gh pr create --base master --head docs/readme-live-update --title "$TITLE" --body "$BODY" --json number --jq .number)"
+          else
+            gh pr edit "$PR" --title "$TITLE" --body "$BODY"
+            gh pr ready "$PR" 2>/dev/null || true
+          fi
+          echo "PR de README #$PR aberto — aguardando CI para merge."
+          for _ in $(seq 1 120); do
+            if [[ "$(gh pr view "$PR" --json merged --jq .merged)" == "true" ]]; then
+              echo "PR de README #$PR já mergeado."
+              exit 0
+            fi
+            if gh pr merge "$PR" --squash 2>/dev/null; then
+              echo "PR de README #$PR mergeado."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERRO: PR de README #$PR não mergeado em tempo hábil (checks/conflito)." >&2
+          exit 1

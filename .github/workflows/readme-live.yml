@@ -40,8 +40,8 @@ jobs:
         run: bash scripts/update-readme.sh
 
       # A branch master é protegida (exige PR), então o push direto é
-      # rejeitado. Em vez disso, abre (ou atualiza) um PR com auto-merge
-      # habilitado — o merge ocorre automaticamente quando o CI passa.
+      # rejeitado. Em vez disso, abre (ou atualiza) um PR que aguarda a
+      # aprovação manual do dono (workflow Aprovar PR) para ser mergeado.
       - name: Abrir PR com as mudanças do README
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,5 +67,5 @@ jobs:
             PR_URL="$(gh pr create --base master --head "$BRANCH" --title "$TITLE" --body "$BODY")"
             PR_NUM="$(basename "$PR_URL")"
           fi
-          # Habilita o auto-merge (squash): o PR é mergeado assim que o CI passar.
-          gh pr merge "$PR_NUM" --auto --squash || echo "aviso: auto-merge nao habilitado (PR #$PR_NUM aberto para merge manual)"
+          # Sem auto-merge: aguarda a aprovação manual do dono (workflow Aprovar PR).
+          echo "PR #$PR_NUM aberto — aguardando aprovação manual do dono."
