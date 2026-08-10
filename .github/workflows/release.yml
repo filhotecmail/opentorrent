@@ -74,8 +74,20 @@ jobs:
 
           # Push na master: ignora merges que não tocam o código (ex.: README do
           # readme-live) — evita bump/release em cascata a cada atualização.
-          FILES="$(printf '%s' '${{ toJson(github.event.commits) }}' | jq -r '[.[].added[]?, .[].modified[]?, .[].removed[]?] | unique[]' 2>/dev/null || true)"
-          RELEVANT="$(printf '%s\n' "$FILES" | grep -E '^(src/|Cargo\.toml|Cargo\.lock|\.github/|scripts/|build\.sh)' || true)"
+          # Relevância é decidida por git diff entre o commit anterior (before) e
+          # o HEAD: o webhook nem sempre inclui os arrays added/modified/removed
+          # (merges squash via API), então não confiamos neles.
+          BEFORE="${{ github.event.before }}"
+          if [[ "$BEFORE" =~ ^0+$ ]]; then
+            RELEVANT="yes"
+          else
+            git fetch --quiet --depth=1 origin "$BEFORE" || true
+            if git diff --name-only "$BEFORE" HEAD | grep -qE '^(src/|Cargo\.toml|Cargo\.lock|\.github/|scripts/|build\.sh)'; then
+              RELEVANT="yes"
+            else
+              RELEVANT=""
+            fi
+          fi
           if [[ -z "$RELEVANT" ]]; then
             echo "Push sem mudanças relevantes (código/versão) — pulando."
             echo "proceed=skip" >> "$GITHUB_OUTPUT"
