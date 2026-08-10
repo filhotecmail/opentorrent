@@ -12,7 +12,6 @@
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/filhotecmail/opentorrent)
 [![Release](https://img.shields.io/badge/release-v0.1.29-blue)](https://github.com/filhotecmail/opentorrent/releases)
 [![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
-[![Gemfury Badge](https://badge.fury.io/apt/opentorrent.svg)](https://badge.fury.io/apt/opentorrent)
 [![APT Package](https://img.shields.io/badge/Debian%2FAPT-.deb-A81D33?style=flat-square&logo=debian&logoColor=white)](https://github.com/filhotecmail/opentorrent/releases/latest)
 <!-- BADGES_END -->
 
