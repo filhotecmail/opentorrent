@@ -201,6 +201,9 @@ struct Theme {
     text: Color,
     /// Acento/destaque (ciano).
     accent: Color,
+    /// Cor de primeiro plano do prompt da Home (US-039): branca para garantir
+    /// contraste sobre o fundo do footer (a cor de acento ciano era ilegível).
+    home_prompt_fg: Color,
     /// Sucesso / downloads completos (verde).
     success: Color,
     /// Avisos (amarelo).
@@ -224,6 +227,7 @@ const THEME: Theme = Theme {
     border: Color::DarkGrey,
     text: Color::White,
     accent: Color::Cyan,
+    home_prompt_fg: Color::White,
     success: Color::Green,
     warning: Color::Yellow,
     error: Color::Red,
@@ -1561,7 +1565,13 @@ impl Tui {
             let max_w = (width as usize).saturating_sub(4);
             let shown = Self::truncate(&label, max_w);
             frame.fill(row, left, width, ' ', None, Some(THEME.footer_bg));
-            frame.put_styled(row, left, &shown, Some(THEME.accent), Some(THEME.footer_bg));
+            frame.put_styled(
+                row,
+                left,
+                &shown,
+                Some(THEME.home_prompt_fg),
+                Some(THEME.footer_bg),
+            );
             return;
         }
         // US-034: no modo "insira o link:", o rótulo muda e o placeholder
@@ -1575,7 +1585,13 @@ impl Tui {
         let max_w = (width as usize).saturating_sub(4);
         let shown = Self::truncate(&text, max_w);
         frame.fill(row, left, width, ' ', None, Some(THEME.footer_bg));
-        frame.put_styled(row, left, prompt, Some(THEME.accent), Some(THEME.footer_bg));
+        frame.put_styled(
+            row,
+            left,
+            prompt,
+            Some(THEME.home_prompt_fg),
+            Some(THEME.footer_bg),
+        );
         let text_col = left + prompt.chars().count() as u16;
         frame.put_styled(
             row,
@@ -2296,6 +2312,13 @@ mod tests {
     fn strips_sgr_escape_sequences() {
         let colored = "\u{1b}[36mhello\u{1b}[0m world".to_string();
         assert_eq!(strip_ansi(&colored), "hello world");
+    }
+
+    #[test]
+    fn home_prompt_fg_contrasts_with_footer_bg() {
+        // US-039: o prompt da Home usa cor própria (branca) que difere do fundo
+        // do footer para garantir legibilidade da confirmação/entrada.
+        assert_ne!(THEME.home_prompt_fg, THEME.footer_bg);
     }
 
     #[test]

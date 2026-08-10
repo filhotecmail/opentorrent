@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -89,6 +89,44 @@ fn config_folder() -> anyhow::Result<PathBuf> {
     dirs::config_dir()
         .context("could not determine the user config directory")
         .map(|dir| dir.join("opentorrent"))
+}
+
+/// Trackers públicos de fallback aplicados somente no Windows (US-039): o
+/// firewall do Windows costuma bloquear o DHT, e um magnet sem `&tr=` que não
+/// resolve metadados via DHT fica preso em "inicializando" sem mensagem de
+/// erro. Os trackers globais da sessão (SessionOptions::trackers) garantem
+/// fontes de peers mesmo com o DHT indisponível.
+#[cfg(target_os = "windows")]
+const FALLBACK_TRACKERS: &[&str] = &[
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker.tiny-vps.com:6969/announce",
+    "udp://tracker.cyberia.is:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "https://tracker.tamersunion.org:443/announce",
+];
+
+/// Trackers globais da sessão (US-039): conjunto não vazio no Windows como
+/// fallback para o DHT bloqueado pelo firewall, e vazio nas demais plataformas,
+/// onde o DHT já resolve magnets sem trackers — o comportamento do Linux fica
+/// inalterado.
+#[cfg(target_os = "windows")]
+fn fallback_trackers() -> HashSet<url::Url> {
+    FALLBACK_TRACKERS
+        .iter()
+        .filter_map(|s| url::Url::parse(s).ok())
+        .collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn fallback_trackers() -> HashSet<url::Url> {
+    HashSet::new()
 }
 
 /// Whether the torrent's files already exist in the given output folder.
@@ -340,6 +378,8 @@ async fn run_interactive() -> anyhow::Result<()> {
         persistence: Some(SessionPersistenceConfig::Json {
             folder: Some(session_folder),
         }),
+        // US-039: no Windows, trackers públicos de fallback (DHT bloqueado).
+        trackers: fallback_trackers(),
         ..Default::default()
     };
     let session = Session::new_with_opts(output_folder.clone(), session_opts)
@@ -366,7 +406,11 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
         None => None,
     };
 
-    let session_opts = SessionOptions::default();
+    let session_opts = SessionOptions {
+        // US-039: no Windows, trackers públicos de fallback (DHT bloqueado).
+        trackers: fallback_trackers(),
+        ..Default::default()
+    };
 
     let output_folder = match opts.output_folder.as_deref() {
         Some(o) => PathBuf::from(o),
@@ -815,5 +859,13 @@ mod tests {
         // US-038: %APPDATA%\opentorrent no Windows / ~/.config/opentorrent no Unix.
         let folder = config_folder().expect("diretório de configuração resolvido");
         assert_eq!(folder.file_name().unwrap(), "opentorrent");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn fallback_trackers_off_on_non_windows() {
+        // US-039: a lista de trackers de fallback é aplicada apenas no Windows;
+        // nas demais plataformas a sessão mantém o comportamento padrão.
+        assert!(fallback_trackers().is_empty());
     }
 }
