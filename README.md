@@ -1,27 +1,16 @@
 # OpenTorrent
 
 <!-- BADGES_START -->
-**Métricas e Compatibilidade**
-
 [![MSRV](https://img.shields.io/badge/MSRV-1.85+-orange?logo=rust)](https://github.com/filhotecmail/opentorrent/blob/master/Cargo.toml)
 [![Plataforma](https://img.shields.io/badge/plataforma-linux%20x86__64%20%7C%20windows%20x86__64-blue)](https://github.com/filhotecmail/opentorrent/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/filhotecmail/opentorrent/total?color=2ea44f&label=downloads)](https://github.com/filhotecmail/opentorrent/releases)
-
-**Qualidade e Segurança**
-
-[![CI push](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?event=push&branch=master)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
 [![CI pull request](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
 [![CI schedule](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
-[![Dependências auditadas](https://deps.rs/repo/github/filhotecmail/opentorrent/badge.svg)](https://deps.rs/repo/github/filhotecmail/opentorrent)
 [![CodeQL](https://github.com/filhotecmail/opentorrent/actions/workflows/codeql.yml/badge.svg?branch=master)](https://github.com/filhotecmail/opentorrent/security/code-scanning)
 [![Cobertura](https://codecov.io/gh/filhotecmail/opentorrent/branch/master/graph/badge.svg)](https://codecov.io/gh/filhotecmail/opentorrent)
-
-**Atividade e Comunidade**
-
 [![Último commit](https://img.shields.io/github/last-commit/filhotecmail/opentorrent/master)](https://github.com/filhotecmail/opentorrent/commits/master)
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/filhotecmail/opentorrent)
-[![GitHub Discussions](https://img.shields.io/badge/Discussions-junte-se-8a2be2)](https://github.com/filhotecmail/opentorrent/discussions)
-[![Release](https://img.shields.io/badge/release-v0.1.24-blue)](https://github.com/filhotecmail/opentorrent/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.26-blue)](https://github.com/filhotecmail/opentorrent/releases)
 [![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
 <!-- BADGES_END -->
 
@@ -59,9 +48,9 @@ dependências externas de runtime.
 | Estado | Valor |
 | --- | --- |
 | Branch principal | `master` |
-| Última release | `v0.1.20` |
+| Última release | `v0.1.26` |
 | Milestone atual | v1.0 |
-| Issues abertas | 0 |
+| Issues abertas | 1 |
 | Labels do projeto | 19 |
 <!-- ESTADO_END -->
 
@@ -69,7 +58,7 @@ dependências externas de runtime.
 | Metadado | Valor |
 | --- | --- |
 | Pacote | `opentorrent` |
-| Versão | `0.1.21` |
+| Versão | `0.1.26` |
 | Edição Rust | 2024 |
 <!-- CARGO_END -->
 
