@@ -1,3 +1,7 @@
+// US-039/coverage: habilita `#[coverage(off)]` apenas no job de cobertura
+// (nightly + cfg `coverage_nightly`). Em builds normais o atributo é removido.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -356,6 +360,9 @@ fn update_command(tag: &str) -> String {
     )
 }
 
+/// Despacha o comando para o modo interativo ou para o modo aditivo. Entrypoint
+/// de rede/TUI não unit-testável → excluído da cobertura (ver `coverage_nightly`).
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run(opts: Opts, multi: MultiProgress) -> anyhow::Result<()> {
     match opts.subcommand {
         Some(SubCommand::Add(add)) => run_add(add, multi).await,
@@ -364,7 +371,9 @@ async fn run(opts: Opts, multi: MultiProgress) -> anyhow::Result<()> {
     }
 }
 
-/// Run the interactive session UI (no subcommand).
+/// Run the interactive session UI (no subcommand). Entrypoint de rede/TUI não
+/// unit-testável → excluído da cobertura (ver `coverage_nightly`).
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_interactive() -> anyhow::Result<()> {
     let output_folder = default_output_folder()?;
     std::fs::create_dir_all(&output_folder)
@@ -389,6 +398,9 @@ async fn run_interactive() -> anyhow::Result<()> {
     session_ui::run_interactive(session, output_folder).await
 }
 
+/// Entrypoint de rede/TUI não unit-testável → excluído da cobertura (ver
+/// `coverage_nightly`).
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
     if opts.list {
         print_line(&multi, "listing torrent contents");

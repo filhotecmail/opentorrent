@@ -1555,6 +1555,9 @@ impl Tui {
 
     /// Prompt fixo da base (US-031): `> ` + texto digitado (ou placeholder) com
     /// cursor ativo, preenchendo a largura do terminal com as margens laterais.
+    /// Método da TUI que exige `Arc<Session>` real (rede) → não unit-testável;
+    /// excluído da cobertura (ver `coverage_nightly`).
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn render_home_prompt(&mut self, frame: &mut Frame, cols: u16, row: u16) {
         let left = LAYOUT_MARGIN_COLS;
         let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS);
