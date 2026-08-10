@@ -52,10 +52,11 @@ jobs:
   #   - `bump`    → merge na master sem bump (release da versão atual já
   #                 publicada): abre PR de bump com auto-merge; release é
   #                 publicada quando esse PR for mergeado.
-  #   - `skip`    → PR mergeado sem mudanças relevantes (ex.: README) ou PR
-  #                 fechado sem merge; nada é feito.
+  #   - `skip`    → PR mergeado sem mudanças relevantes (ex.: README); nada é
+  #                 feito. PRs fechados sem merge são pulados no nível do job.
   bump:
     name: Bump automático de versão
+    if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     outputs:
       proceed: ${{ steps.decide.outputs.proceed }}
@@ -82,19 +83,13 @@ jobs:
             exit 0
           fi
 
-          # PR fechado sem merge: nada a fazer.
-          if [[ "${{ github.event.pull_request.merged }}" != "true" ]]; then
-            echo "PR fechado sem merge — pulando."
-            echo "proceed=skip" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           # PR mergeado na master: ignora merges que não tocam o código/versão
           # (ex.: README) — evita bump/release em cascata. A relevância vem dos
           # arquivos alterados do próprio PR (não confiamos nos arrays de commit
-          # do webhook, que o auto-merge omite).
+          # do webhook, que o auto-merge omite). Paginação completa e falha
+          # fechada: se a API falhar, a esteira falha em vez de pular o PR.
           PR_NUM="${{ github.event.pull_request.number }}"
-          FILES="$(gh api "repos/${{ github.repository }}/pulls/$PR_NUM/files?per_page=100" --jq '.[].filename' 2>/dev/null || true)"
+          FILES="$(gh api --paginate "repos/${{ github.repository }}/pulls/$PR_NUM/files" --jq '.[].filename')"
           RELEVANT="$(printf '%s\n' "$FILES" | grep -E '^(src/|Cargo\.toml|Cargo\.lock|\.github/|scripts/|build\.sh)' || true)"
           if [[ -z "$RELEVANT" ]]; then
             echo "PR #$PR_NUM sem mudanças relevantes (código/versão) — pulando."
@@ -305,7 +300,7 @@ jobs:
           ls -lh dist
 
       - name: Publicar release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.check.outputs.tag }}
           target_commitish: ${{ needs.check.outputs.commitish }}
