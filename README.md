@@ -12,6 +12,8 @@
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/filhotecmail/opentorrent)
 [![Release](https://img.shields.io/badge/release-v0.1.29-blue)](https://github.com/filhotecmail/opentorrent/releases)
 [![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
+[![Gemfury Badge](https://badge.fury.io/apt/opentorrent.svg)](https://badge.fury.io/apt/opentorrent)
+[![APT Package](https://img.shields.io/badge/Debian%2FAPT-.deb-A81D33?style=flat-square&logo=debian&logoColor=white)](https://github.com/filhotecmail/opentorrent/releases/latest)
 <!-- BADGES_END -->
 
 Um cliente BitTorrent de **linha de comando (CLI)** para **Linux/Ubuntu e
@@ -134,15 +136,35 @@ Necessárias apenas para **compilar** (gerar o binário):
 #### Instalar via apt (repositório Gemfury)
 
 O pipeline de release publica o pacote `.deb` no repositório apt gerenciado
-pelo Gemfury. Para instalar com o gerenciador de pacotes:
+pelo Gemfury a cada release do GitHub. Para instalar com o gerenciador de
+pacotes:
 
 ```bash
+# 1. Configura o repositório (uma única vez)
 echo "deb [trusted=yes] https://apt.fury.io/cads2509/ /" | sudo tee /etc/apt/sources.list.d/opentorrent.list
+
+# 2. Atualiza o índice de pacotes e instala
 sudo apt update
 sudo apt install opentorrent
 ```
 
 > O repositório Gemfury não é assinado com GPG — por isso o `[trusted=yes]`.
+
+**Para atualizar:** cada release do GitHub publica automaticamente uma nova
+versão no repositório. Basta atualizar o índice e fazer o upgrade:
+
+```bash
+sudo apt update
+sudo apt install --only-upgrade opentorrent
+```
+
+**Para desinstalar:**
+
+```bash
+sudo apt remove opentorrent
+sudo rm /etc/apt/sources.list.d/opentorrent.list
+sudo apt update
+```
 
 #### Instalar a partir do Release (recomendado)
 

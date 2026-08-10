@@ -28,7 +28,7 @@ latest_tag=$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/nu
 # valor dinâmico (branch/tag) usam as variáveis acima; as demais são estáveis.
 # Layout plano (sem agrupamentos), aprovado para o README: MSRV, Plataforma,
 # Downloads, CI PR, CI schedule, CodeQL, Cobertura, Último commit, Codespaces,
-# Release e Issues abertas.
+# Release, Issues abertas, Gemfury (apt) e APT package.
 msrv_badge="[![MSRV](https://img.shields.io/badge/MSRV-1.85+-orange?logo=rust)](https://github.com/$REPO/blob/$default_branch/Cargo.toml)"
 platform_badge="[![Plataforma](https://img.shields.io/badge/plataforma-linux%20x86__64%20%7C%20windows%20x86__64-blue)](https://github.com/$REPO/releases/latest)"
 downloads_badge="[![Downloads](https://img.shields.io/github/downloads/$REPO/total?color=2ea44f&label=downloads)](https://github.com/$REPO/releases)"
@@ -40,6 +40,8 @@ last_commit_badge="[![Último commit](https://img.shields.io/github/last-commit/
 codespaces_badge="[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/$REPO)"
 release_badge="[![Release](https://img.shields.io/badge/release-$latest_tag-blue)](https://github.com/$REPO/releases)"
 issues_badge="[![Issues abertas](https://img.shields.io/github/issues/$REPO)](https://github.com/$REPO/issues)"
+gemfury_badge="[![Gemfury Badge](https://badge.fury.io/apt/opentorrent.svg)](https://badge.fury.io/apt/opentorrent)"
+apt_badge="[![APT Package](https://img.shields.io/badge/Debian%2FAPT-.deb-A81D33?style=flat-square&logo=debian&logoColor=white)](https://github.com/$REPO/releases/latest)"
 
 badges="
 $msrv_badge
@@ -52,7 +54,9 @@ $cov_badge
 $last_commit_badge
 $codespaces_badge
 $release_badge
-$issues_badge"
+$issues_badge
+$gemfury_badge
+$apt_badge"
 
 estado="| Estado | Valor |
 | --- | --- |

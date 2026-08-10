@@ -15,6 +15,9 @@
 .signing/
 *.sig
 
+# Credenciais do Gemfury (tokens) — nunca versionar
+gemfury.secrets.yaml
+
 # Estado local e credenciais do opencode (Spec Kit)
 .opencode/
 
