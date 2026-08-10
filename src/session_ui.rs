@@ -16,10 +16,14 @@ use crossterm::{
     style::{self, Color},
     terminal,
 };
-use librqbit::{AddTorrent, AddTorrentResponse, ManagedTorrent, Session, TorrentStatsState};
+use librqbit::{AddTorrent, ManagedTorrent, Session, TorrentStatsState};
 use tokio::sync::mpsc;
 
-use crate::downloads::{format_completed, list_completed_downloads};
+use crate::{
+    daemon,
+    downloads::{format_completed, list_completed_downloads},
+    ipc::{DaemonRequest, DaemonResponse, DaemonState},
+};
 
 /// Comandos do menu flutuante (US-031): comando e descrição funcional.
 const COMMANDS: [(&str, &str); 6] = [
@@ -96,6 +100,7 @@ struct ContextMenu {
     anchor_row: u16,
 }
 
+#[derive(Clone)]
 struct SessionRow {
     id: usize,
     name: String,
@@ -111,7 +116,9 @@ struct SessionRow {
     eta_seconds: Option<u64>,
     /// Bytes enviados (upload) acumulados na sessão (US-033).
     uploaded_bytes: u64,
-    handle: Arc<ManagedTorrent>,
+    /// Handle do torrent na sessão local (modo sem daemon/testes); `None` no
+    /// modo daemon (a TUI atua por `id` via IPC).
+    handle: Option<Arc<ManagedTorrent>>,
 }
 
 /// Status de uma origem adicionada em segundo plano (US-014).
@@ -393,7 +400,11 @@ impl Frame {
 }
 
 struct Tui {
-    session: Arc<Session>,
+    /// Sessão local do librqbit — `None` no modo daemon (US-040), quando a
+    /// fila é renderizada a partir do snapshot ocasional do socket Unix.
+    session: Option<Arc<Session>>,
+    /// Último snapshot da fila recebido do daemon (modo daemon).
+    snapshot: DaemonState,
     output_folder: PathBuf,
     view: View,
     /// Current command being typed in the title input field.
@@ -436,7 +447,34 @@ impl Tui {
         keys: mpsc::UnboundedReceiver<Event>,
     ) -> Self {
         Self {
-            session,
+            session: Some(session),
+            snapshot: DaemonState::default(),
+            output_folder,
+            view: View::Home,
+            input: String::new(),
+            menu_index: 0,
+            row_index: 0,
+            prompt_cursor: 0,
+            prompt_add_mode: false,
+            notice: None,
+            confirming_delete: None,
+            context_menu: None,
+            context_rect: None,
+            keys,
+            layout: None,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            prev_frame: None,
+            prev_cursor: None,
+            running: true,
+        }
+    }
+
+    /// Constrói a TUI no modo daemon (US-040): sem sessão local, renderizando
+    /// a partir do snapshot recebido via socket Unix.
+    fn new_daemon(output_folder: PathBuf, keys: mpsc::UnboundedReceiver<Event>) -> Self {
+        Self {
+            session: None,
+            snapshot: DaemonState::default(),
             output_folder,
             view: View::Home,
             input: String::new(),
@@ -966,8 +1004,29 @@ impl Tui {
     }
 
     fn session_rows(&self) -> Vec<SessionRow> {
+        // US-040: modo daemon → fila a partir do snapshot vinda do socket.
+        let Some(session) = &self.session else {
+            return self
+                .snapshot
+                .torrents
+                .iter()
+                .map(|t| SessionRow {
+                    id: t.id,
+                    name: t.name.clone(),
+                    state: state_from_display(&t.state),
+                    progress_bytes: t.progress_bytes,
+                    total_bytes: t.total_bytes,
+                    finished: t.finished,
+                    down_speed_mbps: t.down_speed_mbps,
+                    up_speed_mbps: t.up_speed_mbps,
+                    eta_seconds: t.eta_seconds,
+                    uploaded_bytes: t.uploaded_bytes,
+                    handle: None,
+                })
+                .collect();
+        };
         let rows = std::cell::RefCell::new(Vec::new());
-        self.session.with_torrents(|torrents| {
+        session.with_torrents(|torrents| {
             for (id, handle) in torrents {
                 let stats = handle.stats();
                 // Métricas de rede (US-033): `live` só existe na sessão Live;
@@ -994,7 +1053,7 @@ impl Tui {
                     up_speed_mbps,
                     eta_seconds,
                     uploaded_bytes: stats.uploaded_bytes,
-                    handle: handle.clone(),
+                    handle: Some(handle.clone()),
                 });
             }
         });
@@ -1003,10 +1062,46 @@ impl Tui {
         rows
     }
 
+    /// Atualiza o snapshot no modo daemon (US-040). Sem efeito no modo local.
+    async fn refresh_snapshot(&mut self) {
+        if self.session.is_some() {
+            return;
+        }
+        let mut client = match daemon::connect_client().await {
+            Ok(c) => c,
+            Err(_) => return, // daemon indisponível: mantém o último snapshot
+        };
+        if let Ok(state) = client.get_state().await {
+            self.snapshot = state;
+        }
+    }
+
+    /// Envia uma ação ao daemon (modo daemon, US-040) e retorna a mensagem de
+    /// sucesso ou o erro em `DaemonResponse::Error`.
+    async fn daemon_action(&mut self, req: DaemonRequest) -> anyhow::Result<Option<String>> {
+        let mut client = daemon::connect_client().await?;
+        match client.request(req).await? {
+            DaemonResponse::Ok { message } => Ok(Some(message)),
+            DaemonResponse::AlreadyManaged => Ok(None),
+            DaemonResponse::Error { message } => anyhow::bail!(message),
+            other => anyhow::bail!("resposta inesperada do daemon: {other:?}"),
+        }
+    }
+
     async fn pause_row(&mut self) -> anyhow::Result<()> {
         let rows = self.session_rows();
-        if let Some(row) = rows.get(self.row_index) {
-            self.session.pause(&row.handle).await?;
+        if let Some(row) = rows.get(self.row_index).cloned() {
+            match &self.session {
+                Some(session) => {
+                    if let Some(handle) = &row.handle {
+                        session.pause(handle).await?;
+                    }
+                }
+                None => {
+                    self.daemon_action(DaemonRequest::Pause { id: row.id })
+                        .await?;
+                }
+            }
             self.notice = Some(format!("pausado: {}", row.name));
         } else {
             // Linha selecionada é uma origem pendente (ainda sem handle).
@@ -1017,8 +1112,18 @@ impl Tui {
 
     async fn resume_row(&mut self) -> anyhow::Result<()> {
         let rows = self.session_rows();
-        if let Some(row) = rows.get(self.row_index) {
-            self.session.clone().unpause(&row.handle).await?;
+        if let Some(row) = rows.get(self.row_index).cloned() {
+            match &self.session {
+                Some(session) => {
+                    if let Some(handle) = &row.handle {
+                        session.clone().unpause(handle).await?;
+                    }
+                }
+                None => {
+                    self.daemon_action(DaemonRequest::Resume { id: row.id })
+                        .await?;
+                }
+            }
             self.notice = Some(format!("retomado: {}", row.name));
         } else {
             self.notice = Some("torrent em inicialização — aguarde a resolução".into());
@@ -1028,10 +1133,18 @@ impl Tui {
 
     async fn remove_row(&mut self) -> anyhow::Result<()> {
         let rows = self.session_rows();
-        if let Some(row) = rows.get(self.row_index) {
-            self.session
-                .delete(librqbit::api::TorrentIdOrHash::Id(row.id), false)
-                .await?;
+        if let Some(row) = rows.get(self.row_index).cloned() {
+            match &self.session {
+                Some(session) => {
+                    session
+                        .delete(librqbit::api::TorrentIdOrHash::Id(row.id), false)
+                        .await?;
+                }
+                None => {
+                    self.daemon_action(DaemonRequest::Stop { id: row.id })
+                        .await?;
+                }
+            }
             self.notice = Some(format!("removido da fila: {}", row.name));
         } else {
             // Origem pendente (ainda sem handle): apenas descarta a requisição.
@@ -1079,11 +1192,18 @@ impl Tui {
             DeleteTarget::Torrent { id, name } => {
                 // Erro capturado como aviso (e não propagado): uma falha ao
                 // apagar os arquivos não deve encerrar a TUI via handle_event.
-                if let Err(err) = self
-                    .session
-                    .delete(librqbit::api::TorrentIdOrHash::Id(id), true)
-                    .await
-                {
+                let result = match &self.session {
+                    Some(session) => {
+                        session
+                            .delete(librqbit::api::TorrentIdOrHash::Id(id), true)
+                            .await
+                    }
+                    None => match self.daemon_action(DaemonRequest::Delete { id }).await {
+                        Ok(_) => Ok(()),
+                        Err(err) => Err(anyhow::anyhow!(format!("{err:#}"))),
+                    },
+                };
+                if let Err(err) = result {
                     self.notice = Some(format!("falha ao excluir: {err:#}"));
                     return Ok(());
                 }
@@ -1924,6 +2044,18 @@ fn progress_color(state: TorrentStatsState, finished: bool) -> Color {
     }
 }
 
+/// Reconstrói `TorrentStatsState` a partir do `Display` serializado no
+/// snapshot do daemon (US-040). Valores desconhecidos caem para `Initializing`
+/// (renderização conservadora, sem panics).
+fn state_from_display(s: &str) -> TorrentStatsState {
+    match s {
+        "live" => TorrentStatsState::Live,
+        "paused" => TorrentStatsState::Paused,
+        "error" => TorrentStatsState::Error,
+        _ => TorrentStatsState::Initializing,
+    }
+}
+
 /// Mapeia uma linha da tela para o índice da entrada de um bloco listado
 /// (menu, diálogo ou tabela), considerando a altura ocupada por entrada
 /// (`stride` linhas; 1 = consecutivas, 2 = com divisor fino). Retorna `None`
@@ -2099,14 +2231,27 @@ fn footer_hints(
 /// Resolve e adiciona uma origem em segundo plano (US-014). Para magnet links a
 /// resolução de metadados via DHT/trackers ocorre aqui, fora da interface.
 async fn add_torrent_background(
-    session: Arc<Session>,
+    session: Option<Arc<Session>>,
     source: String,
 ) -> anyhow::Result<AddOutcome> {
     let add = AddTorrent::from_cli_argument(&source)?;
-    match session.add_torrent(add, None).await? {
-        AddTorrentResponse::Added(_, _) => Ok(AddOutcome::Added),
-        AddTorrentResponse::AlreadyManaged(_, _) => Ok(AddOutcome::AlreadyManaged),
-        _ => unreachable!("add_torrent sem list_only só retorna Added ou AlreadyManaged"),
+    match session {
+        // Modo local (sem daemon; testes): adiciona direto na sessão.
+        Some(session) => match session.add_torrent(add, None).await? {
+            librqbit::AddTorrentResponse::Added(_, _) => Ok(AddOutcome::Added),
+            librqbit::AddTorrentResponse::AlreadyManaged(_, _) => Ok(AddOutcome::AlreadyManaged),
+            _ => unreachable!("add_torrent sem list_only só retorna Added ou AlreadyManaged"),
+        },
+        // Modo daemon (US-040): delega ao daemon — dedup decidido por lá.
+        None => {
+            let mut client = daemon::connect_client().await?;
+            match client.request(DaemonRequest::Add { source }).await? {
+                DaemonResponse::Ok { .. } => Ok(AddOutcome::Added),
+                DaemonResponse::AlreadyManaged => Ok(AddOutcome::AlreadyManaged),
+                DaemonResponse::Error { message } => anyhow::bail!(message),
+                other => anyhow::bail!("resposta inesperada do daemon: {other:?}"),
+            }
+        }
     }
 }
 
@@ -2215,7 +2360,12 @@ fn key_reader(tx: mpsc::UnboundedSender<Event>) {
 }
 
 /// Run the interactive TUI. Expects the terminal to be in a clean state.
-pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> anyhow::Result<()> {
+/// `session: Some(..)` opera em uma sessão local (modo legado/testes);
+/// `session: None` é o modo daemon (US-040), renderizando via snapshot IPC.
+pub async fn run_interactive(
+    session: Option<Arc<Session>>,
+    output_folder: PathBuf,
+) -> anyhow::Result<()> {
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(
@@ -2230,7 +2380,10 @@ pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> a
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || key_reader(tx));
 
-    let mut tui = Tui::new(session, output_folder, rx);
+    let mut tui = match session {
+        Some(session) => Tui::new(session, output_folder, rx),
+        None => Tui::new_daemon(output_folder, rx),
+    };
     // Primeiro frame é desenhado imediatamente (sem esperar o orçamento).
     tui.render(&mut stdout)?;
 
@@ -2278,6 +2431,11 @@ pub async fn run_interactive(session: Arc<Session>, output_folder: PathBuf) -> a
         // Redesenha apenas se houve evento relevante ou o orçamento expirou
         // (para atualizar progresso em tempo real). Sem loop desimpedido.
         if dirty || last_frame.elapsed() >= FRAME_BUDGET {
+            // US-040 (modo daemon): atualiza o snapshot da fila antes de
+            // renderizar, mantendo o progresso ao vivo mesmo com a TUI aberta.
+            if tui.session.is_none() {
+                tui.refresh_snapshot().await;
+            }
             tui.render(&mut stdout)?;
             last_frame = Instant::now();
         }

@@ -38,7 +38,11 @@ O **OpenTorrent** é um programa em Rust que:
 - Usa **diretório padrão** `~/downloads/torrent-downloads/` quando `-o` não é
   informado;
 - Faz **retomada inteligente**: torrents já 100% baixados são reportados e
-  pulados; downloads parciais são retomados do ponto onde pararam.
+  pulados; downloads parciais são retomados do ponto onde pararam;
+- Mantém **downloads em background** quando a TUI é fechada, via um daemon que
+  pode ser gerenciado como **systemd user service** (US-040);
+- **Atualiza a si mesmo** com um único comando, parando/substituindo/religando o
+  daemon automaticamente (US-040).
 
 O motor de BitTorrent é o **librqbit** — uma implementação 100% em Rust — o que
 significa que o projeto compila e roda apenas com o ecossistema Rust, sem
@@ -77,7 +81,10 @@ opentorrent/
 ├── build.sh                # Helper de build: bump de versão, build verbose e assinatura
 ├── .devcontainer/          # Container de desenvolvimento para GitHub Codespaces (US-034)
 ├── src/
-│   ├── main.rs             # CLI (clap), sessão de download (librqbit) e checagem de versão (US-029)
+│   ├── main.rs             # CLI (clap), despacho dos modos (add/daemon/update/TUI) e checagem de versão (US-029)
+│   ├── daemon.rs           # Daemon de background + systemd user service (US-040)
+│   ├── ipc.rs              # Protocolo IPC do daemon (socket Unix + JSON) (US-040)
+│   ├── update.rs           # Atualização automática com troca do binário (US-040)
 │   ├── session_ui.rs       # TUI interativa: Header/Body/Footer, tabela, modal, mouse
 │   ├── downloads.rs        # Lógica de download e estado de arquivos no disco
 │   └── metadata.rs         # Metadados embutidos na seção .note.opentorrent do ELF
@@ -112,9 +119,10 @@ Todas as dependências são resolvidas automaticamente pelo Cargo no build.
 | `indicatif` | 0.18 | Barras de progresso e MultiProgress na UI |
 | `crossterm` | 0.29 | Captura de eventos de mouse e controle do terminal |
 | `size_format` | 1.x | Formatação de tamanhos de bytes (ex: 1.24 GiB) |
-| `reqwest` | 0.12 | Cliente HTTP para a checagem de versão/atualizações (US-029) |
+| `reqwest` | 0.12 | Cliente HTTP para a checagem de versão/atualizações (US-029/US-040) |
 | `semver` | 1.x | Comparação SemVer de versões (US-029) |
-| `serde_json` | 1.x | Leitura do `tag_name` da API de releases (US-029) |
+| `serde` | 1.x | Serialização/deserialização dos tipos do IPC do daemon (US-040) |
+| `serde_json` | 1.x | JSON do protocolo IPC do daemon e leitura do `tag_name` (US-029/US-040) |
 | `chrono` | 0.4 | Datas/horários nos registros e na sessão |
 | `tracing` | 0.1 | Log estruturado (macros `info!`, `error!`, `warn!`) |
 | `tracing-subscriber` | 0.3 | Configuração dos logs no console (filtro por nível/`RUST_LOG`) |
@@ -200,8 +208,41 @@ opentorrent --version
 
 **Para atualizar:** basta repetir o download do comando acima — o endpoint
 `/releases/latest` sempre aponta para a versão mais recente. O próprio
-`opentorrent --version` já consulta o GitHub e informa se há uma release nova
-disponível, com o comando de atualização sugerido (US-029).
+`opentorrent --version` consulta o GitHub e informa se há uma release nova
+(US-029), e o comando `opentorrent update` (US-040) automatiza a troca:
+
+```bash
+# Para, substitui o binário pela release mais recente e religa o daemon.
+opentorrent update
+```
+
+> O `update` baixa o novo binário, valida a assinatura digital (US-018) quando a
+> CA local existir em `~/.local/share/opentorrent/signing/`, e faz a troca de
+> forma atômica (temp + rename) — em caso de falha o binário atual é mantido.
+
+#### Daemon em background e service systemd
+
+O OpenTorrent mantém os downloads ativos mesmo com a TUI fechada: um **daemon**
+roda em segundo plano e a TUI conecta nele via socket Unix (US-040). Na primeira
+execução, o binário instala o **systemd user service** automaticamente:
+
+```text
+~/.config/systemd/user/opentorrent-daemon.service
+```
+
+```bash
+# Gerenciamento explícito do daemon (fallback para spawn manual sem systemd)
+opentorrent daemon install        # instala o service (idempotente; sem systemd → no-op)
+opentorrent daemon start          # inicia (systemctl --user start ou spawn)
+opentorrent daemon status         # mostra o estado (pid/socket)
+opentorrent daemon stop           # encerra (systemctl --user stop ou shutdown IPC)
+
+# O service sobrevive a logout apenas com linger (passo manual opcional):
+loginctl enable-linger "$USER"
+```
+
+> Sem systemd user disponível (ex.: containers ou distros sem user manager), o
+> `daemon start` usa o fallback de spawn desanexado — o comportamento anterior.
 
 > **Releases automáticas:** cada push na `master` que incremente a versão do
 > `Cargo.toml` publica automaticamente uma nova release (binários Linux +
@@ -288,7 +329,9 @@ opentorrent --version
 
 **Para atualizar:** repita o `Invoke-WebRequest` acima — o endpoint
 `/releases/latest` sempre aponta para a versão mais recente, e o
-`opentorrent --version` avisa quando há release nova (US-029).
+`opentorrent --version` avisa quando há release nova (US-029). No Windows o
+`daemon` e o `opentorrent update` ainda não são suportados (o daemon é Linux
+prioritariamente; o `update` baixa o binário Linux x86_64).
 
 ## Quickstart
 
@@ -308,6 +351,9 @@ opentorrent add "magnet:?xt=urn:btih:..."
 
 # 4. Acompanha a sessão interativa (menu, fila e barra de progresso com mouse)
 opentorrent
+
+# 5. Atualiza o OpenTorrent para a release mais recente (para/substitui/religa o daemon)
+opentorrent update
 ```
 
 > **No Windows (PowerShell):** troque o passo 1 por
@@ -365,6 +411,27 @@ opentorrent add ./arquivo.torrent -o videos
 # - arquivos completos → "torrent already fully downloaded", nada a fazer
 # - arquivos parciais   → "partial files found, resuming download"
 ```
+
+### Subcomando `daemon` e `update`
+
+```text
+Uso: opentorrent daemon <SUBCOMANDO>
+
+Subcomandos:
+  install   Instala o systemd user service (idempotente; sem systemd → no-op)
+  start     Inicia o daemon em background (systemctl --user start ou spawn)
+  stop      Encerra o daemon (systemctl --user stop ou shutdown via IPC)
+  status    Mostra se o daemon está rodando e o pid/socket
+
+Uso: opentorrent update
+
+  Verifica a release mais recente no GitHub, para o daemon, substitui o
+  binário (validando a assinatura US-018 se a CA local existir) e religa.
+```
+
+A TUI (`opentorrent` sem subcomando) já inicia o daemon automaticamente na
+primeira execução e instala o service systemd, então os subcomandos acima são
+opcionais — úteis para gerenciar/manter o daemon explicitamente.
 
 ### Interface interativa (TUI)
 
@@ -592,6 +659,11 @@ automatizado por `./scripts/create-new-us.sh`:
   `%USERPROFILE%`/`%APPDATA%` no Windows (o `opentorrent.exe` inicia sem depender
   da variável `$HOME`) e orientação de `PATH` para executar `opentorrent` sem o
   prefixo `.\`.
+- **US-040** — Daemon de background + deduplicação por infohash: a TUI fecha e
+  os downloads continuam (daemon via socket Unix + JSON); o daemon é instalado
+  como **systemd user service** automaticamente na primeira execução, e o
+  comando `opentorrent update` automatiza a atualização (para o service,
+  substitui o binário validando a assinatura US-018 e religa).
 
 ## Licença
 

@@ -23,16 +23,19 @@ use crossterm::{
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ByteBufOwned, ListOnlyResponse,
-    ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig, TorrentMetaV1Info,
-    TorrentStatsState, api::TorrentIdOrHash,
+    ManagedTorrent, Session, SessionOptions, TorrentMetaV1Info, TorrentStatsState,
+    api::TorrentIdOrHash,
 };
 use size_format::SizeFormatterBinary as SF;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
+mod daemon;
 mod downloads;
+mod ipc;
 mod metadata;
 mod session_ui;
+mod update;
 
 const MSG_WIDTH: u16 = 40;
 const BAR_WIDTH: u16 = 20;
@@ -63,7 +66,7 @@ fn print_line(multi: &MultiProgress, msg: &str) {
 
 /// O diretório de saída padrão quando `-o` não é informado (US-038): resolve a
 /// pasta pessoal de forma cross-platform e monta o caminho de downloads.
-fn default_output_folder() -> anyhow::Result<PathBuf> {
+pub(crate) fn default_output_folder() -> anyhow::Result<PathBuf> {
     Ok(default_output_folder_from(&home_dir()?))
 }
 
@@ -89,7 +92,7 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 
 /// Diretório de dados de configuração da aplicação (US-038): `%APPDATA%\opentorrent`
 /// no Windows e `~/.config/opentorrent` no Unix (via `dirs::config_dir()`).
-fn config_folder() -> anyhow::Result<PathBuf> {
+pub(crate) fn config_folder() -> anyhow::Result<PathBuf> {
     dirs::config_dir()
         .context("could not determine the user config directory")
         .map(|dir| dir.join("opentorrent"))
@@ -188,6 +191,11 @@ struct Opts {
     #[arg(long = "version", short = 'V')]
     check_version: bool,
 
+    /// Internal: run as the background daemon (US-040). Hidden flag used by
+    /// `opentorrent daemon start` to spawn a fully detached process.
+    #[arg(long, hide = true)]
+    daemon_headless: bool,
+
     #[command(subcommand)]
     subcommand: Option<SubCommand>,
 }
@@ -196,6 +204,29 @@ struct Opts {
 enum SubCommand {
     /// Download one or more torrents (magnet links, .torrent files or http(s) URLs).
     Add(AddOpts),
+
+    /// Manage the background daemon (US-040), which keeps downloads alive
+    /// even when the interactive UI is closed.
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonOpts,
+    },
+
+    /// Update OpenTorrent to the latest GitHub release (US-040): stops the
+    /// daemon service, replaces the binary and restarts it.
+    Update,
+}
+
+#[derive(clap::Subcommand)]
+enum DaemonOpts {
+    /// Install the systemd user service (US-040) if not present (idempotent).
+    Install,
+    /// Start the daemon in the background if it is not running.
+    Start,
+    /// Stop the running daemon.
+    Stop,
+    /// Show whether the daemon is running and where its socket is.
+    Status,
 }
 
 #[derive(Parser)]
@@ -292,7 +323,7 @@ fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 }
 
 /// URL da API de releases do GitHub usada pela checagem de versão (US-029).
-const RELEASES_LATEST_URL: &str =
+pub(crate) const RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/filhotecmail/opentorrent/releases/latest";
 
 /// US-029: `--version`/`-V` — imprime a versão instalada e consulta o
@@ -306,9 +337,9 @@ fn run_version_check() -> anyhow::Result<()> {
 
     // Falha de rede/timeout/resposta inválida (None): apenas a versão local.
     if let Some(tag) = runtime.block_on(fetch_latest_release()) {
-        if has_update(&tag, current) {
+        if update::has_update(&tag, current) {
             println!("Nova versão disponível: {tag} (atual: v{current})");
-            println!("Execute para atualizar: {}", update_command(&tag));
+            println!("Atualize com: {}", update::update_command());
         } else {
             println!("você está na versão mais recente (v{current})");
         }
@@ -318,7 +349,7 @@ fn run_version_check() -> anyhow::Result<()> {
 
 /// Busca o `tag_name` da última release publicada no GitHub, com timeout curto
 /// (máx. 3s). Retorna `None` em qualquer falha (rede, timeout, status, JSON).
-async fn fetch_latest_release() -> Option<String> {
+pub(crate) async fn fetch_latest_release() -> Option<String> {
     let client = reqwest::Client::new();
     let request = async {
         let resp = client
@@ -337,35 +368,19 @@ async fn fetch_latest_release() -> Option<String> {
         .ok()?
 }
 
-/// Comparação SemVer: `true` quando a release remota (tag, ex.: `v0.1.16`) é
-/// estritamente superior à versão instalada. Versões malformadas não contam
-/// como atualização (falha graciosa).
-fn has_update(latest_tag: &str, current: &str) -> bool {
-    let latest = latest_tag.trim_start_matches('v');
-    match (
-        semver::Version::parse(latest),
-        semver::Version::parse(current),
-    ) {
-        (Ok(a), Ok(b)) => a > b,
-        _ => false,
-    }
-}
-
-/// Comando sugerido para atualizar o binário a partir da release mais recente.
-fn update_command(tag: &str) -> String {
-    format!(
-        "curl -L -o opentorrent \
-         https://github.com/filhotecmail/opentorrent/releases/download/{tag}/opentorrent-{tag}-linux-x86_64 \
-         && chmod +x opentorrent"
-    )
-}
-
 /// Despacha o comando para o modo interativo ou para o modo aditivo. Entrypoint
 /// de rede/TUI não unit-testável → excluído da cobertura (ver `coverage_nightly`).
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run(opts: Opts, multi: MultiProgress) -> anyhow::Result<()> {
+    // US-040: modo internal do daemon headless (spawned por `daemon start`).
+    if opts.daemon_headless {
+        return daemon::run_headless(&opts).await;
+    }
+
     match opts.subcommand {
         Some(SubCommand::Add(add)) => run_add(add, multi).await,
+        Some(SubCommand::Daemon { cmd }) => daemon::run_command(&cmd).await,
+        Some(SubCommand::Update) => update::run_update().await,
         // US-009/US-010: without a subcommand, open the interactive session UI.
         None => run_interactive().await,
     }
@@ -379,23 +394,26 @@ async fn run_interactive() -> anyhow::Result<()> {
     std::fs::create_dir_all(&output_folder)
         .with_context(|| format!("error creating output folder {}", output_folder.display()))?;
 
-    // US-009 FR-001a: persiste a sessão em ~/.config/opentorrent no Unix e em
-    // %APPDATA%\opentorrent no Windows (resolução cross-platform, US-038).
-    let session_folder = config_folder()?;
-    let session_opts = SessionOptions {
-        fastresume: true,
-        persistence: Some(SessionPersistenceConfig::Json {
-            folder: Some(session_folder),
-        }),
-        // US-039: no Windows, trackers públicos de fallback (DHT bloqueado).
-        trackers: fallback_trackers(),
-        ..Default::default()
-    };
-    let session = Session::new_with_opts(output_folder.clone(), session_opts)
-        .await
-        .context("error initializing session")?;
+    // US-040: a sessão vive em um daemon de background. Na primeira execução
+    // instala o systemd user service (idempotente, sem systemd → no-op) e
+    // inicia o daemon se não estiver rodando; a TUI renderiza via snapshot IPC.
+    daemon::install_service()?;
+    if !daemon::is_running()? {
+        daemon::start()?;
+        wait_for_daemon().await?;
+    }
+    session_ui::run_interactive(None, output_folder).await
+}
 
-    session_ui::run_interactive(session, output_folder).await
+/// Aguarda o daemon abrir o socket após o spawn (poll curto, US-040).
+async fn wait_for_daemon() -> anyhow::Result<()> {
+    for _ in 0..50 {
+        if daemon::is_running()? {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("o daemon não abriu o socket a tempo")
 }
 
 /// Entrypoint de rede/TUI não unit-testável → excluído da cobertura (ver
@@ -815,32 +833,6 @@ async fn stats_printer(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn has_update_detects_newer_release() {
-        assert!(has_update("v0.1.12", "0.1.10"));
-        assert!(has_update("v0.2.0", "0.1.99"));
-    }
-
-    #[test]
-    fn has_update_false_when_equal_or_older() {
-        assert!(!has_update("v0.1.11", "0.1.11"));
-        assert!(!has_update("v0.1.10", "0.1.11"));
-    }
-
-    #[test]
-    fn has_update_ignores_malformed_versions() {
-        assert!(!has_update("not-a-version", "0.1.15"));
-        assert!(!has_update("v0.1.16", "junk"));
-        assert!(!has_update("", "0.1.15"));
-    }
-
-    #[test]
-    fn update_command_targets_release_asset() {
-        let cmd = update_command("v0.1.16");
-        assert!(cmd.contains("opentorrent-v0.1.16-linux-x86_64"));
-        assert!(cmd.contains("chmod +x opentorrent"));
-    }
 
     #[test]
     fn default_output_folder_uses_platform_downloads_dir() {
