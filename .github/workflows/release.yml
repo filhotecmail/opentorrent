@@ -63,7 +63,7 @@ jobs:
     steps:
       # No evento pull_request.closed (PR mergeado), o estado canônico é o
       # merge commit na master — não o ref sintético refs/pull/N/merge.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           fetch-depth: 0
@@ -141,7 +141,7 @@ jobs:
       commitish: ${{ steps.commitish.outputs.commitish }}
       exists: ${{ steps.exists.outputs.exists }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           fetch-depth: 0
@@ -205,7 +205,7 @@ jobs:
     if: needs.check.outputs.exists == 'false'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           fetch-depth: 0
@@ -239,7 +239,7 @@ jobs:
       # AC-1: checkout com o hash exato do commit disparado (fetch-depth 0). No
       # pull_request.closed o github.sha é o ref sintético do merge — usamos o
       # merge_commit_sha na master.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           fetch-depth: 0
