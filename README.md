@@ -8,6 +8,7 @@
 [![CI schedule](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/filhotecmail/opentorrent/actions/workflows/codeql.yml/badge.svg?branch=master)](https://github.com/filhotecmail/opentorrent/security/code-scanning)
 [![Cobertura](https://codecov.io/gh/filhotecmail/opentorrent/branch/master/graph/badge.svg)](https://codecov.io/gh/filhotecmail/opentorrent)
+[![Auto Merge](https://github.com/filhotecmail/opentorrent/actions/workflows/auto-merge.yml/badge.svg)](https://github.com/filhotecmail/opentorrent/actions/workflows/auto-merge.yml)
 [![Último commit](https://img.shields.io/github/last-commit/filhotecmail/opentorrent/master)](https://github.com/filhotecmail/opentorrent/commits/master)
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/filhotecmail/opentorrent)
 [![Release](https://img.shields.io/badge/release-v0.1.26-blue)](https://github.com/filhotecmail/opentorrent/releases)
@@ -50,7 +51,7 @@ dependências externas de runtime.
 | Branch principal | `master` |
 | Última release | `v0.1.26` |
 | Milestone atual | v1.0 |
-| Issues abertas | 1 |
+| Issues abertas | 0 |
 | Labels do projeto | 19 |
 <!-- ESTADO_END -->
 
@@ -58,7 +59,7 @@ dependências externas de runtime.
 | Metadado | Valor |
 | --- | --- |
 | Pacote | `opentorrent` |
-| Versão | `0.1.26` |
+| Versão | `0.1.27` |
 | Edição Rust | 2024 |
 <!-- CARGO_END -->
 
