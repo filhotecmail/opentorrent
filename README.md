@@ -131,6 +131,19 @@ Necessárias apenas para **compilar** (gerar o binário):
 
 ### Linux (Ubuntu)
 
+#### Instalar via apt (repositório Gemfury)
+
+O pipeline de release publica o pacote `.deb` no repositório apt gerenciado
+pelo Gemfury. Para instalar com o gerenciador de pacotes:
+
+```bash
+echo "deb [trusted=yes] https://apt.fury.io/cads2509/ /" | sudo tee /etc/apt/sources.list.d/opentorrent.list
+sudo apt update
+sudo apt install opentorrent
+```
+
+> O repositório Gemfury não é assinado com GPG — por isso o `[trusted=yes]`.
+
 #### Instalar a partir do Release (recomendado)
 
 Cada release do GitHub publica o binário compilado para **Linux x86_64**. Para

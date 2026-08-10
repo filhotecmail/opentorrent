@@ -299,6 +299,36 @@ jobs:
           cp target/release/opentorrent.sig "dist/opentorrent-linux-x86_64.sig"
           ls -lh dist
 
+      # Gemfury (apt): gera o pacote .deb com cargo-deb e o publica no
+      # repositório apt gerenciado, habilitando `sudo apt install opentorrent`
+      # sem passar pelo GitHub Releases. O upload usa o CLI oficial do Gemfury
+      # (binário Go pré-compilado) com o push token guardado em secret.
+      - name: Instalar CLI do Gemfury
+        run: |
+          curl -sSfL -o /tmp/fury.tar.gz \
+            https://github.com/gemfury/cli/releases/download/v0.23.0/fury-cli_0.23.0_Linux_x86_64.tar.gz
+          tar xzf /tmp/fury.tar.gz -C /usr/local/bin fury
+          fury --version
+
+      - name: Empacotar pacote .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb
+          cp target/debian/*.deb dist/
+          ls -lh dist/*.deb
+
+      - name: Publicar .deb no Gemfury
+        env:
+          FURY_ACCOUNT: ${{ secrets.FURY_ACCOUNT }}
+          FURY_TOKEN: ${{ secrets.FURY_TOKEN }}
+        run: |
+          if [[ -z "$FURY_TOKEN" || -z "$FURY_ACCOUNT" ]]; then
+            echo "FURY_ACCOUNT/FURY_TOKEN não configurados — pulando publicação no Gemfury."
+            exit 0
+          fi
+          DEB="$(ls target/debian/*.deb | head -n 1)"
+          fury push "$DEB" -a "$FURY_ACCOUNT" --api-token "$FURY_TOKEN" 2>&1 | tail -n 1
+
       - name: Publicar release
         uses: softprops/action-gh-release@v3
         with:
@@ -309,7 +339,15 @@ jobs:
             Release gerado automaticamente pelo pipeline de CI/CD (US-030) a
             partir do commit `${{ needs.check.outputs.commitish }}` na master.
 
-            Instalação (Ubuntu):
+            Instalação (Ubuntu — apt via Gemfury):
+
+            ```bash
+            echo "deb [trusted=yes] https://apt.fury.io/cads2509/ /" | sudo tee /etc/apt/sources.list.d/opentorrent.list
+            sudo apt update
+            sudo apt install opentorrent
+            ```
+
+            Instalação (Ubuntu — binário direto):
 
             ```bash
             curl -L -o opentorrent https://github.com/filhotecmail/opentorrent/releases/latest/download/opentorrent-linux-x86_64
