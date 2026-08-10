@@ -10,7 +10,7 @@
 [![Cobertura](https://codecov.io/gh/filhotecmail/opentorrent/branch/master/graph/badge.svg)](https://codecov.io/gh/filhotecmail/opentorrent)
 [![Último commit](https://img.shields.io/github/last-commit/filhotecmail/opentorrent/master)](https://github.com/filhotecmail/opentorrent/commits/master)
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/filhotecmail/opentorrent)
-[![Release](https://img.shields.io/badge/release-v0.1.29-blue)](https://github.com/filhotecmail/opentorrent/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.30-blue)](https://github.com/filhotecmail/opentorrent/releases)
 [![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
 [![Gemfury Badge](https://badge.fury.io/apt/opentorrent.svg)](https://badge.fury.io/apt/opentorrent)
 [![APT Package](https://img.shields.io/badge/Debian%2FAPT-.deb-A81D33?style=flat-square&logo=debian&logoColor=white)](https://github.com/filhotecmail/opentorrent/releases/latest)
@@ -50,9 +50,9 @@ dependências externas de runtime.
 | Estado | Valor |
 | --- | --- |
 | Branch principal | `master` |
-| Última release | `v0.1.29` |
+| Última release | `v0.1.30` |
 | Milestone atual | v1.0 |
-| Issues abertas | 0 |
+| Issues abertas | 1 |
 | Labels do projeto | 19 |
 <!-- ESTADO_END -->
 
