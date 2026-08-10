@@ -51,7 +51,7 @@ dependências externas de runtime.
 | Branch principal | `master` |
 | Última release | `v0.1.30` |
 | Milestone atual | v1.0 |
-| Issues abertas | 0 |
+| Issues abertas | 1 |
 | Labels do projeto | 19 |
 <!-- ESTADO_END -->
 
@@ -59,7 +59,7 @@ dependências externas de runtime.
 | Metadado | Valor |
 | --- | --- |
 | Pacote | `opentorrent` |
-| Versão | `0.1.30` |
+| Versão | `0.1.31` |
 | Edição Rust | 2024 |
 <!-- CARGO_END -->
 
