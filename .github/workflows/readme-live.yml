@@ -40,8 +40,9 @@ jobs:
         run: bash scripts/update-readme.sh
 
       # A branch master é protegida (exige PR), então o push direto é
-      # rejeitado. Em vez disso, abre (ou atualiza) um PR que aguarda a
-      # aprovação manual do dono (workflow Aprovar PR) para ser mergeado.
+      # rejeitado. Em vez disso, abre um PR que aguarda a aprovação manual do
+      # dono (workflow Aprovar PR) para ser mergeado. O branch usa timestamp
+      # para nunca reutilizar um PR já mergeado do branch antigo.
       - name: Abrir PR com as mudanças do README
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,18 +55,11 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add README.md
           git commit -m "docs: atualiza README com estado atual do projeto (auto)"
-          BRANCH="docs/readme-live-update"
-          git push -f origin "HEAD:$BRANCH"
+          BRANCH="docs/readme-live-update-$(date +%Y%m%d-%H%M%S)"
+          git push origin "HEAD:$BRANCH"
           TITLE="docs: atualiza README com estado do projeto (auto)"
           BODY="Atualização automática do README (badges, estado do projeto e metadados) pelo workflow README vivo."
-          PR_NUM="$(gh pr view "$BRANCH" --json number --jq .number 2>/dev/null || true)"
-          if [[ -n "$PR_NUM" ]]; then
-            gh pr edit "$PR_NUM" --title "$TITLE" --body "$BODY"
-            gh pr ready "$PR_NUM" 2>/dev/null || true
-          else
-            # gh pr create imprime a URL do PR no stdout; o número é o último segmento.
-            PR_URL="$(gh pr create --base master --head "$BRANCH" --title "$TITLE" --body "$BODY")"
-            PR_NUM="$(basename "$PR_URL")"
-          fi
+          PR_URL="$(gh pr create --base master --head "$BRANCH" --title "$TITLE" --body "$BODY")"
+          PR_NUM="$(basename "$PR_URL")"
           # Sem auto-merge: aguarda a aprovação manual do dono (workflow Aprovar PR).
           echo "PR #$PR_NUM aberto — aguardando aprovação manual do dono."

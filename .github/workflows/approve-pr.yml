@@ -173,20 +173,14 @@ jobs:
           echo "README desatualizado — abrindo PR de atualização."
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git branch -D docs/readme-live-update 2>/dev/null || true
-          git checkout -b docs/readme-live-update
+          BRANCH="docs/readme-live-update-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
           git add README.md
           git commit -m "docs: atualiza README com versão publicada (após aprovação)"
-          git push -f origin "HEAD:docs/readme-live-update"
+          git push origin "HEAD:$BRANCH"
           TITLE="docs: atualiza README com versão publicada"
           BODY="Atualização do README (área de versão) após aprovação manual e publicação de release."
-          PR="$(gh pr view docs/readme-live-update --json number --jq .number 2>/dev/null || true)"
-          if [[ -z "$PR" ]]; then
-            PR="$(gh pr create --base master --head docs/readme-live-update --title "$TITLE" --body "$BODY" --json number --jq .number)"
-          else
-            gh pr edit "$PR" --title "$TITLE" --body "$BODY"
-            gh pr ready "$PR" 2>/dev/null || true
-          fi
+          PR="$(gh pr create --base master --head "$BRANCH" --title "$TITLE" --body "$BODY" --json number --jq .number)"
           echo "PR de README #$PR aberto — aguardando CI para merge."
           for _ in $(seq 1 120); do
             if [[ "$(gh pr view "$PR" --json merged --jq .merged)" == "true" ]]; then
