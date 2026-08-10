@@ -283,7 +283,7 @@ jobs:
       # AC-4: artefatos com nome estável (instalação via /releases/latest) e
       # nome versionado (rastreabilidade exata da versão), ambos com .sig.
       # Primeiro agrega o .exe do Windows compilado no job `windows`.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-release
           path: dist
