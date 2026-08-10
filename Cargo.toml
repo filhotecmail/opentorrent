@@ -7,6 +7,13 @@ description = "Terminal CLI to download torrents and magnet links"
 license = "MIT"
 repository = "https://github.com/filhotecmail/opentorrent"
 
+# `coverage_nightly` é um cfg custom definido apenas no job de cobertura
+# (coverage.yml) para habilitar `#[coverage(off)]` em entrypoints de rede/TUI
+# que não são unit-testáveis. `coverage` é um cfg bem-conhecido do rustc
+# (instrument-coverage), declarado aqui para silenciar o `unexpected_cfgs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage, coverage_nightly)"] }
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -23,6 +30,7 @@ size_format = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5.8"
 
 [profile.dev]
 debug = 0

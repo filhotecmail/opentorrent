@@ -15,23 +15,34 @@ env:
 
 jobs:
   coverage:
-    name: Cobertura de código (cargo tarpaulin)
+    name: Cobertura de código (cargo llvm-cov)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      # US-039/coverage: toolchain nightly para `#[coverage(off)]`
+      # (`feature(coverage_attribute)`), ativado via cfg `coverage_nightly`.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Instalar dependências de sistema
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev mold
 
-      - name: Instalar cargo-tarpaulin
-        uses: taiki-e/install-action@cargo-tarpaulin
+      - name: Instalar cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
+      # `coverage_nightly` habilita `#[coverage(off)]` nos entrypoints de
+      # rede/TUI (src/main.rs, src/session_ui.rs) — excluídos da medição pois
+      # exigem uma Session real e não são unit-testáveis.
       - name: Medir cobertura
-        run: cargo tarpaulin --engine llvm --out Xml --output-dir ./coverage --all-targets
+        env:
+          RUSTFLAGS: "--cfg coverage_nightly"
+        run: |
+          mkdir -p ./coverage
+          cargo llvm-cov --all-targets --cobertura --output-path ./coverage/cobertura.xml
 
       - name: Subir relatório de cobertura (artefato)
         uses: actions/upload-artifact@v7

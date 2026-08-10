@@ -5,14 +5,18 @@ name: Release
 # validação pré-publicação da versão e artefatos com nome estável para a
 # instalação via /releases/latest.
 #
+# Bump automático (US-030b): a cada merge na master que toca o código/versão,
+# se a release da versão atual já existir (merge sem bump), o job `bump` abre um
+# PR com bump de versão patch e auto-merge. Quando esse PR é mergeado, o próprio
+# pipeline detecta a release ainda não publicada e segue para a publicação —
+# gerando release para cada merge de código.
+#
 # Disparos:
-#   - push de tag `v*`          → publica com a própria tag.
-#   - push na branch master     → publica usando a versão do Cargo.toml como
-#                                 tag (`vA.B.C`), desde que essa release ainda
-#                                 não exista (evita duplicatas em pushes sem
-#                                 bump de versão).
+#   - push de tag `v*`          → publica com a própria tag (idempotente).
+#   - push na branch master     → decide entre bump de versão, release ou skip
+#                                 (ver job `bump`).
 #   - workflow_dispatch         → publica com a tag informada (ou, se vazia,
-#                                 com a versão do Cargo.toml).
+#                                 com a versão do Cargo.toml), sem bump.
 
 on:
   push:
@@ -26,6 +30,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -35,9 +40,86 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Bump automático de versão patch: decide o fluxo desta execução. O output
+  # `proceed` controla os jobs de release:
+  #   - `release` → a release da versão atual ainda não existe (ou é tag push /
+  #                 dispatch manual); segue o pipeline.
+  #   - `bump`    → merge na master sem bump (release da versão atual já
+  #                 publicada): abre PR de bump com auto-merge; release é
+  #                 publicada quando esse PR for mergeado.
+  #   - `skip`    → push sem mudanças relevantes (ex.: README do readme-live);
+  #                 nada é feito (evita bump/release em cascata).
+  bump:
+    name: Bump automático de versão
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Decidir fluxo (release | bump | skip)
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Tag push ou dispatch manual: fluxo de release (sem bump).
+          if [[ "${{ github.ref_type }}" == "tag" ]] || [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "proceed=release" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Push na master: ignora merges que não tocam o código (ex.: README do
+          # readme-live) — evita bump/release em cascata a cada atualização.
+          FILES="$(printf '%s' '${{ toJson(github.event.commits) }}' | jq -r '[.[].added[]?, .[].modified[]?, .[].removed[]?] | unique[]' 2>/dev/null || true)"
+          RELEVANT="$(printf '%s\n' "$FILES" | grep -E '^(src/|Cargo\.toml|Cargo\.lock|\.github/|scripts/|build\.sh)' || true)"
+          if [[ -z "$RELEVANT" ]]; then
+            echo "Push sem mudanças relevantes (código/versão) — pulando."
+            echo "proceed=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VER="$(awk -F'=' '/^version/ {gsub(/[" ]/,"",$2); print $2; exit}' Cargo.toml)"
+          TAG="v${VER}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG já publicada — merge sem bump; abrindo PR de bump de versão."
+            IFS=. read -r major minor patch <<< "$VER"
+            NEXT="$major.$minor.$((patch + 1))"
+            sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$NEXT\"/" Cargo.toml
+            cargo update -p opentorrent
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            BRANCH="chore/bump-version-$NEXT"
+            git checkout -b "$BRANCH"
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore: bump versão para $NEXT (automático)"
+            git push -f origin "HEAD:$BRANCH"
+            TITLE="chore: bump versão para $NEXT"
+            BODY="Bump automático de versão patch (pipeline US-030) após merge na master. A release $NEXT é publicada automaticamente quando este PR é mergeado."
+            PR_NUM="$(gh pr view "$BRANCH" --json number --jq .number 2>/dev/null || true)"
+            if [[ -n "$PR_NUM" ]]; then
+              gh pr edit "$PR_NUM" --title "$TITLE" --body "$BODY"
+              gh pr ready "$PR_NUM" 2>/dev/null || true
+            else
+              gh pr create --base master --head "$BRANCH" --title "$TITLE" --body "$BODY" >/dev/null
+              PR_NUM="$(gh pr view "$BRANCH" --json number --jq .number)"
+            fi
+            # Auto-merge (squash): mergeado assim que o CI passar.
+            gh pr merge "$PR_NUM" --auto --squash || echo "aviso: auto-merge não habilitado (PR #$PR_NUM aberto)"
+            echo "proceed=bump" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG ainda não publicada — seguindo para o release."
+            echo "proceed=release" >> "$GITHUB_OUTPUT"
+          fi
+
   # Determina a tag do release e se ela já existe (guarda anti-duplicata).
   check:
     name: Determinar tag do release
+    needs: bump
+    if: needs.bump.outputs.proceed == 'release'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
@@ -67,21 +149,22 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release alvo: $TAG (commit ${{ github.sha }})"
 
-      # Push de tag ou dispatch manual: publica sempre (intenção explícita).
-      # Push na master: pula se a release já existir (ex.: push sem bump).
-      # GH_TOKEN é necessário para o `gh` CLI autenticar no runner.
+      # Dispatch manual com tag: intenção explícita → publica sempre.
+      # Demais casos (push na master ou push de tag): pula se a release já
+      # existir — idempotente e evita republicar a tag gerada pelo próprio
+      # fluxo de release (que dispara um novo push de tag).
       - name: Verificar se a release já existe
         id: exists
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
-          if [[ "${{ github.ref_type }}" == "tag" ]] || [[ -n "${{ inputs.tag }}" ]]; then
+          if [[ -n "${{ inputs.tag }}" ]]; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "Release $TAG já publicada — pulando (push na master sem bump de versão)."
+            echo "Release $TAG já publicada — pulando."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
