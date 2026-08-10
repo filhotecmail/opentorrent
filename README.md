@@ -58,7 +58,7 @@ dependências externas de runtime.
 | Metadado | Valor |
 | --- | --- |
 | Pacote | `opentorrent` |
-| Versão | `0.1.29` |
+| Versão | `0.1.30` |
 | Edição Rust | 2024 |
 <!-- CARGO_END -->
 
