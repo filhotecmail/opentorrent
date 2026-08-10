@@ -40,7 +40,9 @@ jobs:
       - name: Medir cobertura
         env:
           RUSTFLAGS: "--cfg coverage_nightly"
-        run: cargo llvm-cov --all-targets --cobertura --output-path ./coverage/cobertura.xml
+        run: |
+          mkdir -p ./coverage
+          cargo llvm-cov --all-targets --cobertura --output-path ./coverage/cobertura.xml
 
       - name: Subir relatório de cobertura (artefato)
         uses: actions/upload-artifact@v7
