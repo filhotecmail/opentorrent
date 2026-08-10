@@ -13,7 +13,6 @@
 [![Release](https://img.shields.io/badge/release-v0.1.31-blue)](https://github.com/filhotecmail/opentorrent/releases)
 [![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
 [![APT Package](https://img.shields.io/badge/Debian%2FAPT-.deb-A81D33?style=flat-square&logo=debian&logoColor=white)](https://github.com/filhotecmail/opentorrent/releases/latest)
-[![Built with Rust](https://img.shields.io/badge/Built_with-Rust-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 <!-- BADGES_END -->
 
 Um cliente BitTorrent de **linha de comando (CLI)** para **Linux/Ubuntu e
