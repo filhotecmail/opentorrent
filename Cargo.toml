@@ -49,3 +49,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[package.metadata.deb]
+maintainer = "FilhoTec <filhotecmail@gmail.com>"
