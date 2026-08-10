@@ -13,15 +13,20 @@ name: Release
 #
 # Disparos:
 #   - push de tag `v*`          → publica com a própria tag (idempotente).
-#   - push na branch master     → decide entre bump de versão, release ou skip
-#                                 (ver job `bump`).
+#   - PR mergeado na master     → decide entre bump de versão, release ou skip
+#                                 (ver job `bump`). Usamos `pull_request: closed`
+#                                 em vez de `push` na master porque merges feitos
+#                                 pelo auto-merge nativo (via GITHUB_TOKEN) não
+#                                 disparam workflows de `push`.
 #   - workflow_dispatch         → publica com a tag informada (ou, se vazia,
 #                                 com a versão do Cargo.toml), sem bump.
 
 on:
   push:
     tags: ["v*"]
+  pull_request:
     branches: [master]
+    types: [closed]
   workflow_dispatch:
     inputs:
       tag:
@@ -47,15 +52,20 @@ jobs:
   #   - `bump`    → merge na master sem bump (release da versão atual já
   #                 publicada): abre PR de bump com auto-merge; release é
   #                 publicada quando esse PR for mergeado.
-  #   - `skip`    → push sem mudanças relevantes (ex.: README do readme-live);
-  #                 nada é feito (evita bump/release em cascata).
+  #   - `skip`    → PR mergeado sem mudanças relevantes (ex.: README) ou PR
+  #                 fechado sem merge; nada é feito.
   bump:
     name: Bump automático de versão
     runs-on: ubuntu-latest
     outputs:
       proceed: ${{ steps.decide.outputs.proceed }}
     steps:
+      # No evento pull_request.closed (PR mergeado), o estado canônico é o
+      # merge commit na master — não o ref sintético refs/pull/N/merge.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -72,24 +82,22 @@ jobs:
             exit 0
           fi
 
-          # Push na master: ignora merges que não tocam o código (ex.: README do
-          # readme-live) — evita bump/release em cascata a cada atualização.
-          # Relevância é decidida por git diff entre o commit anterior (before) e
-          # o HEAD: o webhook nem sempre inclui os arrays added/modified/removed
-          # (merges squash via API), então não confiamos neles.
-          BEFORE="${{ github.event.before }}"
-          if [[ "$BEFORE" =~ ^0+$ ]]; then
-            RELEVANT="yes"
-          else
-            git fetch --quiet --depth=1 origin "$BEFORE" || true
-            if git diff --name-only "$BEFORE" HEAD | grep -qE '^(src/|Cargo\.toml|Cargo\.lock|\.github/|scripts/|build\.sh)'; then
-              RELEVANT="yes"
-            else
-              RELEVANT=""
-            fi
+          # PR fechado sem merge: nada a fazer.
+          if [[ "${{ github.event.pull_request.merged }}" != "true" ]]; then
+            echo "PR fechado sem merge — pulando."
+            echo "proceed=skip" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          # PR mergeado na master: ignora merges que não tocam o código/versão
+          # (ex.: README) — evita bump/release em cascata. A relevância vem dos
+          # arquivos alterados do próprio PR (não confiamos nos arrays de commit
+          # do webhook, que o auto-merge omite).
+          PR_NUM="${{ github.event.pull_request.number }}"
+          FILES="$(gh api "repos/${{ github.repository }}/pulls/$PR_NUM/files?per_page=100" --jq '.[].filename' 2>/dev/null || true)"
+          RELEVANT="$(printf '%s\n' "$FILES" | grep -E '^(src/|Cargo\.toml|Cargo\.lock|\.github/|scripts/|build\.sh)' || true)"
           if [[ -z "$RELEVANT" ]]; then
-            echo "Push sem mudanças relevantes (código/versão) — pulando."
+            echo "PR #$PR_NUM sem mudanças relevantes (código/versão) — pulando."
             echo "proceed=skip" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -135,10 +143,12 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      commitish: ${{ steps.commitish.outputs.commitish }}
       exists: ${{ steps.exists.outputs.exists }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           fetch-depth: 0
 
       - name: Definir tag do release
@@ -149,7 +159,7 @@ jobs:
           elif [[ "${{ github.ref_type }}" == "tag" ]]; then
             TAG="${{ github.ref_name }}"
           else
-            # Push na master: usa a versão do Cargo.toml como tag.
+            # PR mergeado na master: usa a versão do Cargo.toml como tag.
             PKG_VER="$(awk -F'=' '/^version/ {gsub(/[" ]/,"",$2); print $2; exit}' Cargo.toml)"
             TAG="v${PKG_VER}"
             echo "Versão do Cargo.toml: $PKG_VER"
@@ -159,10 +169,19 @@ jobs:
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release alvo: $TAG (commit ${{ github.sha }})"
+          echo "Release alvo: $TAG"
+
+      # Commit alvo da publicação: no pull_request.closed o github.sha é o ref
+      # sintético do merge, não o commit na master.
+      - name: Definir commit de publicação
+        id: commitish
+        run: |
+          SHA="${{ github.event.pull_request.merge_commit_sha || github.sha }}"
+          echo "commitish=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Commit alvo: $SHA"
 
       # Dispatch manual com tag: intenção explícita → publica sempre.
-      # Demais casos (push na master ou push de tag): pula se a release já
+      # Demais casos (PR mergeado na master ou push de tag): pula se a release já
       # existir — idempotente e evita republicar a tag gerada pelo próprio
       # fluxo de release (que dispara um novo push de tag).
       - name: Verificar se a release já existe
@@ -193,6 +212,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
@@ -221,9 +241,12 @@ jobs:
     if: needs.check.outputs.exists == 'false'
     runs-on: ubuntu-latest
     steps:
-      # AC-1: checkout com o hash exato da tag/branch disparada (fetch-depth 0).
+      # AC-1: checkout com o hash exato do commit disparado (fetch-depth 0). No
+      # pull_request.closed o github.sha é o ref sintético do merge — usamos o
+      # merge_commit_sha na master.
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
@@ -285,11 +308,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check.outputs.tag }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ needs.check.outputs.commitish }}
           name: OpenTorrent ${{ needs.check.outputs.tag }}
           body: |
             Release gerado automaticamente pelo pipeline de CI/CD (US-030) a
-            partir do commit `${{ github.sha }}` (${{ github.ref_name }}).
+            partir do commit `${{ needs.check.outputs.commitish }}` na master.
 
             Instalação (Ubuntu):
 
