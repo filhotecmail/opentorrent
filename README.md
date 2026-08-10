@@ -8,7 +8,6 @@
 [![CI schedule](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/filhotecmail/opentorrent/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/filhotecmail/opentorrent/actions/workflows/codeql.yml/badge.svg?branch=master)](https://github.com/filhotecmail/opentorrent/security/code-scanning)
 [![Cobertura](https://codecov.io/gh/filhotecmail/opentorrent/branch/master/graph/badge.svg)](https://codecov.io/gh/filhotecmail/opentorrent)
-[![Auto Merge](https://github.com/filhotecmail/opentorrent/actions/workflows/auto-merge.yml/badge.svg)](https://github.com/filhotecmail/opentorrent/actions/workflows/auto-merge.yml)
 [![Último commit](https://img.shields.io/github/last-commit/filhotecmail/opentorrent/master)](https://github.com/filhotecmail/opentorrent/commits/master)
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/filhotecmail/opentorrent)
 [![Release](https://img.shields.io/badge/release-v0.1.26-blue)](https://github.com/filhotecmail/opentorrent/releases)
@@ -83,7 +82,7 @@ opentorrent/
 │   └── us-pipeline.sh      # Automação do pipeline de US (start/finish/state) — US-017
 ├── specs/                  # Especificações das user stories (specs/001 a specs/018)
 ├── .github/
-│   └── workflows/          # CI, CodeQL, Release (US-030), README vivo, auto-merge, notificações
+│   └── workflows/          # CI, CodeQL, Release (US-030), README vivo, notificações
 ├── .cargo/config.toml      # Linker mold (linkagem rápida em dev)
 ├── .gitignore              # Arquivos/pastas que não entram no repositório
 └── README.md               # Este arquivo
