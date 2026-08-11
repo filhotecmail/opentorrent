@@ -1405,9 +1405,14 @@ impl Tui {
 
         let body_top = 1u16;
         // US-041: o Body cede as linhas da área inferior (Card no estilo
-        // Elevated; apenas o footer no Legacy).
+        // Elevated; apenas o footer no Legacy). A subtração extra de 1 linha
+        // garante um respiro entre o último painel e o topo do Card (evita o
+        // grid de Histórico deslizando por trás do card footer).
         let geometry = ui_bottom::bottom_geometry(self.bottom_style, rows);
-        let body_height = rows.saturating_sub(geometry.reserved).max(1);
+        let body_height = rows
+            .saturating_sub(geometry.reserved)
+            .saturating_sub(1)
+            .max(1);
         match self.view {
             View::Home => self.render_home(&mut frame, cols, body_top, body_height),
             View::Menu => self.render_menu(&mut frame, cols, body_top, body_height),
@@ -1818,6 +1823,12 @@ impl Tui {
                 };
                 ui_bottom::render_input_card(frame, cols, geometry.input_row, &data, focused);
                 ui_bottom::render_badges_row(frame, cols, geometry.badges_row, &data, focused);
+                ui_bottom::render_gap_row(
+                    frame,
+                    cols,
+                    geometry.edge_row.saturating_sub(1),
+                    focused,
+                );
                 ui_bottom::render_edge_row(frame, cols, geometry.edge_row);
             }
             BottomStyle::Legacy => {

@@ -188,6 +188,28 @@ pub fn render_badges_row(frame: &mut Frame, cols: u16, row: u16, data: &BottomDa
     }
 }
 
+/// Linha de respiro do Card (US-042): fundo do Card com o acento `▌` à
+/// esquerda, dando altura extra ao card sem conteúdo adicional.
+pub fn render_gap_row(frame: &mut Frame, cols: u16, row: u16, focused: bool) {
+    if row >= frame.rows {
+        return;
+    }
+    let accent = if focused {
+        THEME.card_accent_active
+    } else {
+        THEME.card_accent_idle
+    };
+    frame.put_styled(row, 0, ACCENT_BLOCK, Some(accent), Some(THEME.card_bg));
+    frame.fill(
+        row,
+        1,
+        cols.saturating_sub(1),
+        ' ',
+        None,
+        Some(THEME.card_bg),
+    );
+}
+
 /// Borda inferior do Card (US-042): canto `╹` + `▀` na cor do Card sobre o
 /// fundo base, reproduzindo o efeito de elevação do opencode.
 pub fn render_edge_row(frame: &mut Frame, cols: u16, row: u16) {
@@ -205,7 +227,8 @@ pub fn render_edge_row(frame: &mut Frame, cols: u16, row: u16) {
     );
 }
 
-/// Configura o terminal para a área inferior (alternate screen, raw mode).
+/// Calcula as linhas absolutas da área inferior conforme o estilo e o total de
+/// linhas do terminal. `rows.min(4)` evita underflow em terminais minúsculos.
 pub fn bottom_geometry(style: BottomStyle, rows: u16) -> BottomGeometry {
     match style {
         BottomStyle::Legacy => BottomGeometry {
@@ -214,15 +237,16 @@ pub fn bottom_geometry(style: BottomStyle, rows: u16) -> BottomGeometry {
             edge_row: rows.saturating_sub(2),
             reserved: 1,
         },
-        // US-042: Card com 3 linhas (input + badges + borda inferior) no fim da
-        // tela, isolado no render como `Length(3)`. Sem barra externa.
+        // US-042: Card com 4 linhas (input + badges + linha de respiro + borda
+        // inferior) no fim da tela, isolado no render como `Length(4)`. Sem
+        // barra externa.
         BottomStyle::Elevated => {
-            let input_row = rows.saturating_sub(3);
+            let input_row = rows.saturating_sub(4);
             BottomGeometry {
                 input_row,
-                badges_row: rows.saturating_sub(2),
+                badges_row: rows.saturating_sub(3),
                 edge_row: rows.saturating_sub(1),
-                reserved: 3,
+                reserved: 4,
             }
         }
     }
@@ -254,11 +278,11 @@ mod tests {
     }
 
     #[test]
-    fn geometry_elevated_reserves_three_rows() {
+    fn geometry_elevated_reserves_four_rows() {
         let g = bottom_geometry(BottomStyle::Elevated, 24);
-        assert_eq!(g.reserved, 3);
-        assert_eq!(g.input_row, 21);
-        assert_eq!(g.badges_row, 22);
+        assert_eq!(g.reserved, 4);
+        assert_eq!(g.input_row, 20);
+        assert_eq!(g.badges_row, 21);
         assert_eq!(g.edge_row, 23);
     }
 
@@ -268,6 +292,16 @@ mod tests {
         assert_eq!(g.reserved, 1);
         assert_eq!(g.input_row, 22);
         assert_eq!(g.edge_row, 22);
+    }
+
+    #[test]
+    fn gap_row_draws_card_background_with_accent() {
+        let mut frame = Frame::new(80, 3);
+        render_gap_row(&mut frame, 80, 1, true);
+        assert_eq!(frame.cell(1, 0).ch(), '▌');
+        assert_eq!(frame.cell(1, 0).fg(), Some(THEME.card_accent_active));
+        assert_eq!(frame.cell(1, 79).bg, Some(THEME.card_bg));
+        assert_eq!(frame.cell(1, 1).ch(), ' ');
     }
 
     #[test]
