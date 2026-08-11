@@ -10,13 +10,9 @@
 [![Cobertura](https://codecov.io/gh/filhotecmail/opentorrent/branch/master/graph/badge.svg)](https://codecov.io/gh/filhotecmail/opentorrent)
 [![Último commit](https://img.shields.io/github/last-commit/filhotecmail/opentorrent/master)](https://github.com/filhotecmail/opentorrent/commits/master)
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/filhotecmail/opentorrent)
-[![Release](https://img.shields.io/badge/release-v0.1.39-blue)](https://github.com/filhotecmail/opentorrent/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.31-blue)](https://github.com/filhotecmail/opentorrent/releases)
 [![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
 [![APT Package](https://img.shields.io/badge/Debian%2FAPT-.deb-A81D33?style=flat-square&logo=debian&logoColor=white)](https://github.com/filhotecmail/opentorrent/releases/latest)
-[![Built with Rust](https://img.shields.io/badge/Built_with-Rust-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Interface: TUI](https://img.shields.io/badge/Interface-TUI-8A2BE2?style=flat-square&logo=gnu-terminal&logoColor=white)](https://github.com/seu-usuario/opentorrent)
-[![CLI Application](https://img.shields.io/badge/Type-CLI-000000?style=flat-square&logo=windows-terminal&logoColor=white)](https://github.com/seu-usuario/opentorrent)
-[![PowerShell Supported](https://img.shields.io/badge/PowerShell-v5.1%20%7C%20v7%2B-5391FE?style=flat-square&logo=powershell&logoColor=white)](https://microsoft.com/powershell)
 <!-- BADGES_END -->
 
 Um cliente BitTorrent de **linha de comando (CLI)** para **Linux/Ubuntu e
@@ -60,9 +56,9 @@ dependências externas de runtime.
 | Estado | Valor |
 | --- | --- |
 | Branch principal | `master` |
-| Última release | `v0.1.39` |
+| Última release | `v0.1.31` |
 | Milestone atual | v1.0 |
-| Issues abertas | 0 |
+| Issues abertas | 3 |
 | Labels do projeto | 19 |
 <!-- ESTADO_END -->
 
