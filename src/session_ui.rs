@@ -503,10 +503,8 @@ pub(crate) struct Tui {
     /// última varredura ainda era válida. `(timestamp, itens)`.
     history_cache: Option<(Instant, Vec<crate::downloads::CompletedItem>)>,
     /// Estilo da área inferior da TUI (US-041): `Legacy` mantém o prompt no
-    /// fim do Body + footer; `Elevated` usa o novo Card + barra de status.
+    /// fim do Body + footer; `Elevated` usa o novo Card.
     bottom_style: BottomStyle,
-    /// Indicador animado de atividade da barra externa (US-041).
-    activity: ui_bottom::ActivityIndicator,
     running: bool,
 }
 
@@ -537,7 +535,6 @@ impl Tui {
             prev_cursor: None,
             history_cache: None,
             bottom_style: BOTTOM_STYLE,
-            activity: ui_bottom::ActivityIndicator::new(),
             running: true,
         }
     }
@@ -566,7 +563,6 @@ impl Tui {
             prev_cursor: None,
             history_cache: None,
             bottom_style: BOTTOM_STYLE,
-            activity: ui_bottom::ActivityIndicator::new(),
             running: true,
         }
     }
@@ -665,9 +661,8 @@ impl Tui {
             return self.handle_context_menu_key(key).await;
         }
 
-        // US-041: Ctrl+P abre o menu de comandos a partir da barra externa de
-        // status (atalho anunciado na própria barra: `ctrl+p comandos`). Precisa
-        // ser tratado antes das teclas únicas da Biblioteca, que capturam `p`.
+        // US-041: Ctrl+P abre o menu de comandos. Precisa ser tratado antes
+        // das teclas únicas da Biblioteca, que capturam `p`.
         if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
@@ -1158,19 +1153,6 @@ impl Tui {
         rows
     }
 
-    /// Total de bytes baixados e totais de todas as torrents (US-042, métrica
-    /// de progresso do rodapé). No modo daemon usa o snapshot do socket.
-    fn footer_progress(&self) -> (u64, u64) {
-        let rows = self.session_rows();
-        let mut progress = 0u64;
-        let mut total = 0u64;
-        for row in &rows {
-            progress += row.progress_bytes;
-            total += row.total_bytes;
-        }
-        (progress, total)
-    }
-
     /// Atualiza o snapshot no modo daemon (US-040). Sem efeito no modo local.
     async fn refresh_snapshot(&mut self) {
         if self.session.is_some() {
@@ -1422,8 +1404,8 @@ impl Tui {
         self.render_header(&mut frame, cols);
 
         let body_top = 1u16;
-        // US-041: o Body cede as linhas da área inferior (Card + barra de
-        // status no estilo Elevated; apenas o footer no Legacy).
+        // US-041: o Body cede as linhas da área inferior (Card no estilo
+        // Elevated; apenas o footer no Legacy).
         let geometry = ui_bottom::bottom_geometry(self.bottom_style, rows);
         let body_height = rows.saturating_sub(geometry.reserved).max(1);
         match self.view {
@@ -1802,8 +1784,8 @@ impl Tui {
     }
 
     /// Desenha a área inferior conforme o estilo (US-041): no `Elevated`,
-    /// desenha o Card de entrada + badges e a barra externa de status; no
-    /// `Legacy`, mantém o footer original.
+    /// desenha o Card de entrada + badges + borda inferior; no `Legacy`,
+    /// mantém o footer original.
     fn render_bottom(
         &mut self,
         frame: &mut Frame,
@@ -1818,7 +1800,6 @@ impl Tui {
                 let text_col = 3 + prompt.chars().count() as u16;
                 let max_w = (width as usize).saturating_sub(text_col as usize + 2);
                 let focused = self.confirming_delete.is_none();
-                let (progress_bytes, total_bytes) = self.footer_progress();
                 let data = ui_bottom::BottomData {
                     prompt,
                     input: if self.input.is_empty() && !self.prompt_add_mode {
@@ -1834,14 +1815,10 @@ impl Tui {
                     prompt_add_mode: self.prompt_add_mode,
                     menu_open: self.view == View::Menu,
                     notice: self.notice.as_deref(),
-                    progress_bytes,
-                    total_bytes,
                 };
-                let activity = self.activity.tick();
                 ui_bottom::render_input_card(frame, cols, geometry.input_row, &data, focused);
                 ui_bottom::render_badges_row(frame, cols, geometry.badges_row, &data, focused);
                 ui_bottom::render_edge_row(frame, cols, geometry.edge_row);
-                ui_bottom::render_status_bar(frame, cols, geometry.status_row, &data, &activity);
             }
             BottomStyle::Legacy => {
                 self.render_footer(frame, cols, rows);
