@@ -265,6 +265,9 @@ pub(crate) struct Theme {
     /// Barra de acento vertical do Card (US-041): cinza neutro quando o campo
     /// está inativo (estado ocioso).
     pub(crate) card_accent_idle: Color,
+    /// Barra de acento vertical do Card de Histórico (US-046): laranja,
+    /// distinguindo o painel de downloads completos do Card azul do footer.
+    pub(crate) card_accent_alt: Color,
 }
 
 pub(crate) const THEME: Theme = Theme {
@@ -297,6 +300,11 @@ pub(crate) const THEME: Theme = Theme {
         b: 246,
     },
     card_accent_idle: Color::DarkGrey,
+    card_accent_alt: Color::Rgb {
+        r: 249,
+        g: 115,
+        b: 22,
+    },
 };
 
 /// Buffer de tela (US-016): o render desenha o estado atual neste buffer e, ao
@@ -505,6 +513,12 @@ pub(crate) struct Tui {
     /// Estilo da área inferior da TUI (US-041): `Legacy` mantém o prompt no
     /// fim do Body + footer; `Elevated` usa o novo Card.
     bottom_style: BottomStyle,
+    /// Deslocamento vertical do grid do Card de Histórico (US-046): quantas
+    /// linhas de itens foram roladas para cima.
+    history_scroll: usize,
+    /// Região (linha do topo, altura) do Card de Histórico, para a rolagem com
+    /// o mouse (US-046). `None` quando o card não está visível.
+    history_region: Option<(u16, u16)>,
     running: bool,
 }
 
@@ -535,6 +549,8 @@ impl Tui {
             prev_cursor: None,
             history_cache: None,
             bottom_style: BOTTOM_STYLE,
+            history_scroll: 0,
+            history_region: None,
             running: true,
         }
     }
@@ -563,6 +579,8 @@ impl Tui {
             prev_cursor: None,
             history_cache: None,
             bottom_style: BOTTOM_STYLE,
+            history_scroll: 0,
+            history_region: None,
             running: true,
         }
     }
@@ -601,10 +619,13 @@ impl Tui {
                 if let Err(err) = self.handle_mouse(mouse).await {
                     self.notice = Some(format!("erro no clique: {err:#}"));
                 }
-                // Apenas cliques alteram o estado; movimentos não redesenham.
+                // Cliques e a rolagem do mouse alteram o estado; movimentos
+                // não redesenham.
                 let click = matches!(
                     mouse.kind,
                     MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
                 );
                 (true, click)
             }
@@ -901,6 +922,23 @@ impl Tui {
 
     /// Handle one mouse event, dispatching clicks to the active view.
     async fn handle_mouse(&mut self, me: MouseEvent) -> anyhow::Result<()> {
+        // US-046: rolagem vertical do Card de Histórico (mouse wheel).
+        if matches!(
+            me.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            if let Some((top, height)) = self.history_region
+                && (top..top.saturating_add(height)).contains(&me.row)
+            {
+                let step: isize = if me.kind == MouseEventKind::ScrollUp {
+                    -1
+                } else {
+                    1
+                };
+                self.history_scroll = (self.history_scroll as isize + step).max(0) as usize;
+            }
+            return Ok(());
+        }
         if !matches!(
             me.kind,
             MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
@@ -1481,7 +1519,7 @@ impl Tui {
         if hist_height >= 3 {
             let hist_top = body_top.saturating_add(lib_height);
             self.render_library_panel(frame, cols, body_top, lib_height);
-            self.render_history_panel(frame, cols, hist_top, hist_height);
+            self.render_history_card(frame, cols, hist_top, hist_height);
         } else {
             // Espaço só para a Biblioteca: o histórico é omitido.
             self.render_library_panel(frame, cols, body_top, panels_height);
@@ -1727,52 +1765,137 @@ impl Tui {
         });
     }
 
-    /// Painel intermediário da Home: downloads completos em verde.
-    fn render_history_panel(&mut self, frame: &mut Frame, cols: u16, top: u16, height: u16) {
-        let left = LAYOUT_MARGIN_COLS;
-        let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS);
-        let content_left = left + 2;
-        let inner_width = (width as usize).saturating_sub(4);
+    /// Card do Histórico de downloads (US-046): mesmo estilo do Card do footer,
+    /// com a barra de acento esquerda **laranja**. Exibe o grid de downloads
+    /// completos dentro do card, com rolagem vertical (mouse) e scrollbar quando
+    /// o conteúdo excede a altura — o grid nunca ultrapassa as bordas do card,
+    /// independentemente do tamanho do terminal.
+    fn render_history_card(&mut self, frame: &mut Frame, cols: u16, top: u16, height: u16) {
+        if height < 4 {
+            self.history_region = None;
+            return;
+        }
+        // Fundo do Card + acento laranja na margem esquerda de todas as linhas.
+        frame.fill_rect(top, 0, height, cols, ' ', None, Some(THEME.card_bg));
+        for r in top..top.saturating_add(height) {
+            frame.put_styled(
+                r,
+                0,
+                ui_bottom::ACCENT_BLOCK,
+                Some(THEME.card_accent_alt),
+                Some(THEME.card_bg),
+            );
+        }
+
+        // Área de conteúdo: reserva 1 coluna à direita para a scrollbar.
+        let content_left = 3u16;
+        let content_w = (cols as usize).saturating_sub(content_left as usize + 1);
         // Colunas do grid (US-045): DATA CRIAÇÃO | NOME | TAMANHO. A data e o
         // tamanho têm largura fixa; o nome absorve o restante.
-        let name_w = inner_width.saturating_sub(
+        let name_w = content_w.saturating_sub(
             crate::downloads::HISTORY_DATE_W + 1 + crate::downloads::HISTORY_SIZE_W,
         );
 
-        let mut lines: Vec<String> = Vec::new();
-        lines.push("Histórico de downloads".into());
-        lines.push(String::new());
-        lines.push(history_header(name_w));
+        // Título + cabeçalho do grid.
+        frame.put_styled(
+            top,
+            content_left,
+            "Histórico de downloads",
+            Some(THEME.text),
+            Some(THEME.card_bg),
+        );
+        let header = history_header(name_w);
+        frame.put_styled(
+            top + 1,
+            content_left,
+            &header,
+            Some(THEME.muted),
+            Some(THEME.card_bg),
+        );
 
-        // Cache (US-045): evita re-escanear o disco a cada frame, o que fazia
-        // o grid "se reordenar" continuamente enquanto a varredura decorria.
+        // Cache (US-045): evita re-escanear o disco a cada frame.
         let items = self.cached_completed_downloads();
         let item_texts: Vec<String> = items
             .iter()
-            .map(|item| Self::truncate(&format_completed_row(item, name_w), inner_width))
+            .map(|item| Self::truncate(&format_completed_row(item, name_w), content_w))
             .collect();
 
+        // Janela rolada: linhas visíveis = título + cabeçalho + borda inferior.
+        let rows_for_items = height.saturating_sub(3) as usize;
+        let total = item_texts.len();
+        let max_scroll = total.saturating_sub(rows_for_items);
+        self.history_scroll = self.history_scroll.min(max_scroll);
+        let items_top = top + 2;
         if item_texts.is_empty() {
-            lines.push("nenhum download completo".into());
+            frame.put_styled(
+                items_top,
+                content_left,
+                "nenhum download completo",
+                Some(THEME.muted),
+                Some(THEME.card_bg),
+            );
         } else {
-            let max_items = (height as usize).saturating_sub(4);
-            for text in item_texts.iter().take(max_items) {
-                lines.push(text.clone());
+            for (i, text) in item_texts
+                .iter()
+                .skip(self.history_scroll)
+                .take(rows_for_items)
+                .enumerate()
+            {
+                frame.put_styled(
+                    items_top + i as u16,
+                    content_left,
+                    text,
+                    Some(THEME.text),
+                    Some(THEME.card_bg),
+                );
             }
         }
 
-        draw_box(frame, left, top, width, height);
-        write_boxed_lines(frame, content_left, top + 1, &lines, &[], height);
-
-        // Linhas de itens na cor padrão de texto (US-045): antes em verde.
-        let items_start = top + 1 + 3;
-        for (i, text) in item_texts
-            .iter()
-            .take((height as usize).saturating_sub(4))
-            .enumerate()
-        {
-            frame.put_colored(items_start + i as u16, content_left, text, Some(THEME.text));
+        // Scrollbar vertical à direita quando o conteúdo excede o card.
+        // `max_scroll >= 1` aqui (pois `total > rows_for_items`).
+        if total > rows_for_items {
+            let sb_col = cols.saturating_sub(1);
+            let track = height - 1;
+            let thumb_h = ((track as usize * rows_for_items) / total).max(1) as u16;
+            let thumb_offset = (track - thumb_h) as usize * self.history_scroll / max_scroll;
+            for i in 0..track {
+                let row = top + i;
+                let in_thumb =
+                    (i as usize) >= thumb_offset && (i as usize) < thumb_offset + thumb_h as usize;
+                if in_thumb {
+                    frame.put_styled(
+                        row,
+                        sb_col,
+                        "█",
+                        Some(THEME.card_accent_alt),
+                        Some(THEME.card_bg),
+                    );
+                } else {
+                    frame.put_styled(row, sb_col, "░", Some(THEME.muted), Some(THEME.card_bg));
+                }
+            }
         }
+
+        // Borda inferior do Card (US-042/046): canto `╹` + `▀`.
+        let edge_row = top + height - 1;
+        frame.put_styled(
+            edge_row,
+            0,
+            ui_bottom::ACCENT_CORNER,
+            Some(THEME.card_accent_idle),
+            None,
+        );
+        frame.fill(
+            edge_row,
+            1,
+            cols.saturating_sub(1),
+            ui_bottom::EDGE_BLOCK,
+            Some(THEME.card_bg),
+            None,
+        );
+
+        // Região do card para a rolagem com o mouse.
+        self.history_region = Some((top, height));
     }
 
     /// Lista os downloads completos usando o cache do histórico (US-045),
@@ -3758,5 +3881,91 @@ mod tests {
         assert!(tui.input.is_empty());
         // Todos os comandos ficam visíveis com o prompt vazio.
         assert_eq!(tui.filtered_commands().len(), COMMANDS.len());
+    }
+
+    // ---- US-046: Card do Histórico com acento laranja e rolagem ----
+
+    fn history_items(n: usize) -> Vec<crate::downloads::CompletedItem> {
+        (0..n)
+            .map(|i| crate::downloads::CompletedItem {
+                path: std::path::PathBuf::from(format!("/tmp/f{i}.iso")),
+                name: format!("arquivo-{i}.iso"),
+                size: 1_000_000 + i as u64,
+                modified: std::time::SystemTime::UNIX_EPOCH,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn history_card_draws_orange_accent_title_and_grid() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.history_cache = Some((std::time::Instant::now(), history_items(10)));
+        let mut frame = Frame::new(80, 20);
+        tui.render_history_card(&mut frame, 80, 8, 6);
+        // Acento laranja na margem esquerda de todas as linhas do card.
+        assert_eq!(frame.cell(8, 0).ch(), '▌');
+        assert_eq!(frame.cell(8, 0).fg(), Some(THEME.card_accent_alt));
+        assert_eq!(frame.cell(12, 0).ch(), '▌');
+        // Título na primeira linha do card.
+        let title: String = (3..40).map(|c| frame.cell(8, c).ch()).collect();
+        assert!(title.starts_with("Histórico de downloads"));
+        // Borda inferior `▀` na última linha do card.
+        assert_eq!(frame.cell(13, 1).ch(), '▀');
+        // 10 itens > 3 linhas visíveis → scrollbar presente (thumb no topo).
+        assert_eq!(frame.cell(8, 79).ch(), '█');
+        assert_eq!(tui.history_region, Some((8, 6)));
+    }
+
+    #[tokio::test]
+    async fn history_card_empty_state_shows_message() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.history_cache = Some((std::time::Instant::now(), Vec::new()));
+        let mut frame = Frame::new(80, 20);
+        tui.render_history_card(&mut frame, 80, 8, 6);
+        let row: String = (3..40).map(|c| frame.cell(10, c).ch()).collect();
+        assert!(row.contains("nenhum download completo"));
+        assert_eq!(frame.cell(8, 0).fg(), Some(THEME.card_accent_alt));
+    }
+
+    #[tokio::test]
+    async fn mouse_wheel_scrolls_history_card_and_clamps() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.history_cache = Some((std::time::Instant::now(), history_items(20)));
+        tui.history_region = Some((8, 6));
+        let wheel = |kind: MouseEventKind| MouseEvent {
+            kind,
+            column: 40,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        };
+        // Scroll para baixo dentro do card rola para baixo.
+        tui.handle_mouse(wheel(MouseEventKind::ScrollDown))
+            .await
+            .unwrap();
+        assert_eq!(tui.history_scroll, 1);
+        // Scroll para cima volta a 0 e não fica negativa.
+        tui.handle_mouse(wheel(MouseEventKind::ScrollUp))
+            .await
+            .unwrap();
+        assert_eq!(tui.history_scroll, 0);
+        tui.handle_mouse(wheel(MouseEventKind::ScrollUp))
+            .await
+            .unwrap();
+        assert_eq!(tui.history_scroll, 0);
+        // Fora da região do card não rola.
+        tui.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 40,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(tui.history_scroll, 0);
+        // O render clampa o deslocamento ao máximo (20 itens - 3 visíveis).
+        tui.history_scroll = 100;
+        let mut frame = Frame::new(80, 20);
+        tui.render_history_card(&mut frame, 80, 8, 6);
+        assert_eq!(tui.history_scroll, 17);
     }
 }

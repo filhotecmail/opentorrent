@@ -16,12 +16,12 @@ use crate::session_ui::{Frame, THEME};
 
 /// Caractere do acento vertical na margem esquerda do Card (US-042): bloco
 /// esquerdo, simulando a borda lateral de 4px do mockup HTML.
-const ACCENT_BLOCK: &str = "▌";
+pub(crate) const ACCENT_BLOCK: &str = "▌";
 /// Caractere do canto inferior esquerdo do Card (US-042, igual ao opencode).
-const ACCENT_CORNER: &str = "╹";
+pub(crate) const ACCENT_CORNER: &str = "╹";
 /// Caractere de meio-bloco superior da borda inferior do Card (US-042,
 /// igual ao opencode): cria o efeito de elevação.
-const EDGE_BLOCK: char = '▀';
+pub(crate) const EDGE_BLOCK: char = '▀';
 
 /// Estilo da área inferior da TUI (US-041). Permite alternar entre o layout
 /// legado (prompt no fim do Body + footer) e o novo Card elevado sem alterar
