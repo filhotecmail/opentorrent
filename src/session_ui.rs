@@ -67,6 +67,14 @@ const LAYOUT_MARGIN_COLS: u16 = 2;
 /// a cada frame.
 const HISTORY_REFRESH: Duration = Duration::from_secs(2);
 
+/// Taxa máxima de atualização do snapshot do daemon (US-040): sem este
+/// throttle, a TUI reconectava ao socket e transferia o estado completo a cada
+/// frame (~30 FPS), o que congelava a TUI ao rolar o mouse sobre o Card de
+/// processamento. 200 ms ≈ 5 FPS de atualização do progresso — suave e barato.
+const SNAPSHOT_REFRESH: Duration = Duration::from_millis(200);
+/// Timeout do IPC de snapshot: um daemon lento/ocupado nunca pode travar a TUI.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Estilo da área inferior da TUI (US-041). Para voltar à UI anterior, troque
 /// para `BottomStyle::Legacy` — o render intacto (`render_home_prompt` +
 /// `render_footer`) e a geometria original passam a ser usados automaticamente.
@@ -528,6 +536,8 @@ pub(crate) struct Tui {
     session: Option<Arc<Session>>,
     /// Último snapshot da fila recebido do daemon (modo daemon).
     snapshot: DaemonState,
+    /// Momento do último snapshot recebido do daemon (throttle, US-040).
+    last_snapshot_at: Option<Instant>,
     output_folder: PathBuf,
     view: View,
     /// Current command being typed in the title input field.
@@ -568,8 +578,6 @@ pub(crate) struct Tui {
     pending: Arc<Mutex<Vec<PendingTorrent>>>,
     /// Frame anterior renderizado (double buffering / diff-rendering).
     prev_frame: Option<Frame>,
-    /// Posição do cursor do terminal exibida no último frame (`None` = oculto).
-    prev_cursor: Option<(u16, u16)>,
     /// Cache do histórico de downloads (US-045): evita re-escanear o disco a
     /// cada frame, que fazia a lista "reordenar" continuamente enquanto a
     /// última varredura ainda era válida. `(timestamp, itens)`.
@@ -595,6 +603,7 @@ impl Tui {
         Self {
             session: Some(session),
             snapshot: DaemonState::default(),
+            last_snapshot_at: None,
             output_folder,
             view: View::Home,
             input: String::new(),
@@ -613,7 +622,6 @@ impl Tui {
             library_region: None,
             pending: Arc::new(Mutex::new(Vec::new())),
             prev_frame: None,
-            prev_cursor: None,
             history_cache: None,
             bottom_style: BOTTOM_STYLE,
             history_scroll: 0,
@@ -628,6 +636,7 @@ impl Tui {
         Self {
             session: None,
             snapshot: DaemonState::default(),
+            last_snapshot_at: None,
             output_folder,
             view: View::Home,
             input: String::new(),
@@ -646,7 +655,6 @@ impl Tui {
             library_region: None,
             pending: Arc::new(Mutex::new(Vec::new())),
             prev_frame: None,
-            prev_cursor: None,
             history_cache: None,
             bottom_style: BOTTOM_STYLE,
             history_scroll: 0,
@@ -1325,15 +1333,26 @@ impl Tui {
     }
 
     /// Atualiza o snapshot no modo daemon (US-040). Sem efeito no modo local.
+    /// O throttle (`SNAPSHOT_REFRESH`) evita reconectar ao socket e transferir
+    /// o estado completo a cada frame — o que congelava a TUI ao rolar o mouse
+    /// sobre o progresso. Um timeout (`SNAPSHOT_TIMEOUT`) garante que um daemon
+    /// lento/ocupado nunca bloqueie o render.
     async fn refresh_snapshot(&mut self) {
         if self.session.is_some() {
             return;
         }
+        if self
+            .last_snapshot_at
+            .is_some_and(|t| t.elapsed() < SNAPSHOT_REFRESH)
+        {
+            return;
+        }
+        self.last_snapshot_at = Some(Instant::now());
         let mut client = match daemon::connect_client().await {
             Ok(c) => c,
             Err(_) => return, // daemon indisponível: mantém o último snapshot
         };
-        if let Ok(state) = client.get_state().await {
+        if let Ok(Ok(state)) = tokio::time::timeout(SNAPSHOT_TIMEOUT, client.get_state()).await {
             self.snapshot = state;
         }
     }
@@ -1602,23 +1621,21 @@ impl Tui {
         if needs_full {
             queue!(w, terminal::Clear(terminal::ClearType::All), cursor::Hide)?;
             frame.apply_diff(w, &Frame::new(cols, rows))?;
-            // Após o clear total o cursor é sempre reemitido abaixo, mesmo que
-            // a posição não tenha mudado (evita cursor oculto durante a
-            // digitação após redimensionamento/troca de view).
-            self.prev_cursor = None;
+            // O cursor é sempre reemitido abaixo (não depende de mudança de
+            // posição) — o diff pode ter deixado o cursor físico no corpo.
         } else if let Some(prev) = &self.prev_frame {
             frame.apply_diff(w, prev)?;
         }
 
-        // Cursor do terminal: visível apenas durante a digitação (include).
-        // Emite apenas quando a posição/visibilidade muda — frames ociosos
-        // (sem alterações) não reescrevem o cursor.
-        if frame.cursor != self.prev_cursor {
-            match frame.cursor {
-                Some((row, col)) => queue!(w, cursor::MoveTo(col, row), cursor::Show)?,
-                None => queue!(w, cursor::Hide)?,
-            }
-            self.prev_cursor = frame.cursor;
+        // Cursor do terminal: sempre reposicionado após o diff. O
+        // `apply_diff` reescreve runs com `MoveTo`, deixando o cursor físico
+        // no fim do último run alterado — que pode cair no corpo (barra de
+        // progresso/ratio do Card da Biblioteca). Reposicionar SEMPRE na área
+        // de comandos do Card (US-042) evita o cursor do terminal piscando
+        // fora do footer durante downloads/rolagem.
+        match frame.cursor {
+            Some((row, col)) => queue!(w, cursor::MoveTo(col, row), cursor::Show)?,
+            None => queue!(w, cursor::Hide)?,
         }
         w.flush()?;
 
