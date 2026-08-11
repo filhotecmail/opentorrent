@@ -10,7 +10,7 @@
 [![Cobertura](https://codecov.io/gh/filhotecmail/opentorrent/branch/master/graph/badge.svg)](https://codecov.io/gh/filhotecmail/opentorrent)
 [![Último commit](https://img.shields.io/github/last-commit/filhotecmail/opentorrent/master)](https://github.com/filhotecmail/opentorrent/commits/master)
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/filhotecmail/opentorrent)
-[![Release](https://img.shields.io/badge/release-v0.1.31-blue)](https://github.com/filhotecmail/opentorrent/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.39-blue)](https://github.com/filhotecmail/opentorrent/releases)
 [![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
 [![APT Package](https://img.shields.io/badge/Debian%2FAPT-.deb-A81D33?style=flat-square&logo=debian&logoColor=white)](https://github.com/filhotecmail/opentorrent/releases/latest)
 [![Built with Rust](https://img.shields.io/badge/Built_with-Rust-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -57,7 +57,7 @@ dependências externas de runtime.
 | Estado | Valor |
 | --- | --- |
 | Branch principal | `master` |
-| Última release | `v0.1.31` |
+| Última release | `v0.1.39` |
 | Milestone atual | v1.0 |
 | Issues abertas | 0 |
 | Labels do projeto | 19 |
@@ -67,7 +67,7 @@ dependências externas de runtime.
 | Metadado | Valor |
 | --- | --- |
 | Pacote | `opentorrent` |
-| Versão | `0.1.31` |
+| Versão | `0.1.39` |
 | Edição Rust | 2024 |
 <!-- CARGO_END -->
 
@@ -120,6 +120,8 @@ Todas as dependências são resolvidas automaticamente pelo Cargo no build.
 | `crossterm` | 0.29 | Captura de eventos de mouse e controle do terminal |
 | `size_format` | 1.x | Formatação de tamanhos de bytes (ex: 1.24 GiB) |
 | `reqwest` | 0.12 | Cliente HTTP para a checagem de versão/atualizações (US-029/US-040) |
+| `url` | 2.5.8 | Parsing de URLs — magnet links e trackers de fallback (US-040) |
+| `dirs` | 6 | Diretórios padrão do usuário (home/config/data) em Linux e Windows (US-038/US-040) |
 | `semver` | 1.x | Comparação SemVer de versões (US-029) |
 | `serde` | 1.x | Serialização/deserialização dos tipos do IPC do daemon (US-040) |
 | `serde_json` | 1.x | JSON do protocolo IPC do daemon e leitura do `tag_name` (US-029/US-040) |
@@ -243,6 +245,21 @@ loginctl enable-linger "$USER"
 
 > Sem systemd user disponível (ex.: containers ou distros sem user manager), o
 > `daemon start` usa o fallback de spawn desanexado — o comportamento anterior.
+
+**Dinâmicas do daemon (US-040):**
+
+- **Fonte da verdade e deduplicação por infohash** — o daemon centraliza a
+  sessão do librqbit; re-adicionar um torrent já gerenciado (mesmo `infohash`,
+  independente de a origem ser magnet, URL ou arquivo `.torrent`) retorna
+  `AlreadyManaged` e não cria duplicidade na fila.
+- **Snapshot via IPC** — a TUI renderiza a fila a partir de um `snapshot`
+  (`GetState`) recebido pelo socket Unix e atualizado em segundo plano
+  (com throttle), e delega as ações (pausar/retomar/parar/excluir) ao daemon
+  via JSON sobre o mesmo socket. A TUI, assim, não abre rede nem arquivos
+  quando o daemon está ativo.
+- **Auto-start transparente** — a TUI (`opentorrent` sem subcomando) inicia o
+  daemon automaticamente na primeira execução, então o gerenciamento explícito
+  é opcional.
 
 > **Releases automáticas:** cada push na `master` que incremente a versão do
 > `Cargo.toml` publica automaticamente uma nova release (binários Linux +
@@ -436,28 +453,37 @@ opcionais — úteis para gerenciar/manter o daemon explicitamente.
 ### Interface interativa (TUI)
 
 Ao executar `opentorrent` sem argumentos, a TUI abre com **Header** (título +
-versão), **Body** (menu/área de conteúdo) e **Footer** (atalhos) — estrutura
-padronizada com tema escuro e destaque de seleção com cor de fundo (US-019).
-A sessão exibe uma tabela com colunas `ID`, `PROGRESSO`, `STATUS`, `NOME` e
-`AÇÕES`, com barra de progresso em blocos contínuos coloridos por estado
-(US-020) e separadores sutis entre os registros (US-028).
+versão), **Body** (conteúdo) e **Card** inferior de entrada/comandos — estrutura
+padronizada com tema escuro, acento vertical `▌` e destaque de seleção com cor
+de fundo (US-019/US-041).
 
-Em um terminal interativo (TTY), cada linha exibe botões clicáveis à direita:
+O Body exibe dois **Cards** com acentos coloridos: a **Biblioteca de downloads**
+(acento verde, US-047) com a fila de torrents em tabela de colunas responsivas
+(`ID`, `PROGRESSO`, `STATUS`, `NOME` e métricas), e o **Histórico de downloads**
+(acento laranja, US-046) com os downloads completos. Nomes longos quebram em
+várias linhas e ambos os cards rolam com o mouse (com scrollbar quando o
+conteúdo excede a altura).
 
 ```text
->  [0] ██████████░░░░░░░░░░ 45.2% baixando  debian.iso  [Pausar ] [Parar   ] [Excluir]
+▌ Biblioteca de downloads
+▌      ID PROGRESSO          STATUS        NOME            DOWN SPEED ...
+▌      0  ██████████░░░░░░░░  45.2%  em andamento  debian.iso  1.2 MB/s ...
 ```
 
-| Botão / Tecla | Ação |
-| --- | --- |
-| `[Pausar ]` / `[Retomar]` | Alterna entre pausar e retomar o torrent |
-| `[Parar  ]` | Para o torrent, mantendo os arquivos em disco |
-| `[Excluir]` | Para o torrent e exclui os arquivos baixados (com confirmação) |
-| `Delete` | Exclui o torrent selecionado (com confirmação Y/N) e apaga os arquivos do disco (US-027) |
+| Ação | Tecla | Mouse |
+| --- | --- | --- |
+| Pausar / Retomar | `p` / `r` | Clique direito no item → menu |
+| Parar / Excluir | `x` / `Delete` | Clique direito no item → menu |
+| Navegar | `↑` / `↓` | Roda do mouse sobre o card |
+| Comandos | `/` ou `Ctrl+P` | — |
+| Cancelar / fechar popup | `Esc` | — |
 
 A barra de progresso usa blocos sólidos (`█`) para o percentual concluído e
 neutros (`░`) para o restante, com cor por estado: **verde** em andamento/
 concluído, **azul/amarelo** pausado e **vermelho** em erro (US-020).
+
+O cursor do terminal fica sempre piscando na área de comandos do Card inferior
+(entrada de texto/badges), nunca sobre o conteúdo.
 
 ## Desenvolvimento
 
@@ -664,6 +690,20 @@ automatizado por `./scripts/create-new-us.sh`:
   como **systemd user service** automaticamente na primeira execução, e o
   comando `opentorrent update` automatiza a atualização (para o service,
   substitui o binário validando a assinatura US-018 e religa).
+- **US-041** — Novo layout da área inferior da TUI: Card elevado de entrada com
+  acento vertical (`▌`) e borda de elevação (`▀`), no estilo do prompt do
+  opencode.
+- **US-042** — Card mais alto com respiro entre o campo de entrada e os badges,
+  cursor sempre na área de digitação do card e remoção da barra externa de
+  status.
+- **US-045** — Grid de histórico com cache em disco: a lista de downloads
+  completos é re-escaneada no máximo a cada 2s.
+- **US-046** — Card de histórico com acento laranja e rolagem vertical por mouse
+  (com scrollbar quando o conteúdo excede o card).
+- **US-047** — Card da biblioteca com acento verde, colunas responsivas (a barra
+  de progresso encolhe antes do nome em terminais estreitos), quebra de nomes
+  longos em várias linhas, rolagem por mouse com scrollbar e navegação por
+  setas que mantém a seleção visível.
 
 ## Licença
 
