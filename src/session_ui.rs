@@ -42,6 +42,10 @@ const ROW_PREFIX_W: usize = 7;
 const PROGRESS_COL_W: usize = 31;
 /// Largura da coluna de status.
 const STATE_W: usize = 13;
+/// Largura padrão da coluna de progresso no Card da Biblioteca (US-047):
+/// compacta (blocos + percentual), cedendo o espaço restante para o nome do
+/// download — reduz a quebra de linha em terminais típicos.
+const LIB_BAR_W: usize = 20;
 /// Largura total mínima da coluna de progresso no Card da Biblioteca (US-047):
 /// alguns blocos + o percentual adjacente, para a barra continuar legível em
 /// terminais estreitos.
@@ -1214,6 +1218,44 @@ impl Tui {
         }
         let next = (self.row_index as isize + delta).rem_euclid(total as isize);
         self.row_index = next as usize;
+        // US-047: com nomes quebrados em várias linhas, a seleção pode cair
+        // fora da janela rolada — rola a view para manter o item visível.
+        self.keep_selection_visible();
+    }
+
+    /// Ajusta `library_scroll` para que o item selecionado fique dentro da
+    /// janela visível do Card da Biblioteca (US-047). Se o fim do item caiu
+    /// abaixo da janela, rola para baixo; se o início caiu acima, rola para
+    /// cima (cobre também o wrap-around da navegação: `↓` no último item leva
+    /// a seleção ao topo e a view acompanha). Usa o `library_map` do último
+    /// render (linha física → item); sem card visível, não faz nada.
+    fn keep_selection_visible(&mut self) {
+        let Some(map) = &self.library_map else {
+            return;
+        };
+        let Some((_, height)) = self.library_region else {
+            return;
+        };
+        let rows_for_items = height.saturating_sub(3) as usize;
+        let total_lines = map.rows.len();
+        if total_lines <= rows_for_items {
+            self.library_scroll = 0;
+            return;
+        }
+        let first = map.rows.iter().position(|&i| i == self.row_index);
+        let last = map.rows.iter().rposition(|&i| i == self.row_index);
+        let (Some(first), Some(last)) = (first, last) else {
+            return;
+        };
+        let max_scroll = total_lines - rows_for_items;
+        let window_end = self.library_scroll + rows_for_items;
+        if last >= window_end {
+            // Fim do item abaixo da janela → rola para baixo até exibi-lo.
+            self.library_scroll = (last + 1).saturating_sub(rows_for_items).min(max_scroll);
+        } else if first < self.library_scroll {
+            // Início do item acima da janela → rola para cima até exibi-lo.
+            self.library_scroll = first.min(max_scroll);
+        }
     }
 
     fn session_rows(&self) -> Vec<SessionRow> {
@@ -1737,15 +1779,16 @@ impl Tui {
         let content_w = (cols as usize).saturating_sub(content_left as usize + 1);
 
         // Colunas responsivas (US-047): as métricas aparecem só quando sobra
-        // espaço; a barra de progresso encolhe (até `MIN_BAR_W`) antes do nome,
-        // preservando a legibilidade do nome (`NAME_W_MIN`).
+        // espaço; a barra de progresso é compacta (`LIB_BAR_W`) e encolhe
+        // (até `MIN_BAR_W`) antes do nome, preservando a legibilidade do nome
+        // (`NAME_W_MIN`) — o nome ganha o espaço economizado da barra.
         let show_metrics = content_w >= ROW_FIXED_W + METRICS_FIXED_W + 15;
         let extra_w = if show_metrics { METRICS_FIXED_W } else { 0 };
         // Colunas fixas antes da barra: marcador/ID (ROW_PREFIX_W) + espaço +
         // STATUS (STATE_W) + espaço (+ métricas quando visíveis).
         let prefix_w = ROW_PREFIX_W + 1 + STATE_W + 1 + extra_w;
         let room = content_w.saturating_sub(prefix_w);
-        let bar_w = PROGRESS_COL_W
+        let bar_w = LIB_BAR_W
             .min(room.saturating_sub(NAME_W_MIN))
             .max(MIN_BAR_W)
             .min(room.max(1));
@@ -2158,6 +2201,11 @@ impl Tui {
                     notice: self.notice.as_deref(),
                 };
                 ui_bottom::render_input_card(frame, cols, geometry.input_row, &data, focused);
+                // Respiro entre o campo de entrada e a linha de badges: o card
+                // elevado fica mais alto e arejado (toque fino).
+                for r in (geometry.input_row + 1)..geometry.badges_row {
+                    ui_bottom::render_gap_row(frame, cols, r, focused);
+                }
                 ui_bottom::render_badges_row(frame, cols, geometry.badges_row, &data, focused);
                 ui_bottom::render_gap_row(
                     frame,
@@ -3483,6 +3531,28 @@ mod tests {
     }
 
     #[test]
+    fn session_table_header_aligns_with_compact_bar_width() {
+        // Com a barra compacta do Card (LIB_BAR_W), o cabeçalho continua com a
+        // mesma largura da linha de dados (colunas alinhadas, US-047).
+        let bar_w = LIB_BAR_W;
+        let name_width = 30;
+        let header = session_table_header(name_width, true, bar_w);
+        let bar = progress_bar_width(50.0, bar_w);
+        let metrics = row_metrics_text(false, Some(1.2), Some(0.0), Some(252), 145, 100);
+        let data = session_table_line(
+            "  ",
+            1,
+            &bar,
+            "em andamento",
+            "arquivo.iso",
+            name_width,
+            Some(&metrics),
+        );
+        assert_eq!(header.chars().count(), data.chars().count());
+        assert_eq!(bar.chars().count(), bar_w);
+    }
+
+    #[test]
     fn home_footer_hints_mention_shortcuts() {
         assert!(footer_hints(&View::Home, false, false, false).contains("p pausar"));
         assert!(footer_hints(&View::Home, false, false, false).contains("r retomar"));
@@ -4305,5 +4375,241 @@ mod tests {
         let mut frame = Frame::new(80, 20);
         tui.render_history_card(&mut frame, 80, 8, 6);
         assert_eq!(tui.history_scroll, 17);
+    }
+
+    // ---- US-047: Card da Biblioteca com acento verde e rolagem ----
+
+    /// Preenche a fila de pendentes com magnets longos (sem espaços), que
+    /// quebram linha no card estreito — gera muitas linhas físicas.
+    fn pending_magnets(n: usize) -> Vec<PendingTorrent> {
+        (0..n)
+            .map(|i| PendingTorrent {
+                source: format!("magnet:?xt=urn:btih:{i:044x}"),
+                status: PendingStatus::Resolving,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn library_card_draws_green_accent_and_table() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().extend(pending_magnets(2));
+        let mut frame = Frame::new(80, 20);
+        tui.render_library_card(&mut frame, 80, 2, 8);
+        // Acento verde na margem esquerda das linhas de conteúdo do card.
+        assert_eq!(frame.cell(2, 0).ch(), '▌');
+        assert_eq!(frame.cell(2, 0).fg(), Some(THEME.card_accent_library));
+        assert_eq!(frame.cell(8, 0).ch(), '▌');
+        // Canto inferior esquerdo do card (borda inferior) é o `╹` (US-042).
+        assert_eq!(frame.cell(9, 0).ch(), '╹');
+        // Título na primeira linha do card.
+        let title: String = (3..40).map(|c| frame.cell(2, c).ch()).collect();
+        assert!(title.starts_with("Biblioteca de downloads"));
+        // Cabeçalho da tabela na segunda linha.
+        let header: String = (3..40).map(|c| frame.cell(3, c).ch()).collect();
+        assert!(header.contains("PROGRESSO"));
+        // Borda inferior `▀` na última linha do card.
+        assert_eq!(frame.cell(9, 1).ch(), '▀');
+        // Nenhum conteúdo abaixo da última linha do card (fora do limite).
+        let outside: String = (3..40).map(|c| frame.cell(10, c).ch()).collect();
+        assert!(outside.trim().is_empty());
+        assert_eq!(tui.library_region, Some((2, 8)));
+    }
+
+    #[tokio::test]
+    async fn library_card_scroll_shifts_visible_content_within_card() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().extend(pending_magnets(4));
+        let cols = 50u16;
+        let top = 1u16;
+        let height = 8u16;
+        let rows_for_items = (height - 3) as usize;
+
+        let mut frame = Frame::new(cols, 12);
+        tui.render_library_card(&mut frame, cols, top, height);
+        let before: String = (0..cols).map(|c| frame.cell(top + 2, c).ch()).collect();
+        let total_lines = tui
+            .library_map
+            .as_ref()
+            .expect("card visível gera library_map")
+            .rows
+            .len();
+
+        // Conteúdo excede a altura → há deslocamento possível.
+        assert!(total_lines > rows_for_items);
+
+        // Rolando, a primeira linha visível muda (conteúdo desloca dentro do
+        // card, sem vazar para as linhas de fora).
+        tui.library_scroll = 2;
+        let mut frame2 = Frame::new(cols, 12);
+        tui.render_library_card(&mut frame2, cols, top, height);
+        let after: String = (0..cols).map(|c| frame2.cell(top + 2, c).ch()).collect();
+        assert_ne!(before, after, "rolar deve mudar o conteúdo visível");
+
+        // Rolar até o fim mostra o último item e nada desenha fora do card.
+        tui.library_scroll = 100;
+        let mut frame3 = Frame::new(cols, 12);
+        tui.render_library_card(&mut frame3, cols, top, height);
+        let last: String = (0..cols).map(|c| frame3.cell(top + 2, c).ch()).collect();
+        assert_ne!(before, last);
+        // Nada é desenhado abaixo do card (a borda `▀` ocupa `top + height - 1`).
+        for r in (top + height)..(top + height + 2) {
+            if r >= 12 {
+                break;
+            }
+            let line: String = (0..cols).map(|c| frame3.cell(r, c).ch()).collect();
+            assert!(
+                line.chars().all(|c| c == ' '),
+                "linha {r} fora do card deve estar vazia"
+            );
+        }
+        // Clamp: no máximo (total_lines - linhas visíveis).
+        assert_eq!(tui.library_scroll, total_lines - rows_for_items);
+    }
+
+    #[tokio::test]
+    async fn mouse_wheel_scrolls_library_card_and_clamps() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().extend(pending_magnets(6));
+        tui.library_region = Some((8, 6));
+        let wheel = |kind: MouseEventKind| MouseEvent {
+            kind,
+            column: 40,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        };
+        tui.handle_mouse(wheel(MouseEventKind::ScrollDown))
+            .await
+            .unwrap();
+        assert_eq!(tui.library_scroll, 1);
+        tui.handle_mouse(wheel(MouseEventKind::ScrollDown))
+            .await
+            .unwrap();
+        assert_eq!(tui.library_scroll, 2);
+        tui.handle_mouse(wheel(MouseEventKind::ScrollUp))
+            .await
+            .unwrap();
+        assert_eq!(tui.library_scroll, 1);
+        // Fora da região da Biblioteca não rola a biblioteca.
+        tui.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 40,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(tui.library_scroll, 1);
+    }
+
+    /// `library_map` + região de um card com 8 linhas físicas: itens com
+    /// quebra de linha — item 0 ocupa 2, item 1 ocupa 3, item 2 ocupa 1 e
+    /// item 3 ocupa 2. Altura 6 → 3 linhas visíveis, deslocamento máximo 5.
+    fn wrapped_library_map() -> LibraryMap {
+        LibraryMap {
+            top: 10,
+            rows: vec![0, 0, 1, 1, 1, 2, 3, 3],
+        }
+    }
+
+    #[tokio::test]
+    async fn move_row_down_scrolls_library_to_keep_selection_visible() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().extend(pending_magnets(4));
+        tui.library_map = Some(wrapped_library_map());
+        tui.library_region = Some((10, 6));
+        tui.row_index = 0;
+        tui.library_scroll = 0;
+        // Item 1 ocupa as linhas 2..=4: a view rola para exibir o fim dele.
+        tui.move_row(1);
+        assert_eq!(tui.row_index, 1);
+        assert_eq!(tui.library_scroll, 2);
+        // Item 2 (linha 5) exige mais rolagem.
+        tui.move_row(1);
+        assert_eq!(tui.row_index, 2);
+        assert_eq!(tui.library_scroll, 3);
+        // Item 3 (linhas 6..=7): rola ao máximo (clamp) e fica visível.
+        tui.move_row(1);
+        assert_eq!(tui.row_index, 3);
+        assert_eq!(tui.library_scroll, 5);
+    }
+
+    #[tokio::test]
+    async fn move_row_up_scrolls_library_to_keep_selection_visible() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().extend(pending_magnets(4));
+        tui.library_map = Some(wrapped_library_map());
+        tui.library_region = Some((10, 6));
+        tui.row_index = 3;
+        tui.library_scroll = 5;
+        // Item 2 (linha 5) já está na janela: sem mudança.
+        tui.move_row(-1);
+        assert_eq!(tui.row_index, 2);
+        assert_eq!(tui.library_scroll, 5);
+        // Item 1 (linhas 2..=4) está acima da janela: rola para cima.
+        tui.move_row(-1);
+        assert_eq!(tui.row_index, 1);
+        assert_eq!(tui.library_scroll, 2);
+        // Item 0 (linhas 0..=1): rola ao topo.
+        tui.move_row(-1);
+        assert_eq!(tui.row_index, 0);
+        assert_eq!(tui.library_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn move_row_resets_library_scroll_when_content_fits() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().extend(pending_magnets(4));
+        // Card alto o bastante para todo o conteúdo: rolagem sempre 0.
+        tui.library_map = Some(LibraryMap {
+            top: 2,
+            rows: vec![0, 1, 2, 3],
+        });
+        tui.library_region = Some((2, 10));
+        tui.row_index = 0;
+        tui.library_scroll = 3;
+        tui.move_row(1);
+        assert_eq!(tui.row_index, 1);
+        assert_eq!(tui.library_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn move_row_without_library_map_just_moves_selection() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().extend(pending_magnets(4));
+        tui.library_map = None;
+        tui.row_index = 0;
+        tui.move_row(1);
+        assert_eq!(tui.row_index, 1);
+    }
+
+    #[tokio::test]
+    async fn move_row_down_wraps_to_top_and_scrolls_view_to_selection() {
+        // US-047: `↓` no último item faz wrap para o item 0; a view deve
+        // acompanhar a seleção rolada para o topo (senão o item some da janela).
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().extend(pending_magnets(4));
+        tui.library_map = Some(wrapped_library_map());
+        tui.library_region = Some((10, 6));
+        tui.row_index = 3;
+        tui.library_scroll = 5;
+        tui.move_row(1);
+        assert_eq!(tui.row_index, 0);
+        assert_eq!(tui.library_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn move_row_up_wraps_to_bottom_and_scrolls_view_to_selection() {
+        // US-047: `↑` no item 0 faz wrap para o último item; a view rola para
+        // baixo e mantém o fim do item visível.
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.pending.lock().unwrap().extend(pending_magnets(4));
+        tui.library_map = Some(wrapped_library_map());
+        tui.library_region = Some((10, 6));
+        tui.row_index = 0;
+        tui.library_scroll = 0;
+        tui.move_row(-1);
+        assert_eq!(tui.row_index, 3);
+        assert_eq!(tui.library_scroll, 5);
     }
 }

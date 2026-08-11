@@ -237,16 +237,17 @@ pub fn bottom_geometry(style: BottomStyle, rows: u16) -> BottomGeometry {
             edge_row: rows.saturating_sub(2),
             reserved: 1,
         },
-        // US-042: Card com 4 linhas (input + badges + linha de respiro + borda
-        // inferior) no fim da tela, isolado no render como `Length(4)`. Sem
-        // barra externa.
+        // US-042: Card com 6 linhas (input + 2 respiros + badges + respiro +
+        // borda inferior) no fim da tela. Mais alto, com respiro entre o campo
+        // de entrada e a linha de badges (toque fino solicitado). Sem barra
+        // externa.
         BottomStyle::Elevated => {
-            let input_row = rows.saturating_sub(4);
+            let input_row = rows.saturating_sub(6);
             BottomGeometry {
                 input_row,
                 badges_row: rows.saturating_sub(3),
                 edge_row: rows.saturating_sub(1),
-                reserved: 4,
+                reserved: 6,
             }
         }
     }
@@ -278,12 +279,28 @@ mod tests {
     }
 
     #[test]
-    fn geometry_elevated_reserves_four_rows() {
+    fn geometry_elevated_reserves_six_rows() {
         let g = bottom_geometry(BottomStyle::Elevated, 24);
-        assert_eq!(g.reserved, 4);
-        assert_eq!(g.input_row, 20);
+        assert_eq!(g.reserved, 6);
+        assert_eq!(g.input_row, 18);
         assert_eq!(g.badges_row, 21);
         assert_eq!(g.edge_row, 23);
+    }
+
+    #[test]
+    fn elevated_geometry_spaces_input_from_badges() {
+        // Toque fino: o card ficou mais alto, com respiro (2 linhas) entre o
+        // campo de entrada (rows-6) e a linha de badges (rows-3).
+        let g = bottom_geometry(BottomStyle::Elevated, 24);
+        assert_eq!(g.input_row, 18);
+        assert_eq!(g.badges_row, 21);
+        let mut frame = Frame::new(60, 24);
+        for r in (g.input_row + 1)..g.badges_row {
+            render_gap_row(&mut frame, 60, r, true);
+            assert_eq!(frame.cell(r, 0).ch(), '▌');
+            assert_eq!(frame.cell(r, 0).fg(), Some(THEME.card_accent_active));
+            assert_eq!(frame.cell(r, 1).bg, Some(THEME.card_bg));
+        }
     }
 
     #[test]
