@@ -42,6 +42,12 @@ const ROW_PREFIX_W: usize = 7;
 const PROGRESS_COL_W: usize = 31;
 /// Largura da coluna de status.
 const STATE_W: usize = 13;
+/// Largura total mínima da coluna de progresso no Card da Biblioteca (US-047):
+/// alguns blocos + o percentual adjacente, para a barra continuar legível em
+/// terminais estreitos.
+const MIN_BAR_W: usize = 14;
+/// Largura mínima da coluna de nome para que a quebra de linha seja legível.
+const NAME_W_MIN: usize = 10;
 /// Largura das colunas de métricas de rede (US-033): DOWN SPEED, UP SPEED, ETA
 /// e RATIO, incluindo os espaços separadores. Ex.: `12.4 MiB/s 1.2 MiB/s 00:04:12   1.45`.
 const METRICS_FIXED_W: usize = 38;
@@ -192,6 +198,41 @@ struct Layout {
     row_stride: u16,
 }
 
+/// Mapeamento do Card da Biblioteca (US-047): linha física da tela → índice
+/// global do item (torrents + pendentes). Como os nomes podem quebrar em mais
+/// de uma linha, cada entrada pode ocupar várias linhas físicas — o clique
+/// resolve pelo índice da linha em vez de assumir stride fixo como o `Layout`.
+struct LibraryMap {
+    /// Linha da tela da primeira linha física de itens.
+    top: u16,
+    /// Índice global do item de cada linha física (relativa a `top`).
+    rows: Vec<usize>,
+}
+
+impl LibraryMap {
+    /// Índice global do item na linha física `row` (relativa à tela), ou
+    /// `None` quando a linha cai fora do bloco de itens.
+    fn index_at(&self, row: u16) -> Option<usize> {
+        if row < self.top {
+            return None;
+        }
+        self.rows.get((row - self.top) as usize).copied()
+    }
+}
+
+/// Linha física do Card da Biblioteca (US-047): texto pronto para exibir e,
+/// quando a linha carrega uma barra de progresso, o trecho colorido que é
+/// sobreposto sobre o texto base.
+struct PhysicalRow {
+    /// Índice global do item (torrent + pendentes) ao qual a linha pertence.
+    item_idx: usize,
+    /// Linha de texto base (marcador/ID/barra/status/métricas/nome).
+    line: String,
+    /// `(texto da barra, cor do estado)` para sobrepor; `None` nas linhas de
+    /// continuação de nomes quebrados e na mensagem de fila vazia.
+    bar: Option<(String, Color)>,
+}
+
 /// Uma célula do buffer de tela (double buffering): um caractere + cores de
 /// primeiro plano e de fundo opcionais (`None` = cor padrão do terminal).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -268,6 +309,9 @@ pub(crate) struct Theme {
     /// Barra de acento vertical do Card de Histórico (US-046): laranja,
     /// distinguindo o painel de downloads completos do Card azul do footer.
     pub(crate) card_accent_alt: Color,
+    /// Barra de acento vertical do Card da Biblioteca (US-047): verde
+    /// fluorescente, distinguindo a lista de processamento dos demais Cards.
+    pub(crate) card_accent_library: Color,
 }
 
 pub(crate) const THEME: Theme = Theme {
@@ -305,6 +349,11 @@ pub(crate) const THEME: Theme = Theme {
         g: 115,
         b: 22,
     },
+    card_accent_library: Color::Rgb {
+        r: 57,
+        g: 255,
+        b: 20,
+    },
 };
 
 /// Buffer de tela (US-016): o render desenha o estado atual neste buffer e, ao
@@ -341,6 +390,7 @@ impl Frame {
 
     /// Escreve um texto a partir de `(row, col)` com destaque em ciano
     /// (`cyan = true`); fora dos limites é ignorado.
+    #[cfg(test)]
     fn put(&mut self, row: u16, col: u16, text: &str, cyan: bool) {
         let fg = if cyan { Some(Color::Cyan) } else { None };
         self.put_styled(row, col, text, fg, None);
@@ -500,6 +550,16 @@ pub(crate) struct Tui {
     keys: mpsc::UnboundedReceiver<Event>,
     /// Geometria do último render (usada para mapear cliques do mouse).
     layout: Option<Layout>,
+    /// Mapeamento do Card da Biblioteca (US-047): linha física → índice do
+    /// item, considerando a quebra de linha dos nomes. `None` quando o card
+    /// não está visível.
+    library_map: Option<LibraryMap>,
+    /// Deslocamento vertical (em linhas físicas, considerando quebras de nome)
+    /// do Card da Biblioteca (US-047).
+    library_scroll: usize,
+    /// Região (linha do topo, altura) do Card da Biblioteca, para a rolagem
+    /// com o mouse (US-047). `None` quando o card não está visível.
+    library_region: Option<(u16, u16)>,
     /// Origens adicionadas em segundo plano, compartilhadas com as tasks.
     pending: Arc<Mutex<Vec<PendingTorrent>>>,
     /// Frame anterior renderizado (double buffering / diff-rendering).
@@ -544,6 +604,9 @@ impl Tui {
             context_rect: None,
             keys,
             layout: None,
+            library_map: None,
+            library_scroll: 0,
+            library_region: None,
             pending: Arc::new(Mutex::new(Vec::new())),
             prev_frame: None,
             prev_cursor: None,
@@ -574,6 +637,9 @@ impl Tui {
             context_rect: None,
             keys,
             layout: None,
+            library_map: None,
+            library_scroll: 0,
+            library_region: None,
             pending: Arc::new(Mutex::new(Vec::new())),
             prev_frame: None,
             prev_cursor: None,
@@ -922,19 +988,24 @@ impl Tui {
 
     /// Handle one mouse event, dispatching clicks to the active view.
     async fn handle_mouse(&mut self, me: MouseEvent) -> anyhow::Result<()> {
-        // US-046: rolagem vertical do Card de Histórico (mouse wheel).
+        // US-046/047: rolagem vertical dos Cards de Histórico e Biblioteca
+        // (mouse wheel).
         if matches!(
             me.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         ) {
-            if let Some((top, height)) = self.history_region
+            let step: isize = if me.kind == MouseEventKind::ScrollUp {
+                -1
+            } else {
+                1
+            };
+            if let Some((top, height)) = self.library_region
                 && (top..top.saturating_add(height)).contains(&me.row)
             {
-                let step: isize = if me.kind == MouseEventKind::ScrollUp {
-                    -1
-                } else {
-                    1
-                };
+                self.library_scroll = (self.library_scroll as isize + step).max(0) as usize;
+            } else if let Some((top, height)) = self.history_region
+                && (top..top.saturating_add(height)).contains(&me.row)
+            {
                 self.history_scroll = (self.history_scroll as isize + step).max(0) as usize;
             }
             return Ok(());
@@ -985,8 +1056,16 @@ impl Tui {
         }
     }
 
-    /// Clique na Biblioteca da Home: move a seleção para a linha clicada.
+    /// Clique na Biblioteca da Home: move a seleção para o item clicado,
+    /// resolvendo a linha física pelo `library_map` (que considera nomes
+    /// quebrados em várias linhas). Cai no `layout` quando o card não existe.
     fn mouse_home(&mut self, row: u16) {
+        if let Some(map) = &self.library_map {
+            if let Some(idx) = map.index_at(row) {
+                self.row_index = idx;
+            }
+            return;
+        }
         let Some(layout) = self.layout else {
             return;
         };
@@ -1038,6 +1117,13 @@ impl Tui {
     /// seleção para ela e ancora o popup. Não faz nada se o clique cai fora
     /// das linhas de itens.
     fn open_context_menu(&mut self, row: u16) {
+        if let Some(map) = &self.library_map {
+            let Some(idx) = map.index_at(row) else {
+                return;
+            };
+            self.open_context_menu_at(idx, row);
+            return;
+        }
         let Some(layout) = self.layout else {
             return;
         };
@@ -1046,6 +1132,11 @@ impl Tui {
         else {
             return;
         };
+        self.open_context_menu_at(idx, row);
+    }
+
+    /// Ancoras o popup de contexto (US-036) sobre o item `idx` da Biblioteca.
+    fn open_context_menu_at(&mut self, idx: usize, row: u16) {
         self.row_index = idx;
         self.context_menu = Some(ContextMenu {
             entry_index: idx,
@@ -1518,11 +1609,11 @@ impl Tui {
 
         if hist_height >= 3 {
             let hist_top = body_top.saturating_add(lib_height);
-            self.render_library_panel(frame, cols, body_top, lib_height);
+            self.render_library_card(frame, cols, body_top, lib_height);
             self.render_history_card(frame, cols, hist_top, hist_height);
         } else {
             // Espaço só para a Biblioteca: o histórico é omitido.
-            self.render_library_panel(frame, cols, body_top, panels_height);
+            self.render_library_card(frame, cols, body_top, panels_height);
         }
         if self.bottom_style == BottomStyle::Legacy {
             self.render_home_prompt(frame, cols, prompt_row);
@@ -1564,7 +1655,7 @@ impl Tui {
             .saturating_add(4)
             .min(cols.saturating_sub(4));
         // Altura mínima de 3 (bordas), limitada ao espaço do Body acima do
-        // prompt; cada opção cabe (sem o -3 do `write_boxed_lines`).
+        // prompt; cada opção cabe (a altura soma as bordas sem reservar linha).
         let height = (lines.len() as u16)
             .saturating_add(2)
             .clamp(3, body_height.saturating_sub(1).max(3));
@@ -1617,43 +1708,85 @@ impl Tui {
         self.context_rect = Some((left, top, width, height));
     }
 
-    /// Painel superior da Home: tabela compacta da sessão (sem ações),
-    /// com a linha selecionada destacada e as barras coloridas por estado.
-    fn render_library_panel(&mut self, frame: &mut Frame, cols: u16, top: u16, height: u16) {
-        let left = LAYOUT_MARGIN_COLS;
-        let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS);
-        let content_left = left + 2;
-        let inner_width = (width as usize).saturating_sub(4);
+    /// Card da Biblioteca (US-047): mesmo estilo do Card do Histórico, com a
+    /// barra de acento esquerda **verde fluorescente**. Exibe a fila de
+    /// torrents (ativos + pendentes) em tabela com colunas responsivas — a
+    /// barra de progresso encolhe antes do nome em terminais estreitos —,
+    /// nomes longos quebrados em várias linhas e rolagem vertical (mouse)
+    /// com scrollbar quando o conteúdo excede a altura do card.
+    fn render_library_card(&mut self, frame: &mut Frame, cols: u16, top: u16, height: u16) {
+        if height < 4 {
+            self.library_map = None;
+            self.library_region = None;
+            return;
+        }
+        // Fundo do Card + acento verde na margem esquerda de todas as linhas.
+        frame.fill_rect(top, 0, height, cols, ' ', None, Some(THEME.card_bg));
+        for r in top..top.saturating_add(height) {
+            frame.put_styled(
+                r,
+                0,
+                ui_bottom::ACCENT_BLOCK,
+                Some(THEME.card_accent_library),
+                Some(THEME.card_bg),
+            );
+        }
 
+        // Área de conteúdo: 1 coluna de acento + margem + scrollbar à direita.
+        let content_left = 3u16;
+        let content_w = (cols as usize).saturating_sub(content_left as usize + 1);
+
+        // Colunas responsivas (US-047): as métricas aparecem só quando sobra
+        // espaço; a barra de progresso encolhe (até `MIN_BAR_W`) antes do nome,
+        // preservando a legibilidade do nome (`NAME_W_MIN`).
+        let show_metrics = content_w >= ROW_FIXED_W + METRICS_FIXED_W + 15;
+        let extra_w = if show_metrics { METRICS_FIXED_W } else { 0 };
+        // Colunas fixas antes da barra: marcador/ID (ROW_PREFIX_W) + espaço +
+        // STATUS (STATE_W) + espaço (+ métricas quando visíveis).
+        let prefix_w = ROW_PREFIX_W + 1 + STATE_W + 1 + extra_w;
+        let room = content_w.saturating_sub(prefix_w);
+        let bar_w = PROGRESS_COL_W
+            .min(room.saturating_sub(NAME_W_MIN))
+            .max(MIN_BAR_W)
+            .min(room.max(1));
+        let name_width = room.saturating_sub(bar_w).max(1);
+        // Coluna inicial do nome (indentação das linhas de continuação).
+        let name_col = prefix_w + bar_w;
+
+        // Título + cabeçalho da tabela.
+        frame.put_styled(
+            top,
+            content_left,
+            "Biblioteca de downloads",
+            Some(THEME.text),
+            Some(THEME.card_bg),
+        );
+        let header = session_table_header(name_width, show_metrics, bar_w);
+        frame.put_styled(
+            top + 1,
+            content_left,
+            &header,
+            Some(THEME.muted),
+            Some(THEME.card_bg),
+        );
+
+        // Bloco físico dos itens: cada entrada gera a linha-base da tabela
+        // (com o nome na coluna NOME) e, quando o nome estoura, linhas de
+        // continuação indentadas. A barra colorida é desenhada por cima depois.
         let rows_data = self.session_rows();
         let pending = self.pending.lock().unwrap().clone();
-        let mut lines: Vec<String> = Vec::new();
-        lines.push("Biblioteca de downloads".into());
-        lines.push(String::new());
+        let mut physical: Vec<PhysicalRow> = Vec::new();
+        let mut map_rows: Vec<usize> = Vec::new();
 
-        // Métricas de rede (US-033) apenas quando o terminal tem espaço para o
-        // nome além das colunas fixas — senão a tabela cai no layout compacto.
-        let show_metrics = inner_width >= ROW_FIXED_W + METRICS_FIXED_W + 15;
-        let fixed_w = if show_metrics {
-            ROW_FIXED_W + METRICS_FIXED_W
+        if rows_data.is_empty() && pending.is_empty() {
+            physical.push(PhysicalRow {
+                item_idx: 0,
+                line: "nenhum torrent na fila".into(),
+                bar: None,
+            });
+            map_rows.push(0);
         } else {
-            ROW_FIXED_W
-        };
-        let name_width = inner_width.saturating_sub(fixed_w).max(1);
-        lines.push(session_table_header(name_width, show_metrics));
-        lines.push(separator_line(inner_width));
-
-        let total = rows_data.len() + pending.len();
-        let max_rows = (height as usize).saturating_sub(5);
-        // (índice de linha no bloco, barra, cor) para sobrepor após a base.
-        let mut bars: Vec<(usize, String, Color)> = Vec::new();
-        // 0 título, 1 vazio, 2 cabeçalho, 3 separador, 4+ dados.
-        let mut row_line = 4usize;
-
-        if total == 0 {
-            lines.push("nenhum torrent na fila".into());
-        } else {
-            for (idx, row) in rows_data.iter().take(max_rows).enumerate() {
+            for (idx, row) in rows_data.iter().enumerate() {
                 let marker = if idx == self.row_index { "> " } else { "  " };
                 let state = if row.finished {
                     "concluído"
@@ -1670,8 +1803,8 @@ impl Tui {
                 } else {
                     row.progress_bytes as f64 / row.total_bytes as f64 * 100.0
                 };
-                let bar = progress_bar(pct);
-                let color = progress_color(row.state, row.finished, row.down_speed_mbps);
+                let bar = progress_bar_width(pct, bar_w);
+                let bar_color = progress_color(row.state, row.finished, row.down_speed_mbps);
                 let metrics = if show_metrics {
                     Some(row_metrics_text(
                         row.finished,
@@ -1688,7 +1821,7 @@ impl Tui {
                 } else {
                     None
                 };
-                lines.push(session_table_line(
+                let base = session_table_line(
                     marker,
                     idx,
                     &bar,
@@ -1696,16 +1829,26 @@ impl Tui {
                     &row.name,
                     name_width,
                     metrics.as_deref(),
-                ));
-                bars.push((row_line, bar, color));
-                row_line += 1;
+                );
+                physical.push(PhysicalRow {
+                    item_idx: idx,
+                    line: base,
+                    bar: Some((bar, bar_color)),
+                });
+                map_rows.push(idx);
+                for chunk in wrap_text(&row.name, name_width).into_iter().skip(1) {
+                    let cont = format!("{}{}", " ".repeat(name_col), chunk);
+                    physical.push(PhysicalRow {
+                        item_idx: idx,
+                        line: cont,
+                        bar: None,
+                    });
+                    map_rows.push(idx);
+                }
             }
             // Origens pendentes (adição assíncrona) também aparecem.
             let mut idx = rows_data.len();
             for pt in &pending {
-                if row_line >= 4 + max_rows {
-                    break;
-                }
                 let marker = if idx == self.row_index { "> " } else { "  " };
                 let (state, color) = match &pt.status {
                     PendingStatus::Resolving => ("inicializando".to_string(), THEME.accent),
@@ -1715,13 +1858,13 @@ impl Tui {
                     }
                     PendingStatus::Done(_) => continue,
                 };
-                let bar = progress_bar(0.0);
+                let bar = progress_bar_width(0.0, bar_w);
                 let metrics = if show_metrics {
                     Some(empty_metrics_text())
                 } else {
                     None
                 };
-                lines.push(session_table_line(
+                let base = session_table_line(
                     marker,
                     idx,
                     &bar,
@@ -1729,40 +1872,110 @@ impl Tui {
                     &pt.source,
                     name_width,
                     metrics.as_deref(),
-                ));
-                bars.push((row_line, bar, color));
-                row_line += 1;
+                );
+                physical.push(PhysicalRow {
+                    item_idx: idx,
+                    line: base,
+                    bar: Some((bar, color)),
+                });
+                map_rows.push(idx);
+                for chunk in wrap_text(&pt.source, name_width).into_iter().skip(1) {
+                    let cont = format!("{}{}", " ".repeat(name_col), chunk);
+                    physical.push(PhysicalRow {
+                        item_idx: idx,
+                        line: cont,
+                        bar: None,
+                    });
+                    map_rows.push(idx);
+                }
                 idx += 1;
             }
         }
 
-        let mut highlighted = Vec::new();
-        if self.row_index < total && self.row_index < max_rows {
-            highlighted.push(4 + self.row_index);
+        // Janela rolada: título + cabeçalho + borda inferior reservam 3 linhas.
+        let rows_for_items = height.saturating_sub(3) as usize;
+        let total_lines = physical.len();
+        let max_scroll = total_lines.saturating_sub(rows_for_items);
+        self.library_scroll = self.library_scroll.min(max_scroll);
+        let total_items = rows_data.len() + pending.len();
+        let items_top = top + 2;
+
+        for (i, pr) in physical
+            .iter()
+            .skip(self.library_scroll)
+            .take(rows_for_items)
+            .enumerate()
+        {
+            let row = items_top + i as u16;
+            let selected = pr.item_idx < total_items && pr.item_idx == self.row_index;
+            let bg = if selected {
+                THEME.highlight_bg
+            } else {
+                THEME.card_bg
+            };
+            if selected {
+                frame.fill(row, content_left, content_w as u16, ' ', None, Some(bg));
+            }
+            frame.put_styled(row, content_left, &pr.line, Some(THEME.text), Some(bg));
+            if let Some((bar, color)) = &pr.bar {
+                frame.put_styled(
+                    row,
+                    content_left + ROW_PREFIX_W as u16,
+                    bar,
+                    Some(*color),
+                    Some(bg),
+                );
+            }
         }
 
-        draw_box(frame, left, top, width, height);
-        write_boxed_lines(frame, content_left, top + 1, &lines, &highlighted, height);
-
-        // Barras coloridas por estado por cima da linha base.
-        for (line_idx, bar, color) in &bars {
-            let row = top + 1 + *line_idx as u16;
-            frame.put_styled(
-                row,
-                content_left + ROW_PREFIX_W as u16,
-                bar,
-                Some(*color),
-                None,
-            );
+        // Scrollbar vertical à direita quando o conteúdo excede o card.
+        if total_lines > rows_for_items {
+            let sb_col = cols.saturating_sub(1);
+            let track = height - 1;
+            let thumb_h = ((track as usize * rows_for_items) / total_lines).max(1) as u16;
+            let thumb_offset = (track - thumb_h) as usize * self.library_scroll / max_scroll;
+            for i in 0..track {
+                let row = top + i;
+                let in_thumb =
+                    (i as usize) >= thumb_offset && (i as usize) < thumb_offset + thumb_h as usize;
+                if in_thumb {
+                    frame.put_styled(
+                        row,
+                        sb_col,
+                        "█",
+                        Some(THEME.card_accent_library),
+                        Some(THEME.card_bg),
+                    );
+                } else {
+                    frame.put_styled(row, sb_col, "░", Some(THEME.muted), Some(THEME.card_bg));
+                }
+            }
         }
 
-        // Geometria para cliques do mouse na Biblioteca (move a seleção).
-        self.layout = Some(Layout {
-            top: top + 1,
-            rows_offset: 4,
-            row_count: bars.len().max(1),
-            row_stride: 1,
+        // Borda inferior do Card (US-042/046): canto `╹` + `▀`.
+        let edge_row = top + height - 1;
+        frame.put_styled(
+            edge_row,
+            0,
+            ui_bottom::ACCENT_CORNER,
+            Some(THEME.card_accent_idle),
+            None,
+        );
+        frame.fill(
+            edge_row,
+            1,
+            cols.saturating_sub(1),
+            ui_bottom::EDGE_BLOCK,
+            Some(THEME.card_bg),
+            None,
+        );
+
+        // Mapeamento linha física → item (cliques do mouse) e região de rolagem.
+        self.library_map = Some(LibraryMap {
+            top: items_top,
+            rows: map_rows,
         });
+        self.library_region = Some((top, height));
     }
 
     /// Card do Histórico de downloads (US-046): mesmo estilo do Card do footer,
@@ -2106,7 +2319,7 @@ impl Tui {
             .saturating_add(4)
             .min(cols.saturating_sub(4));
         // Altura mínima de 3 (bordas) e máxima limitada pelo espaço acima do
-        // prompt; cada linha de comando cabe (sem o -3 do write_boxed_lines).
+        // prompt; cada linha de comando cabe (a altura soma as bordas).
         let height = (lines.len() as u16)
             .saturating_add(2)
             .clamp(3, prompt_row.saturating_sub(body_top).max(3));
@@ -2121,8 +2334,8 @@ impl Tui {
 
         // Desenha cada linha manualmente: a selecionada com highlight de fundo
         // (AC-3) e as demais com o fundo sólido do popup. Como o popup pode ser
-        // pequeno (1 item filtrado), não usa `write_boxed_lines` (que limita a
-        // `height - 3` linhas e zeraria um popup de 3 linhas).
+        // pequeno (1 item filtrado), não há reserva de linha extra para limite
+        // de altura — o próprio `max_lines` cuida da janela visível.
         let max_lines = (height as usize).saturating_sub(2);
         for (idx, line) in lines.iter().take(max_lines).enumerate() {
             let row = top + 1 + idx as u16;
@@ -2167,7 +2380,7 @@ impl Tui {
 
 /// Linha de um comando do popup flutuante (US-031): comando à esquerda e
 /// descrição funcional alinhada à direita. O comando selecionado recebe o
-/// marcador `>` (o destaque de fundo é aplicado pelo `write_boxed_lines`).
+/// marcador `>` (o destaque de fundo é aplicado pelo `render_menu`).
 fn command_item_line(cmd: &str, desc: &str, selected: bool) -> String {
     let marker = if selected { "> " } else { "  " };
     format!("{marker}{cmd:<8} {desc}")
@@ -2254,19 +2467,78 @@ fn prompt_cursor_col(input: &str, cursor_bytes: usize, max_visible: usize) -> us
 
 /// Barra de progresso em blocos contínuos estilo VCL/GUI (US-020): `█` para o
 /// trecho concluído e `░` para o restante, com o percentual exato adjacente
-/// (ex.: `████████████░░░░░░░░░░░░░░  50.0%`). Ocupa toda a largura da coluna.
+/// (ex.: `████████████░░░░░░░░░░░░░░  50.0%`). Ocupa a largura fixa da coluna
+/// da tabela (`PROGRESS_COL_W`).
+#[cfg(test)]
 fn progress_bar(pct: f64) -> String {
-    let bar_width = PROGRESS_COL_W - 7; // 7 = espaço + percentual (ex.: " 50.0%")
+    progress_bar_width(pct, PROGRESS_COL_W)
+}
+
+/// Barra de progresso com largura responsiva (US-047): mesma estética da
+/// `progress_bar`, mas o chamador define a largura total `bar_w` (blocos +
+/// espaço + percentual). O percentual sempre ocupa 6 caracteres
+/// (`" 50.0%"`); os blocos absorvem o restante.
+fn progress_bar_width(pct: f64, bar_w: usize) -> String {
     let pct = pct.clamp(0.0, 100.0);
-    let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
-    let filled = filled.min(bar_width);
+    let pct_text = format!("{pct:>5.1}%");
+    let block_w = bar_w.saturating_sub(pct_text.len() + 1); // +1 espaço antes
+    let filled = ((pct / 100.0) * block_w as f64).round() as usize;
+    let filled = filled.min(block_w);
     // `█`/`░` ocupam 3 bytes cada; a capacidade evita realocação por frame.
-    let mut bar = String::with_capacity(bar_width * 3 + 7);
+    let mut bar = String::with_capacity(bar_w * 3);
     bar.push_str(&"█".repeat(filled));
-    bar.push_str(&"░".repeat(bar_width - filled));
+    bar.push_str(&"░".repeat(block_w - filled));
     bar.push(' ');
-    bar.push_str(&format!("{pct:>5.1}%"));
+    bar.push_str(&pct_text);
     bar
+}
+
+/// Quebra `text` em linhas de no máximo `max_chars` caracteres, respeitando
+/// limites de palavras (espaços). Palavras mais longas que a linha (ex.: URLs
+/// de magnet sem espaços) são cortadas no meio. Usado pelo Card da Biblioteca
+/// (US-047) para nomes longos que não cabem numa única linha.
+fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 || text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split_whitespace() {
+        let chars: Vec<char> = word.chars().collect();
+        let word_w = chars.len();
+        if word_w <= max_chars {
+            if !cur.is_empty() && cur_w + 1 + word_w <= max_chars {
+                cur.push(' ');
+                cur.push_str(word);
+                cur_w += 1 + word_w;
+            } else if cur.is_empty() {
+                cur.push_str(word);
+                cur_w = word_w;
+            } else {
+                lines.push(std::mem::take(&mut cur));
+                cur.push_str(word);
+                cur_w = word_w;
+            }
+        } else {
+            // Palavra longa (magnet, URL): fecha a linha atual e corta em
+            // pedaços, cada um iniciando uma nova linha.
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            for chunk in chars.chunks(max_chars) {
+                if !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
+                }
+                cur.extend(chunk);
+                cur_w = chunk.len();
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 /// Formata uma velocidade em MiB/s (US-033), ex.: `12.4 MiB/s`.
@@ -2403,15 +2675,17 @@ fn table_row_to_index(row: u16, first_row: u16, row_count: usize, stride: u16) -
 /// Linha divisória sutil (US-028): `─` repetido pela largura da tabela,
 /// separando registros sem gastar linhas em branco. A cor escura
 /// (`THEME.muted`) é aplicada pelo chamador na sobreposição.
+#[cfg(test)]
 fn separator_line(width: usize) -> String {
     "─".repeat(width)
 }
 
-fn session_table_header(name_width: usize, show_metrics: bool) -> String {
+fn session_table_header(name_width: usize, show_metrics: bool, bar_w: usize) -> String {
     // Colunas numéricas com rótulos alinhados à direita (sobre os dígitos);
     // colunas de texto alinhadas à esquerda — alinhamento perfeito com os
-    // valores das linhas de dados.
-    let mut line = format!("  {:>4} {:<31} {:<13}", "ID", "PROGRESSO", "STATUS");
+    // valores das linhas de dados. A largura da coluna PROGRESSO acompanha a
+    // barra (`bar_w`) usada nas linhas de dados.
+    let mut line = format!("  {:>4} {:<bar_w$} {:<13}", "ID", "PROGRESSO", "STATUS");
     if show_metrics {
         line.push_str(&format!(
             " {:<10} {:<10} {:<8} {:<6}",
@@ -2521,7 +2795,7 @@ fn cycle_context_selection(selected: usize, len: usize, delta: isize) -> usize {
 }
 
 /// Linha de uma opção do menu de contexto (US-036): marcador `>` na opção
-/// destacada (o fundo é aplicado pelo render com `write_boxed_lines`).
+/// destacada (o fundo é aplicado pelo render com `render_context_menu`).
 fn context_item_line(label: &str, selected: bool) -> String {
     let marker = if selected { "> " } else { "  " };
     format!("{marker}{label}")
@@ -2594,48 +2868,6 @@ fn draw_box(frame: &mut Frame, left: u16, top: u16, width: u16, height: u16) {
         frame.put_colored(row, left + width - 1, "│", Some(THEME.border));
     }
     frame.put_colored(top + height - 1, left, &bottom_line, Some(THEME.border));
-}
-
-/// Escreve linhas de conteúdo dentro do quadro no buffer. As linhas
-/// selecionadas recebem o mesmo tratamento de `centered_write` (AC-4): fundo
-/// de destaque (`THEME.highlight_bg`) + texto branco, cobrindo a largura
-/// máxima do bloco; as demais ficam com texto padrão.
-fn write_boxed_lines(
-    frame: &mut Frame,
-    content_left: u16,
-    content_top: u16,
-    lines: &[String],
-    highlighted: &[usize],
-    frame_height: u16,
-) {
-    let max_lines = (frame_height as usize).saturating_sub(3);
-    let max_width = lines
-        .iter()
-        .map(|l| l.chars().count() as u16)
-        .max()
-        .unwrap_or(0);
-    for (idx, line) in lines.iter().take(max_lines).enumerate() {
-        let row = content_top + idx as u16;
-        if highlighted.contains(&idx) {
-            frame.fill(
-                row,
-                content_left,
-                max_width,
-                ' ',
-                None,
-                Some(THEME.highlight_bg),
-            );
-            frame.put_styled(
-                row,
-                content_left,
-                line,
-                Some(THEME.text),
-                Some(THEME.highlight_bg),
-            );
-        } else {
-            frame.put(row, content_left, line, false);
-        }
-    }
 }
 
 /// Remove ANSI escape sequences added by crossterm style helpers.
@@ -2965,6 +3197,77 @@ mod tests {
     }
 
     #[test]
+    fn progress_bar_width_respects_custom_width() {
+        let bar = progress_bar_width(50.0, 20);
+        assert_eq!(bar.chars().count(), 20);
+        assert!(bar.ends_with(" 50.0%"));
+        // Largura maior preenche com mais blocos.
+        let wide = progress_bar_width(50.0, 40);
+        assert_eq!(wide.chars().count(), 40);
+    }
+
+    #[test]
+    fn progress_bar_width_clamps_out_of_range() {
+        assert_eq!(progress_bar_width(150.0, 20), progress_bar_width(100.0, 20));
+        assert_eq!(progress_bar_width(-10.0, 20), progress_bar_width(0.0, 20));
+    }
+
+    #[test]
+    fn wrap_text_splits_on_word_boundaries() {
+        let lines = wrap_text("foo bar baz qux", 9);
+        assert_eq!(lines, vec!["foo bar", "baz qux"]);
+    }
+
+    #[test]
+    fn wrap_text_keeps_short_text_in_one_line() {
+        assert_eq!(wrap_text("curto", 10), vec!["curto"]);
+        assert_eq!(wrap_text("", 10), vec![""]);
+    }
+
+    #[test]
+    fn wrap_text_cuts_long_words_without_spaces() {
+        // Palavra maior que a linha (ex.: magnet) é cortada em pedaços.
+        let lines = wrap_text("magnet:?xt=urn:btih:abcd", 6);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|l| l.chars().count() <= 6));
+    }
+
+    #[test]
+    fn wrap_text_never_exceeds_max_chars() {
+        let text = "um nome bem longo de arquivo com várias palavras no meio";
+        let lines = wrap_text(text, 15);
+        assert!(lines.iter().all(|l| l.chars().count() <= 15));
+        assert_eq!(
+            lines.join(" ").replace("  ", " ").chars().count(),
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn library_map_index_at_maps_screen_row_to_item() {
+        let map = LibraryMap {
+            top: 4,
+            rows: vec![0, 0, 1, 2, 2],
+        };
+        // Linhas 4..=8 mapeiam; fora do bloco retorna None.
+        assert_eq!(map.index_at(4), Some(0));
+        assert_eq!(map.index_at(5), Some(0)); // continuação do item 0
+        assert_eq!(map.index_at(6), Some(1));
+        assert_eq!(map.index_at(8), Some(2));
+        assert_eq!(map.index_at(3), None);
+        assert_eq!(map.index_at(9), None);
+    }
+
+    #[test]
+    fn library_map_index_at_empty_rows() {
+        let map = LibraryMap {
+            top: 0,
+            rows: vec![],
+        };
+        assert_eq!(map.index_at(0), None);
+    }
+
+    #[test]
     fn progress_color_matches_state() {
         // Live saudável (≥ 1 MiB/s): verde.
         assert_eq!(
@@ -3162,7 +3465,7 @@ mod tests {
     #[test]
     fn session_table_header_with_metrics_matches_data_width() {
         let bar = progress_bar(50.0);
-        let header = session_table_header(12, true);
+        let header = session_table_header(12, true, PROGRESS_COL_W);
         let metrics = row_metrics_text(false, Some(1.2), Some(0.0), Some(252), 145, 100);
         let data = session_table_line(
             "  ",
@@ -3327,7 +3630,7 @@ mod tests {
         // O divisor fino tem a mesma largura do cabeçalho e da linha de dados
         // (sem métricas) — as colunas permanecem alinhadas (AC-2/AC-3).
         let name_width = 12;
-        let header = session_table_header(name_width, false);
+        let header = session_table_header(name_width, false, PROGRESS_COL_W);
         let sep = separator_line(header.chars().count());
         assert!(sep.chars().all(|c| c == '─'));
         assert_eq!(sep.chars().count(), header.chars().count());
@@ -3639,6 +3942,41 @@ mod tests {
         assert_eq!(tui.row_index, 2);
         tui.mouse_home(0); // fora do bloco: nada muda
         assert_eq!(tui.row_index, 2);
+    }
+
+    #[tokio::test]
+    async fn mouse_home_uses_library_map_with_wrapped_names() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        // Item 0 ocupa 2 linhas físicas (nome quebrado); item 1, uma.
+        tui.library_map = Some(LibraryMap {
+            top: 10,
+            rows: vec![0, 0, 1],
+        });
+        tui.row_index = 0;
+        tui.mouse_home(11); // continuação do item 0
+        assert_eq!(tui.row_index, 0);
+        tui.mouse_home(12); // item 1
+        assert_eq!(tui.row_index, 1);
+        tui.mouse_home(13); // fora do bloco: nada muda
+        assert_eq!(tui.row_index, 1);
+    }
+
+    #[tokio::test]
+    async fn open_context_menu_uses_library_map_on_clicked_row() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        tui.library_map = Some(LibraryMap {
+            top: 2,
+            rows: vec![0, 0, 1],
+        });
+        tui.open_context_menu(3); // continuação do item 0
+        let cm = tui.context_menu.expect("popup deve abrir");
+        assert_eq!(cm.entry_index, 0);
+        assert_eq!(cm.anchor_row, 3);
+        assert_eq!(tui.row_index, 0);
+        tui.open_context_menu(4); // item 1
+        let cm = tui.context_menu.expect("popup deve reabrir");
+        assert_eq!(cm.entry_index, 1);
+        assert_eq!(tui.row_index, 1);
     }
 
     #[tokio::test]
