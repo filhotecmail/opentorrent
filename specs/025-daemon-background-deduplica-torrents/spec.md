@@ -17,6 +17,8 @@
 5. **Início do daemon**: A — a TUI inicia o daemon automaticamente quando ele não está rodando (transparente).
 6. **Service manager (follow-up US-040)**: A — o daemon é instalado como **systemd user service** (`~/.config/systemd/user/opentorrent-daemon.service`), criado automaticamente pelo binário na primeira execução (instalação) se não existir; `start`/`stop`/`status` delegam ao `systemctl --user`.
 7. **Ciclo de atualização (follow-up US-040)**: A — novo comando `opentorrent update`: para o service, baixa/substitui o binário da release GitHub (validando a assinatura US-018 quando disponível), reescreve o service se necessário e religa o daemon.
+8. **Ordenação automática (follow-up US-040)**: A — quando houver torrents **em processamento** (Live) na fila, eles ficam no **topo do grid**; todo o grid é ordenado do **mais recente para o mais antigo** (id decrescente), com os em processamento pinados no topo (recomendado: ordenação por inserção em todos, processando primeiro).
+9. **Cores do gauge (follow-up US-040)**: A — **vermelho** em caso de falha/erro; **laranja** quando o downstream estiver **abaixo de 1 MiB/s** (torrent Live); **verde mais escuro** (`DarkGreen`) para 100% concluído — aplicado **apenas no grid da Biblioteca** (o painel Histórico mantém o verde atual).
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -100,6 +102,36 @@ O comando `opentorrent update` consulta a release mais recente no GitHub (mesmo 
 3. **Given** o update baixa um binário inválido (verificação de assinatura habilitada e falha), **Then** a substituição é abortada e o binário/versão atuais são preservados.
 4. **Given** já na versão mais recente, **When** o usuário roda `opentorrent update`, **Then** a mensagem indica que está atualizado e nada é substituído.
 5. **Given** falha de rede durante o download, **Then** `update` aborta graciosamente e mantém o binário atual intacto.
+
+### User Story 7 - Ordenação automática do grid (Priority: P1)
+
+A Biblioteca do grid da TUI é ordenada automaticamente: quando há torrents em processamento (Live, baixando) na fila, eles ficam **no topo do grid**; o primeiro item no topo é sempre o **último inserido** (o mais recente por id). A ordenação aplica-se a todas as linhas — torrents fora de processamento (pausado/erro/inicializando/concluído) também ficam do mais recente para o mais antigo, logo abaixo do grupo em processamento.
+
+**Why this priority**: Requisito explícito do usuário — "ordenação automática: torrents em processamento no topo, primeiro no topo é o último inserido".
+
+**Independent Test**: Com 2+ torrents na fila (um recém-adicionado em Live), o grid mostra o torrent mais recente em primeiro lugar e os em processamento acima dos demais estados.
+
+**Acceptance Scenarios**:
+1. **Given** torrents em processamento e não-processando na fila, **When** a Biblioteca é renderizada, **Then** os em processamento (Live) aparecem acima dos demais.
+2. **Given** múltiplos torrents em processamento, **When** a Biblioteca é renderizada, **Then** o mais recentemente inserido (maior id) vem primeiro, descendo até o mais antigo.
+3. **Given** múltiplos torrents não-processando, **When** a Biblioteca é renderizada, **Then** eles vêm depois dos em processamento, também do mais recente para o mais antigo.
+4. **Given** a ordenação automática ativa, **When** um torrent novo é adicionado, **Then** ele passa a aparecer no topo do grid (primeira linha).
+5. **Given** a mesma ordenação em modo daemon (US-040), **When** o snapshot é recebido, **Then** a TUI renderiza na mesma ordem do grid local (ordenação pelo mesmo critério).
+
+### User Story 8 - Cores do gauge de progresso (Priority: P1)
+
+O gauge (barra de progresso) ganha cores semânticas por situação: **vermelho** quando o download falhou (estado Error); **laranja** quando o downstream está baixo (torrent Live com velocidade de download abaixo de **1 MiB/s**); **verde mais escuro** (`DarkGreen`) para torrents **100% concluídos**. Aplicado ao **grid da Biblioteca**; o painel Histórico mantém o verde atual. O verde normal permanece para downloads em andamento saudáveis (Live ≥ 1 MiB/s).
+
+**Why this priority**: Requisito explícito do usuário — "em caso de falha mostrar o Gauge de progresso em vermelho; laranja p/ downstream baixo; verde mais escuro p/ 100% concluído".
+
+**Independent Test**: Com um torrent em erro, um em Live com speed < 1 MiB/s, um em Live com speed ≥ 1 MiB/s e um concluído, o grid exibe respectivamente gauge vermelho, laranja, verde e verde escuro.
+
+**Acceptance Scenarios**:
+1. **Given** um torrent em estado Error, **When** a Biblioteca é renderizada, **Then** o gauge é vermelho (paleta `error`).
+2. **Given** um torrent Live com velocidade de download < 1 MiB/s, **When** a Biblioteca é renderizada, **Then** o gauge é laranja (novo token da paleta).
+3. **Given** um torrent Live com velocidade de download ≥ 1 MiB/s, **When** a Biblioteca é renderizada, **Then** o gauge é verde (paleta `success`).
+4. **Given** um torrent 100% concluído (`finished`), **When** a Biblioteca é renderizada, **Then** o gauge é verde escuro (`DarkGreen`).
+5. **Given** um download completo no painel Histórico, **When** o painel é renderizado, **Then** o texto mantém o verde atual (sem mudança).
 
 ## Technical Context
 

@@ -647,8 +647,14 @@ mod tests {
                 None,
             )
             .await;
-        if let Ok(librqbit::AddTorrentResponse::AlreadyManaged(_, _)) = resp {
-            assert!(true, "dedup por infohash ativo");
+        match resp {
+            Ok(librqbit::AddTorrentResponse::AlreadyManaged(_, _)) => {
+                // Dedup por infohash ativo: 2ª adição reportada como existente.
+            }
+            Ok(_) => panic!("segunda adição do mesmo infohash deveria ser AlreadyManaged"),
+            // Rede indisponível no CI: o add falha; o dedup não é verificável
+            // aqui (teste aceita e não panica).
+            Err(_) => {}
         }
     }
 }

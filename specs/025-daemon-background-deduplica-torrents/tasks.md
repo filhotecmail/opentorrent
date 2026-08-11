@@ -93,3 +93,29 @@
 - [x] T029 `cargo test` verde; atualizar `.specify`/docs do SDD se o design mudou durante a implementação.
 - [x] T030 Revisão cruzada: constituição (IV/VIII), Rust Skills Check do plan.md concretizado no código
       (sem guard cruzando `.await`, sem `.unwrap()` em caminhos produtivos, Arc compartilhado).
+
+## Phase 10: User Story 7 - Ordenação automática do grid (P1)
+
+**Goal**: torrents em processamento no topo; dentro de cada grupo, do mais recente para o mais antigo (id desc)
+
+- [x] T031 Criar função pura `row_sort_key`/comparador de ordenação (`sort_rows_for_grid`): processando
+      (Live, não concluído) primeiro, dentro do grupo por `id` decrescente; unit tests com estados variados.
+- [x] T032 Aplicar a ordenação em `session_rows()` (session_ui.rs) substituindo `rows.sort_by_key(|r| r.id)`
+      pela nova chave (mesma ordenação em modo local e via snapshot do daemon - reordenar após mapear).
+- [x] T033 Teste: com 2+ `SessionRow` (Live + pausado + erro + concluído) a função produz a ordem esperada
+      (processando no topo, mais recente primeiro); sem quebrar navegação/`row_index` (ordem de render).
+
+## Phase 11: User Story 8 - Cores do gauge de progresso (P1)
+
+**Goal**: vermelho = erro, laranja = downstream < 1 MiB/s (Live), verde escuro = 100% concluído, verde normal
+= Live saudável; aplicado ao grid da Biblioteca (Histórico mantém verde atual)
+
+- [x] T034 Adicionar token `progress_low: Color::Rgb(...)` (laranja) e `progress_done: Color::DarkGreen`
+      (verde escuro) à paleta `THEME`; constante `LOW_DOWNSTREAM_MIBPS: f64 = 1.0`.
+- [x] T035 Extender `progress_color(state, finished, down_speed)` (session_ui): erro → `error`; Live com
+      `down_speed < 1.0` → laranja; Live com `down_speed >= 1.0` → `success`; `finished` (100%) → verde
+      escuro; pausado/inicializando mantêm amarelo/ciano atuais.
+- [x] T036 Passar `row.down_speed_mbps` na chamada de `progress_color` no render do grid; garantir que o
+      painel Histórico continua usando `THEME.success` (sem mudança).
+- [x] T037 Testes de `progress_color` para os 5 casos (erro, low-speed, live ok, finished, paused) e da
+      largura/paleta do gauge; rodar gates fim-a-fim (fmt/clippy/test).

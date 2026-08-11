@@ -21,8 +21,9 @@ use tokio::sync::mpsc;
 
 use crate::{
     daemon,
-    downloads::{format_completed, list_completed_downloads},
+    downloads::{format_completed_row, history_header, list_completed_downloads},
     ipc::{DaemonRequest, DaemonResponse, DaemonState},
+    ui_bottom::{self, BottomStyle},
 };
 
 /// Comandos do menu flutuante (US-031): comando e descrição funcional.
@@ -51,7 +52,18 @@ const ROW_FIXED_W: usize = ROW_PREFIX_W + PROGRESS_COL_W + 1 + STATE_W + 1;
 /// cada lateral. O topo/base é 1 linha, embutido nos painéis.
 const LAYOUT_MARGIN_COLS: u16 = 2;
 
+/// Intervalo de validade do cache do Histórico (US-045): a lista de completos
+/// só é re-escaneada do disco após este período, evitando re-ordenar/re-desenhar
+/// a cada frame.
+const HISTORY_REFRESH: Duration = Duration::from_secs(2);
+
+/// Estilo da área inferior da TUI (US-041). Para voltar à UI anterior, troque
+/// para `BottomStyle::Legacy` — o render intacto (`render_home_prompt` +
+/// `render_footer`) e a geometria original passam a ser usados automaticamente.
+const BOTTOM_STYLE: BottomStyle = BottomStyle::Elevated;
+
 /// The state machine driving the interactive UI.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum View {
     /// Home screen with panels (Biblioteca/Histórico) and the prompt at the
     /// bottom (US-031).
@@ -183,10 +195,10 @@ struct Layout {
 /// Uma célula do buffer de tela (double buffering): um caractere + cores de
 /// primeiro plano e de fundo opcionais (`None` = cor padrão do terminal).
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Cell {
+pub(crate) struct Cell {
     ch: char,
     fg: Option<Color>,
-    bg: Option<Color>,
+    pub(crate) bg: Option<Color>,
 }
 
 impl Cell {
@@ -197,45 +209,76 @@ impl Cell {
             bg: None,
         }
     }
+
+    /// Caractere da célula (acessível para leitura de contraste/verificação).
+    #[cfg(test)]
+    pub(crate) fn ch(&self) -> char {
+        self.ch
+    }
+
+    /// Cor de primeiro plano da célula.
+    #[cfg(test)]
+    pub(crate) fn fg(&self) -> Option<Color> {
+        self.fg
+    }
 }
 
 /// Paleta unificada do tema escuro profissional (US-019).
 #[derive(Clone, Copy, Debug)]
-struct Theme {
+pub(crate) struct Theme {
     /// Cor das bordas de blocos/quadros.
     border: Color,
     /// Texto primário (branco/prata).
-    text: Color,
+    pub(crate) text: Color,
     /// Acento/destaque (ciano).
-    accent: Color,
+    pub(crate) accent: Color,
     /// Cor de primeiro plano do prompt da Home (US-039): branca para garantir
     /// contraste sobre o fundo do footer (a cor de acento ciano era ilegível).
-    home_prompt_fg: Color,
+    pub(crate) home_prompt_fg: Color,
     /// Sucesso / downloads completos (verde).
     success: Color,
+    /// Gauge de progresso concluído 100% (verde mais escuro, US-043).
+    progress_done: Color,
+    /// Gauge de progresso com downstream baixo (laranja, US-043).
+    progress_low: Color,
     /// Avisos (amarelo).
-    warning: Color,
+    pub(crate) warning: Color,
     /// Erros (vermelho).
-    error: Color,
+    pub(crate) error: Color,
     /// Texto secundário/dicas (cinza).
-    muted: Color,
+    pub(crate) muted: Color,
     /// Fundo do item ativo selecionado (highlight background).
     highlight_bg: Color,
     /// Fundo do Header fixo.
     header_bg: Color,
     /// Fundo do Footer fixo.
-    footer_bg: Color,
+    pub(crate) footer_bg: Color,
     /// Fundo sólido do popup flutuante de comandos (US-031): evita que o
     /// conteúdo do painel por trás vaze nas linhas do popup.
     popup_bg: Color,
+    /// Fundo elevado do Card de entrada (US-041): cinza escuro contrastando
+    /// com o fundo padrão (None/preta) dos painéis.
+    pub(crate) card_bg: Color,
+    /// Barra de acento vertical do Card (US-041): azul vibrante (`#3B82F6`)
+    /// quando o campo está em foco (digitação).
+    pub(crate) card_accent_active: Color,
+    /// Barra de acento vertical do Card (US-041): cinza neutro quando o campo
+    /// está inativo (estado ocioso).
+    pub(crate) card_accent_idle: Color,
 }
 
-const THEME: Theme = Theme {
+pub(crate) const THEME: Theme = Theme {
     border: Color::DarkGrey,
     text: Color::White,
     accent: Color::Cyan,
     home_prompt_fg: Color::White,
     success: Color::Green,
+    progress_done: Color::DarkGreen,
+    progress_low: Color::Rgb {
+        r: 255,
+        g: 140,
+        b: 0,
+    },
     warning: Color::Yellow,
     error: Color::Red,
     muted: Color::DarkGrey,
@@ -243,22 +286,33 @@ const THEME: Theme = Theme {
     header_bg: Color::Blue,
     footer_bg: Color::DarkGrey,
     popup_bg: Color::DarkGrey,
+    card_bg: Color::Rgb {
+        r: 24,
+        g: 24,
+        b: 27,
+    },
+    card_accent_active: Color::Rgb {
+        r: 59,
+        g: 130,
+        b: 246,
+    },
+    card_accent_idle: Color::DarkGrey,
 };
 
 /// Buffer de tela (US-016): o render desenha o estado atual neste buffer e, ao
 /// aplicar o frame, apenas as células alteradas em relação ao frame anterior
 /// são reescritas no terminal (diff-rendering / double buffering).
-struct Frame {
+pub(crate) struct Frame {
     grid: Vec<Cell>,
     cols: u16,
-    rows: u16,
+    pub(crate) rows: u16,
     /// Posição desejada do cursor do terminal (ex.: campo de entrada).
-    cursor: Option<(u16, u16)>,
+    pub(crate) cursor: Option<(u16, u16)>,
 }
 
 impl Frame {
-    fn new(cols: u16, rows: u16) -> Self {
-        Frame {
+    pub(crate) fn new(cols: u16, rows: u16) -> Self {
+        Self {
             grid: vec![Cell::blank(); cols as usize * rows as usize],
             cols,
             rows,
@@ -270,7 +324,7 @@ impl Frame {
         row as usize * self.cols as usize + col as usize
     }
 
-    fn cell(&self, row: u16, col: u16) -> Cell {
+    pub(crate) fn cell(&self, row: u16, col: u16) -> Cell {
         if row >= self.rows || col >= self.cols {
             return Cell::blank();
         }
@@ -290,7 +344,14 @@ impl Frame {
     }
 
     /// Escreve um texto com cores de primeiro plano e de fundo explícitas.
-    fn put_styled(&mut self, row: u16, col: u16, text: &str, fg: Option<Color>, bg: Option<Color>) {
+    pub(crate) fn put_styled(
+        &mut self,
+        row: u16,
+        col: u16,
+        text: &str,
+        fg: Option<Color>,
+        bg: Option<Color>,
+    ) {
         for (col, ch) in (col..).zip(text.chars()) {
             if row >= self.rows || col >= self.cols {
                 return;
@@ -304,7 +365,7 @@ impl Frame {
     }
 
     /// Preenche uma região retangular do buffer com um caractere e cores.
-    fn fill(
+    pub(crate) fn fill(
         &mut self,
         row: u16,
         col: u16,
@@ -347,7 +408,7 @@ impl Frame {
 
     /// Registra a posição desejada do cursor do terminal (para exibir durante
     /// a digitação). `None` indica cursor oculto.
-    fn set_cursor(&mut self, row: u16, col: u16) {
+    pub(crate) fn set_cursor(&mut self, row: u16, col: u16) {
         self.cursor = Some((row, col));
     }
 
@@ -399,7 +460,7 @@ impl Frame {
     }
 }
 
-struct Tui {
+pub(crate) struct Tui {
     /// Sessão local do librqbit — `None` no modo daemon (US-040), quando a
     /// fila é renderizada a partir do snapshot ocasional do socket Unix.
     session: Option<Arc<Session>>,
@@ -437,6 +498,15 @@ struct Tui {
     prev_frame: Option<Frame>,
     /// Posição do cursor do terminal exibida no último frame (`None` = oculto).
     prev_cursor: Option<(u16, u16)>,
+    /// Cache do histórico de downloads (US-045): evita re-escanear o disco a
+    /// cada frame, que fazia a lista "reordenar" continuamente enquanto a
+    /// última varredura ainda era válida. `(timestamp, itens)`.
+    history_cache: Option<(Instant, Vec<crate::downloads::CompletedItem>)>,
+    /// Estilo da área inferior da TUI (US-041): `Legacy` mantém o prompt no
+    /// fim do Body + footer; `Elevated` usa o novo Card + barra de status.
+    bottom_style: BottomStyle,
+    /// Indicador animado de atividade da barra externa (US-041).
+    activity: ui_bottom::ActivityIndicator,
     running: bool,
 }
 
@@ -465,6 +535,9 @@ impl Tui {
             pending: Arc::new(Mutex::new(Vec::new())),
             prev_frame: None,
             prev_cursor: None,
+            history_cache: None,
+            bottom_style: BOTTOM_STYLE,
+            activity: ui_bottom::ActivityIndicator::new(),
             running: true,
         }
     }
@@ -491,6 +564,9 @@ impl Tui {
             pending: Arc::new(Mutex::new(Vec::new())),
             prev_frame: None,
             prev_cursor: None,
+            history_cache: None,
+            bottom_style: BOTTOM_STYLE,
+            activity: ui_bottom::ActivityIndicator::new(),
             running: true,
         }
     }
@@ -587,6 +663,19 @@ impl Tui {
         // US-036: com o menu de contexto aberto, apenas ↑/↓/Enter/Esc agem.
         if self.context_menu.is_some() {
             return self.handle_context_menu_key(key).await;
+        }
+
+        // US-041: Ctrl+P abre o menu de comandos a partir da barra externa de
+        // status (atalho anunciado na própria barra: `ctrl+p comandos`). Precisa
+        // ser tratado antes das teclas únicas da Biblioteca, que capturam `p`.
+        if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.input.clear();
+            self.prompt_cursor = 0;
+            self.menu_index = 0;
+            self.view = View::Menu;
+            return Ok(());
         }
 
         // US-037: com o prompt vazio, teclas únicas agem na linha selecionada
@@ -902,7 +991,7 @@ impl Tui {
     }
 
     /// Trunca o texto para caber em `max` caracteres, adicionando "…" se necessário.
-    fn truncate(s: &str, max: usize) -> String {
+    pub(crate) fn truncate(s: &str, max: usize) -> String {
         if s.chars().count() <= max {
             return s.to_string();
         }
@@ -1005,8 +1094,8 @@ impl Tui {
 
     fn session_rows(&self) -> Vec<SessionRow> {
         // US-040: modo daemon → fila a partir do snapshot vinda do socket.
-        let Some(session) = &self.session else {
-            return self
+        let rows = match &self.session {
+            None => self
                 .snapshot
                 .torrents
                 .iter()
@@ -1023,43 +1112,63 @@ impl Tui {
                     uploaded_bytes: t.uploaded_bytes,
                     handle: None,
                 })
-                .collect();
-        };
-        let rows = std::cell::RefCell::new(Vec::new());
-        session.with_torrents(|torrents| {
-            for (id, handle) in torrents {
-                let stats = handle.stats();
-                // Métricas de rede (US-033): `live` só existe na sessão Live;
-                // pausado/inicializando/erro não têm velocidade nem ETA.
-                let down_speed_mbps = stats.live.as_ref().map(|l| l.download_speed.mbps);
-                let up_speed_mbps = stats.live.as_ref().map(|l| l.upload_speed.mbps);
-                let eta_seconds = if stats.finished {
-                    None
-                } else {
-                    stats.live.as_ref().and_then(|l| {
-                        let remaining = stats.total_bytes.saturating_sub(stats.progress_bytes);
-                        (l.download_speed.mbps > 0.0 && remaining > 0)
-                            .then(|| remaining / (l.download_speed.mbps * 1024.0 * 1024.0) as u64)
-                    })
-                };
-                rows.borrow_mut().push(SessionRow {
-                    id,
-                    name: handle.name().unwrap_or_else(|| format!("torrent #{id}")),
-                    state: stats.state,
-                    progress_bytes: stats.progress_bytes,
-                    total_bytes: stats.total_bytes,
-                    finished: stats.finished,
-                    down_speed_mbps,
-                    up_speed_mbps,
-                    eta_seconds,
-                    uploaded_bytes: stats.uploaded_bytes,
-                    handle: Some(handle.clone()),
+                .collect(),
+            Some(session) => {
+                let rows = std::cell::RefCell::new(Vec::new());
+                session.with_torrents(|torrents| {
+                    for (id, handle) in torrents {
+                        let stats = handle.stats();
+                        // Métricas de rede (US-033): `live` só existe na sessão Live;
+                        // pausado/inicializando/erro não têm velocidade nem ETA.
+                        let down_speed_mbps = stats.live.as_ref().map(|l| l.download_speed.mbps);
+                        let up_speed_mbps = stats.live.as_ref().map(|l| l.upload_speed.mbps);
+                        let eta_seconds = if stats.finished {
+                            None
+                        } else {
+                            stats.live.as_ref().and_then(|l| {
+                                let remaining =
+                                    stats.total_bytes.saturating_sub(stats.progress_bytes);
+                                (l.download_speed.mbps > 0.0 && remaining > 0).then(|| {
+                                    remaining / (l.download_speed.mbps * 1024.0 * 1024.0) as u64
+                                })
+                            })
+                        };
+                        rows.borrow_mut().push(SessionRow {
+                            id,
+                            name: handle.name().unwrap_or_else(|| format!("torrent #{id}")),
+                            state: stats.state,
+                            progress_bytes: stats.progress_bytes,
+                            total_bytes: stats.total_bytes,
+                            finished: stats.finished,
+                            down_speed_mbps,
+                            up_speed_mbps,
+                            eta_seconds,
+                            uploaded_bytes: stats.uploaded_bytes,
+                            handle: Some(handle.clone()),
+                        });
+                    }
                 });
+                rows.into_inner()
             }
-        });
-        let mut rows = rows.into_inner();
-        rows.sort_by_key(|r| r.id);
+        };
+        // US-042: ordenação automática do grid — torrents em processamento no
+        // topo e, dentro de cada grupo, o mais recente inserido primeiro.
+        let mut rows = rows;
+        sort_rows_for_grid(&mut rows);
         rows
+    }
+
+    /// Total de bytes baixados e totais de todas as torrents (US-042, métrica
+    /// de progresso do rodapé). No modo daemon usa o snapshot do socket.
+    fn footer_progress(&self) -> (u64, u64) {
+        let rows = self.session_rows();
+        let mut progress = 0u64;
+        let mut total = 0u64;
+        for row in &rows {
+            progress += row.progress_bytes;
+            total += row.total_bytes;
+        }
+        (progress, total)
     }
 
     /// Atualiza o snapshot no modo daemon (US-040). Sem efeito no modo local.
@@ -1313,16 +1422,16 @@ impl Tui {
         self.render_header(&mut frame, cols);
 
         let body_top = 1u16;
-        let body_height = rows.saturating_sub(2).max(1);
+        // US-041: o Body cede as linhas da área inferior (Card + barra de
+        // status no estilo Elevated; apenas o footer no Legacy).
+        let geometry = ui_bottom::bottom_geometry(self.bottom_style, rows);
+        let body_height = rows.saturating_sub(geometry.reserved).max(1);
         match self.view {
             View::Home => self.render_home(&mut frame, cols, body_top, body_height),
             View::Menu => self.render_menu(&mut frame, cols, body_top, body_height),
         }
 
-        // US-035: a confirmação de exclusão é exibida no próprio prompt da Home
-        // (`render_home_prompt`), sem modal/overlay central sobre o Body.
-
-        self.render_footer(&mut frame, cols, rows);
+        self.render_bottom(&mut frame, cols, rows, &geometry);
 
         let total = cols as usize * rows as usize;
         let needs_full = match &self.prev_frame {
@@ -1363,9 +1472,16 @@ impl Tui {
     /// "Biblioteca de downloads" (torrents da sessão) no topo e "Histórico de
     /// downloads" (completos) no meio — com o prompt fixo na base.
     fn render_home(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
-        // O prompt fixo ocupa a última linha do Body; os painéis ficam acima.
-        let prompt_row = body_top.saturating_add(body_height).saturating_sub(1);
-        let panels_height = body_height.saturating_sub(1).max(2);
+        // No estilo Elevado (US-041), o Card é desenhado fora do Body (em
+        // `render_bottom`); os painéis usam todo o espaço do Body. No Legacy, o
+        // prompt fixo ocupa a última linha e os painéis ficam acima.
+        let (prompt_row, panels_height) = match self.bottom_style {
+            BottomStyle::Elevated => (0, body_height),
+            BottomStyle::Legacy => (
+                body_top.saturating_add(body_height).saturating_sub(1),
+                body_height.saturating_sub(1).max(2),
+            ),
+        };
         // Divisão vertical: Biblioteca (topo, ~55%) e Histórico (~45%). Em
         // terminais muito baixos os dois painéis somam exatamente o espaço
         // disponível (sem sobrepor o prompt): o histórico encolhe primeiro e
@@ -1383,7 +1499,9 @@ impl Tui {
             // Espaço só para a Biblioteca: o histórico é omitido.
             self.render_library_panel(frame, cols, body_top, panels_height);
         }
-        self.render_home_prompt(frame, cols, prompt_row);
+        if self.bottom_style == BottomStyle::Legacy {
+            self.render_home_prompt(frame, cols, prompt_row);
+        }
 
         // US-036: o menu de contexto fica por cima de tudo na Home.
         if self.context_menu.is_some() {
@@ -1528,7 +1646,7 @@ impl Tui {
                     row.progress_bytes as f64 / row.total_bytes as f64 * 100.0
                 };
                 let bar = progress_bar(pct);
-                let color = progress_color(row.state, row.finished);
+                let color = progress_color(row.state, row.finished, row.down_speed_mbps);
                 let metrics = if show_metrics {
                     Some(row_metrics_text(
                         row.finished,
@@ -1628,27 +1746,29 @@ impl Tui {
         let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS);
         let content_left = left + 2;
         let inner_width = (width as usize).saturating_sub(4);
+        // Colunas do grid (US-045): DATA CRIAÇÃO | NOME | TAMANHO. A data e o
+        // tamanho têm largura fixa; o nome absorve o restante.
+        let name_w = inner_width.saturating_sub(
+            crate::downloads::HISTORY_DATE_W + 1 + crate::downloads::HISTORY_SIZE_W,
+        );
 
         let mut lines: Vec<String> = Vec::new();
         lines.push("Histórico de downloads".into());
         lines.push(String::new());
+        lines.push(history_header(name_w));
 
-        let items = match list_completed_downloads(&self.output_folder) {
-            Ok(items) => items,
-            Err(err) => {
-                lines.push(format!("erro ao listar: {err:#}"));
-                Vec::new()
-            }
-        };
+        // Cache (US-045): evita re-escanear o disco a cada frame, o que fazia
+        // o grid "se reordenar" continuamente enquanto a varredura decorria.
+        let items = self.cached_completed_downloads();
         let item_texts: Vec<String> = items
             .iter()
-            .map(|item| Self::truncate(&format_completed(item), inner_width))
+            .map(|item| Self::truncate(&format_completed_row(item, name_w), inner_width))
             .collect();
 
         if item_texts.is_empty() {
             lines.push("nenhum download completo".into());
         } else {
-            let max_items = (height as usize).saturating_sub(3);
+            let max_items = (height as usize).saturating_sub(4);
             for text in item_texts.iter().take(max_items) {
                 lines.push(text.clone());
             }
@@ -1657,19 +1777,75 @@ impl Tui {
         draw_box(frame, left, top, width, height);
         write_boxed_lines(frame, content_left, top + 1, &lines, &[], height);
 
-        // Completos em verde (sucesso da paleta).
-        let items_start = top + 1 + 2;
+        // Linhas de itens na cor padrão de texto (US-045): antes em verde.
+        let items_start = top + 1 + 3;
         for (i, text) in item_texts
             .iter()
-            .take((height as usize).saturating_sub(3))
+            .take((height as usize).saturating_sub(4))
             .enumerate()
         {
-            frame.put_colored(
-                items_start + i as u16,
-                content_left,
-                text,
-                Some(THEME.success),
-            );
+            frame.put_colored(items_start + i as u16, content_left, text, Some(THEME.text));
+        }
+    }
+
+    /// Lista os downloads completos usando o cache do histórico (US-045),
+    /// re-escaneando o disco apenas quando o cache expirou.
+    fn cached_completed_downloads(&mut self) -> Vec<crate::downloads::CompletedItem> {
+        if let Some((stamp, items)) = &self.history_cache {
+            if stamp.elapsed() < HISTORY_REFRESH {
+                return items.clone();
+            }
+        }
+        let items = list_completed_downloads(&self.output_folder).unwrap_or_default();
+        self.history_cache = Some((Instant::now(), items.clone()));
+        items
+    }
+
+    /// Desenha a área inferior conforme o estilo (US-041): no `Elevated`,
+    /// desenha o Card de entrada + badges e a barra externa de status; no
+    /// `Legacy`, mantém o footer original.
+    fn render_bottom(
+        &mut self,
+        frame: &mut Frame,
+        cols: u16,
+        rows: u16,
+        geometry: &ui_bottom::BottomGeometry,
+    ) {
+        match self.bottom_style {
+            BottomStyle::Elevated => {
+                let prompt = home_prompt_label(self.prompt_add_mode);
+                let width = cols.saturating_sub(2 * LAYOUT_MARGIN_COLS);
+                let text_col = 3 + prompt.chars().count() as u16;
+                let max_w = (width as usize).saturating_sub(text_col as usize + 2);
+                let focused = self.confirming_delete.is_none();
+                let (progress_bytes, total_bytes) = self.footer_progress();
+                let data = ui_bottom::BottomData {
+                    prompt,
+                    input: if self.input.is_empty() && !self.prompt_add_mode {
+                        "Enter a command or / for options"
+                    } else {
+                        &self.input
+                    },
+                    cursor_col: prompt_cursor_col(&self.input, self.prompt_cursor, max_w),
+                    confirm_label: self
+                        .confirming_delete
+                        .as_ref()
+                        .map(|t| confirm_delete_prompt_label(t.name())),
+                    prompt_add_mode: self.prompt_add_mode,
+                    menu_open: self.view == View::Menu,
+                    notice: self.notice.as_deref(),
+                    progress_bytes,
+                    total_bytes,
+                };
+                let activity = self.activity.tick();
+                ui_bottom::render_input_card(frame, cols, geometry.input_row, &data, focused);
+                ui_bottom::render_badges_row(frame, cols, geometry.badges_row, &data, focused);
+                ui_bottom::render_edge_row(frame, cols, geometry.edge_row);
+                ui_bottom::render_status_bar(frame, cols, geometry.status_row, &data, &activity);
+            }
+            BottomStyle::Legacy => {
+                self.render_footer(frame, cols, rows);
+            }
         }
     }
 
@@ -1785,13 +1961,19 @@ impl Tui {
     }
 
     /// Popup flutuante de comandos (US-031): desenhado imediatamente acima do
-    /// prompt da Home, listando os comandos filtrados com a descrição alinhada
-    /// à direita. O item selecionado recebe highlight de fundo (AC-3).
+    /// prompt da Home (ou acima do Card elevado, US-041), listando os comandos
+    /// filtrados com a descrição alinhada à direita. O item selecionado recebe
+    /// highlight de fundo (AC-3).
     fn render_menu(&mut self, frame: &mut Frame, cols: u16, body_top: u16, body_height: u16) {
         // Home por baixo (painéis + prompt); o popup sobrepõe-se acima do prompt.
         self.render_home(frame, cols, body_top, body_height);
 
-        let prompt_row = body_top.saturating_add(body_height).saturating_sub(1);
+        // US-041: no estilo Elevated o popup ancora acima do Card de entrada
+        // (que fica fora do Body); no Legacy usa a linha do prompt no Body.
+        let prompt_row = match self.bottom_style {
+            BottomStyle::Elevated => body_top.saturating_add(body_height),
+            BottomStyle::Legacy => body_top.saturating_add(body_height).saturating_sub(1),
+        };
         let filtered = self.filtered_commands();
         let mut lines: Vec<String> = filtered
             .iter()
@@ -2028,15 +2210,45 @@ fn row_metrics_text(
     format!(" {down:<10} {up:<10} {eta:<8} {ratio:<6}")
 }
 
-/// Cor da barra de progresso conforme o estado do download (US-020): verde
-/// para em andamento/concluído, amarelo para pausado, vermelho para erro e
-/// ciano (azul) para inicializando.
-fn progress_color(state: TorrentStatsState, finished: bool) -> Color {
+/// Limite de velocidade de download (MiB/s) que define "downstream baixo" no
+/// gauge (US-043): torrent Live abaixo dele fica laranja.
+const LOW_DOWNSTREAM_MIBPS: f64 = 1.0;
+
+/// Ordena as linhas do grid da Biblioteca (US-042): torrents em processamento
+/// (Live, não concluído) no topo e, dentro de cada grupo, o mais recente
+/// inserido (maior `id`) primeiro. Ordenação determinística e pura.
+fn sort_rows_for_grid(rows: &mut [SessionRow]) {
+    rows.sort_by(|a, b| {
+        let a_processing = is_processing_row(a);
+        let b_processing = is_processing_row(b);
+        b_processing
+            .cmp(&a_processing)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
+/// `true` quando a linha representa um torrent em processamento (Live e ainda
+/// não concluído) — recebe prioridade de ordenação no topo do grid (US-042).
+fn is_processing_row(row: &SessionRow) -> bool {
+    !row.finished && matches!(row.state, TorrentStatsState::Live)
+}
+
+/// Cor da barra de progresso conforme o estado do download (US-020) e o
+/// downstream atual (US-043): vermelho para erro, laranja para downstream
+/// baixo (Live < 1 MiB/s), verde escuro para 100% concluído, verde para Live
+/// saudável, amarelo para pausado e ciano para inicializando.
+fn progress_color(state: TorrentStatsState, finished: bool, down_speed_mbps: Option<f64>) -> Color {
     if finished {
-        THEME.success
+        THEME.progress_done
     } else {
         match state {
-            TorrentStatsState::Live => THEME.success,
+            TorrentStatsState::Live => {
+                if down_speed_mbps.unwrap_or(0.0) < LOW_DOWNSTREAM_MIBPS {
+                    THEME.progress_low
+                } else {
+                    THEME.success
+                }
+            }
             TorrentStatsState::Paused => THEME.warning,
             TorrentStatsState::Error => THEME.error,
             TorrentStatsState::Initializing => THEME.accent,
@@ -2643,21 +2855,107 @@ mod tests {
 
     #[test]
     fn progress_color_matches_state() {
+        // Live saudável (≥ 1 MiB/s): verde.
         assert_eq!(
-            progress_color(TorrentStatsState::Live, false),
+            progress_color(TorrentStatsState::Live, false, Some(2.0)),
             THEME.success
         );
+        // Live com downstream baixo (< 1 MiB/s): laranja.
         assert_eq!(
-            progress_color(TorrentStatsState::Paused, false),
+            progress_color(TorrentStatsState::Live, false, Some(0.5)),
+            THEME.progress_low
+        );
+        // Live sem métrica de velocidade (None): assume baixo → laranja.
+        assert_eq!(
+            progress_color(TorrentStatsState::Live, false, None),
+            THEME.progress_low
+        );
+        assert_eq!(
+            progress_color(TorrentStatsState::Paused, false, None),
             THEME.warning
         );
-        assert_eq!(progress_color(TorrentStatsState::Error, false), THEME.error);
         assert_eq!(
-            progress_color(TorrentStatsState::Initializing, false),
+            progress_color(TorrentStatsState::Error, false, None),
+            THEME.error
+        );
+        assert_eq!(
+            progress_color(TorrentStatsState::Initializing, false, None),
             THEME.accent
         );
-        // concluído também verde
-        assert_eq!(progress_color(TorrentStatsState::Live, true), THEME.success);
+        // Concluído 100%: verde mais escuro (US-043), independente da velocidade.
+        assert_eq!(
+            progress_color(TorrentStatsState::Live, true, Some(0.0)),
+            THEME.progress_done
+        );
+        assert_eq!(
+            progress_color(TorrentStatsState::Live, true, Some(5.0)),
+            THEME.progress_done
+        );
+    }
+
+    #[test]
+    fn progress_color_threshold_uses_1_mib_s_boundary() {
+        // No limite exato de 1 MiB/s o gauge permanece verde (>= limite).
+        assert_eq!(
+            progress_color(TorrentStatsState::Live, false, Some(1.0)),
+            THEME.success
+        );
+        // Logo abaixo do limite fica laranja.
+        assert_eq!(
+            progress_color(TorrentStatsState::Live, false, Some(0.999)),
+            THEME.progress_low
+        );
+    }
+
+    #[test]
+    fn sort_rows_for_grid_puts_processing_first_and_recent_first() {
+        let row = |id: usize, state: TorrentStatsState, finished: bool| SessionRow {
+            id,
+            name: format!("torrent #{id}"),
+            state,
+            progress_bytes: 0,
+            total_bytes: 0,
+            finished,
+            down_speed_mbps: None,
+            up_speed_mbps: None,
+            eta_seconds: None,
+            uploaded_bytes: 0,
+            handle: None,
+        };
+        let mut rows = vec![
+            row(1, TorrentStatsState::Paused, false),
+            row(2, TorrentStatsState::Live, false),
+            row(3, TorrentStatsState::Live, false),
+            row(4, TorrentStatsState::Error, false),
+            row(5, TorrentStatsState::Live, true),
+        ];
+        sort_rows_for_grid(&mut rows);
+        let ids: Vec<usize> = rows.iter().map(|r| r.id).collect();
+        // Processando (Live, não concluído): topo, mais recente primeiro → 3, 2.
+        assert_eq!(&ids[0..2], &[3, 2]);
+        // Demais estados, também mais recente primeiro → 5 (concluído), 4, 1.
+        assert_eq!(&ids[2..], &[5, 4, 1]);
+    }
+
+    #[test]
+    fn sort_rows_for_grid_is_stable_for_equal_priority() {
+        let row = |id: usize| SessionRow {
+            id,
+            name: "x".into(),
+            state: TorrentStatsState::Paused,
+            progress_bytes: 0,
+            total_bytes: 0,
+            finished: false,
+            down_speed_mbps: None,
+            up_speed_mbps: None,
+            eta_seconds: None,
+            uploaded_bytes: 0,
+            handle: None,
+        };
+        let mut rows = vec![row(10), row(20)];
+        sort_rows_for_grid(&mut rows);
+        assert_eq!(rows[0].id, 20);
+        assert_eq!(rows[1].id, 10);
     }
 
     #[test]
@@ -3456,5 +3754,21 @@ mod tests {
         tui.menu_index = 0;
         tui.handle_mouse(right_click(5, 11)).await.unwrap();
         assert_eq!(tui.menu_index, 1);
+    }
+
+    #[tokio::test]
+    async fn ctrl_p_opens_command_menu_from_status_bar() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        let key = KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        tui.handle_home_key(key).await.unwrap();
+        assert_eq!(tui.view, View::Menu);
+        assert!(tui.input.is_empty());
+        // Todos os comandos ficam visíveis com o prompt vazio.
+        assert_eq!(tui.filtered_commands().len(), COMMANDS.len());
     }
 }

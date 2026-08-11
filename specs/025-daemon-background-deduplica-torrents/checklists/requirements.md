@@ -10,7 +10,9 @@
 - [ ] CHK002 US-2 (P1): dedup por infohash — 4 cenários cobrem: processando, completo, excluído, origens diferentes/mesmo infohash.
 - [ ] CHK003 US-3 (P1): auto-start do daemon — 3 cenários cobrem: parado, já rodando, modo add.
 - [ ] CHK004 US-4 (P2): excluir mantém arquivos + readição retoma — 2 cenários.
-- [ ] CHK005 Prioridades coerentes: P1 = núcleo (daemon/dedup/auto-start), P2 = absorve exclusão (complementar ao dedup).
+- [x] CHK005 Prioridades coerentes: P1 = núcleo (daemon/dedup/auto-start), P2 = absorve exclusão (complementar ao dedup).
+- [ ] CHK005b US-7 (P1): ordenação automática — processando no topo, mais recente primeiro, 5 cenários na spec.
+- [ ] CHK005c US-8 (P1): cores do gauge — vermelho/erro, laranja/baixo, verde escuro/concluído, 5 cenários na spec.
 
 ## Rastreabilidade (spec ↔ plano ↔ contratos ↔ tarefas)
 

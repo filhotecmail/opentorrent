@@ -35,6 +35,7 @@ mod downloads;
 mod ipc;
 mod metadata;
 mod session_ui;
+mod ui_bottom;
 mod update;
 
 const MSG_WIDTH: u16 = 40;

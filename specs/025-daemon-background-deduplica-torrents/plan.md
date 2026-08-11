@@ -18,6 +18,11 @@ aproveitando o `AddTorrentResponse::AlreadyManaged` do librqbit para magnet/URL/
 Excluir (X/Delete) remove da lista mantendo os arquivos no disco, liberando o infohash para re-adição (smart
 resume).
 
+Follow-ups na mesma branch (US-040): **ordenação automática do grid** (torrents em processamento no topo;
+dentro de cada grupo, do mais recente para o mais antigo — id decrescente) e **cores semânticas do gauge**
+(vermelho = erro, laranja = downstream < 1 MiB/s, verde escuro = 100% concluído; verde normal = Live saudável),
+aplicadas ao grid da Biblioteca (o Histórico mantém o verde atual).
+
 Abordagem técnica: um único binário com modos (daemon/headless, TUI, add, daemon admin, update); systemd user
 unit para o ciclo de vida; IPC por socket Unix com protocolo JSON (request/response + snapshot de estado);
 sessão persistida em `~/.config/opentorrent` (fastresume) como fonte da verdade.
@@ -145,6 +150,11 @@ Ver `data-model.md`, `contracts/`, `quickstart.md`. Decisões-chave:
 ## Phase 2 — Task Breakdown
 
 Ver `tasks.md` (gerado por `/speckit.tasks`).
+
+Fases das follow-ups (ordenação + cores do gauge) documentadas no `tasks.md` (Phase 10 e 11): a ordenação é
+pura de TUI (`sort_by` sobre `SessionRow`/snapshot com a mesma chave: processando primeiro, depois id desc), e
+as cores são tokens novos da paleta (`progress_low` laranja, `progress_done` verde escuro) aplicados na
+sobreposição da barra do grid.
 
 ## Complexity Tracking
 
