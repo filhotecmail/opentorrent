@@ -1718,6 +1718,7 @@ name = "opentorrent"
 version = "0.1.39"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "clap",
  "crossterm",

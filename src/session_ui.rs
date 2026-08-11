@@ -2916,19 +2916,27 @@ fn footer_hints(
 
 /// Resolve e adiciona uma origem em segundo plano (US-014). Para magnet links a
 /// resolução de metadados via DHT/trackers ocorre aqui, fora da interface.
+/// URLs de download que respondem HTML com link `.torrent` são resolvidas por
+/// `resolve::resolve_source` (US-048) antes de entregar ao librqbit.
 async fn add_torrent_background(
     session: Option<Arc<Session>>,
     source: String,
 ) -> anyhow::Result<AddOutcome> {
-    let add = AddTorrent::from_cli_argument(&source)?;
     match session {
         // Modo local (sem daemon; testes): adiciona direto na sessão.
-        Some(session) => match session.add_torrent(add, None).await? {
-            librqbit::AddTorrentResponse::Added(_, _) => Ok(AddOutcome::Added),
-            librqbit::AddTorrentResponse::AlreadyManaged(_, _) => Ok(AddOutcome::AlreadyManaged),
-            _ => unreachable!("add_torrent sem list_only só retorna Added ou AlreadyManaged"),
-        },
+        Some(session) => {
+            let resolved = crate::resolve::resolve_source(&source).await?;
+            let add = resolved.into_add_torrent()?;
+            match session.add_torrent(add, None).await? {
+                librqbit::AddTorrentResponse::Added(_, _) => Ok(AddOutcome::Added),
+                librqbit::AddTorrentResponse::AlreadyManaged(_, _) => {
+                    Ok(AddOutcome::AlreadyManaged)
+                }
+                _ => unreachable!("add_torrent sem list_only só retorna Added ou AlreadyManaged"),
+            }
+        }
         // Modo daemon (US-040): delega ao daemon — dedup decidido por lá.
+        // A resolução da URL (US-048) ocorre no daemon (fonte da verdade).
         // Unix-only.
         #[cfg(unix)]
         None => {
@@ -4661,5 +4669,49 @@ mod tests {
         tui.move_row(-1);
         assert_eq!(tui.row_index, 3);
         assert_eq!(tui.library_scroll, 5);
+    }
+
+    #[tokio::test]
+    async fn submit_add_from_prompt_accepts_pasted_torrent_path() {
+        // US-048 (drag & drop): o terminal cola o caminho do arquivo `.torrent`
+        // no campo de input; Enter submete e a origem entra na fila de
+        // pendentes (o `from_cli_argument` lê o arquivo local).
+        let (mut tui, _session, dir) = test_tui_async().await;
+
+        // Gera um `.torrent` local válido (fixture) num runtime tokio próprio
+        // numa thread dedicada (sem runtime ativo na thread do teste):
+        // `create_torrent` usa `spawn_block_in_place`.
+        let file = dir.join("drop.bin");
+        std::fs::File::create(&file)
+            .unwrap()
+            .write_all(&[1u8; 2048])
+            .unwrap();
+        let file_for_thread = file.clone();
+        let torrent = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(librqbit::create_torrent(
+                &file_for_thread,
+                librqbit::CreateTorrentOptions::default(),
+            ))
+            .unwrap()
+            .as_bytes()
+            .unwrap()
+        })
+        .join()
+        .unwrap();
+        let torrent_path = dir.join("drop.torrent");
+        std::fs::write(&torrent_path, torrent).unwrap();
+        let path_str = torrent_path.to_string_lossy().into_owned();
+
+        assert!(tui.submit_add_from_prompt(&path_str));
+
+        // A origem entrou na fila de pendentes (status Resolving).
+        let pending = tui.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source, path_str);
     }
 }

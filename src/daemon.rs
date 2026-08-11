@@ -13,8 +13,8 @@ use std::{
 
 use anyhow::{Context, bail};
 use librqbit::{
-    AddTorrent, AddTorrentResponse, ManagedTorrent, Session, SessionOptions,
-    SessionPersistenceConfig, api::TorrentIdOrHash,
+    AddTorrentResponse, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
+    api::TorrentIdOrHash,
 };
 use tokio::net::UnixListener;
 
@@ -380,7 +380,17 @@ async fn dispatch(session: &Arc<Session>, req: DaemonRequest) -> DaemonResponse 
             // Dedup por infohash: `add_torrent` retorna `AlreadyManaged` se o
             // infohash já está na sessão (fonte da verdade = daemon). Re-add
             // após exclusão (arquivos mantidos) retoma via smart resume.
-            let add = match AddTorrent::from_cli_argument(&source) {
+            // US-048: URLs de download que respondem HTML com link `.torrent`
+            // são resolvidas aqui, antes de entregar ao librqbit.
+            let resolved = match crate::resolve::resolve_source(&source).await {
+                Ok(r) => r,
+                Err(err) => {
+                    return DaemonResponse::Error {
+                        message: err.to_string(),
+                    };
+                }
+            };
+            let add = match resolved.into_add_torrent() {
                 Ok(a) => a,
                 Err(err) => {
                     return DaemonResponse::Error {

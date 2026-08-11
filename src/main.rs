@@ -36,6 +36,7 @@ mod downloads;
 #[cfg(unix)]
 mod ipc;
 mod metadata;
+mod resolve;
 mod session_ui;
 mod ui_bottom;
 mod update;
@@ -510,31 +511,45 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
 
         // Resolve the torrent metainfo (including for magnets, via peers) and
         // the final output folder, so we can check what already exists on disk.
-        let (info, only_files, output_folder, torrent_bytes) = match session
-            .add_torrent(AddTorrent::from_cli_argument(torrent)?, Some(probe_opts))
-            .await
-        {
-            Ok(AddTorrentResponse::ListOnly(ListOnlyResponse {
-                info,
-                only_files,
-                output_folder,
-                torrent_bytes,
-                ..
-            })) => (info, only_files, output_folder, torrent_bytes),
-            Ok(AddTorrentResponse::AlreadyManaged(id, handle)) => {
-                print_line(
-                    &multi,
-                    &format!("already managed (id={id}, hash={:?})", handle.info_hash()),
-                );
-                any_handled = true;
-                continue;
-            }
-            Ok(_) => unreachable!("list_only can only return ListOnly"),
+        // US-048: URLs de download que respondem HTML com link `.torrent` são
+        // resolvidas antes de entregar ao librqbit (que falharia no decode).
+        let resolved = match resolve::resolve_source(torrent).await {
+            Ok(r) => r,
             Err(err) => {
-                print_line(&multi, &format!("failed: {err}"));
+                print_line(&multi, &format!("failed: {err:#}"));
                 continue;
             }
         };
+        let add = match resolved.into_add_torrent() {
+            Ok(a) => a,
+            Err(err) => {
+                print_line(&multi, &format!("failed: {err:#}"));
+                continue;
+            }
+        };
+        let (info, only_files, output_folder, torrent_bytes) =
+            match session.add_torrent(add, Some(probe_opts)).await {
+                Ok(AddTorrentResponse::ListOnly(ListOnlyResponse {
+                    info,
+                    only_files,
+                    output_folder,
+                    torrent_bytes,
+                    ..
+                })) => (info, only_files, output_folder, torrent_bytes),
+                Ok(AddTorrentResponse::AlreadyManaged(id, handle)) => {
+                    print_line(
+                        &multi,
+                        &format!("already managed (id={id}, hash={:?})", handle.info_hash()),
+                    );
+                    any_handled = true;
+                    continue;
+                }
+                Ok(_) => unreachable!("list_only can only return ListOnly"),
+                Err(err) => {
+                    print_line(&multi, &format!("failed: {err}"));
+                    continue;
+                }
+            };
 
         if opts.list {
             for (idx, file) in info.iter_file_details()?.enumerate() {
