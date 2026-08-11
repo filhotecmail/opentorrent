@@ -10,7 +10,9 @@ use std::{fs, path::Path, process::Command};
 
 use anyhow::{Context, bail};
 
-use crate::{daemon, fetch_latest_release};
+#[cfg(unix)]
+use crate::daemon;
+use crate::fetch_latest_release;
 
 /// Comparação SemVer: `true` quando a release remota (tag, ex.: `v0.1.16`) é
 /// estritamente superior à versão instalada. Versões malformadas não contam
@@ -147,6 +149,8 @@ pub(crate) async fn run_update() -> anyhow::Result<()> {
     verify_signature(&dest, &tag).await?;
 
     // Para o daemon (service systemd ou fallback spawn) antes de substituir.
+    // Unix-only: no Windows não há daemon em background.
+    #[cfg(unix)]
     if daemon::is_running()? {
         daemon::stop().await?;
     }
@@ -161,10 +165,20 @@ pub(crate) async fn run_update() -> anyhow::Result<()> {
     })?;
 
     // Reinstala o service (unit pode referenciar o novo caminho) e religa.
-    daemon::install_service()?;
-    daemon::start()?;
+    #[cfg(unix)]
+    {
+        daemon::install_service()?;
+        daemon::start()?;
+    }
 
-    println!("atualizado para {tag} — daemon religado.");
+    #[cfg(unix)]
+    {
+        println!("atualizado para {tag} — daemon religado.");
+    }
+    #[cfg(not(unix))]
+    {
+        println!("atualizado para {tag}.");
+    }
     Ok(())
 }
 

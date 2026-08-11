@@ -30,8 +30,10 @@ use size_format::SizeFormatterBinary as SF;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(unix)]
 mod daemon;
 mod downloads;
+#[cfg(unix)]
 mod ipc;
 mod metadata;
 mod session_ui;
@@ -93,6 +95,8 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 
 /// Diretório de dados de configuração da aplicação (US-038): `%APPDATA%\opentorrent`
 /// no Windows e `~/.config/opentorrent` no Unix (via `dirs::config_dir()`).
+/// Unix-only: no Windows é usado apenas pelo daemon, que não existe.
+#[cfg(unix)]
 pub(crate) fn config_folder() -> anyhow::Result<PathBuf> {
     dirs::config_dir()
         .context("could not determine the user config directory")
@@ -194,6 +198,7 @@ struct Opts {
 
     /// Internal: run as the background daemon (US-040). Hidden flag used by
     /// `opentorrent daemon start` to spawn a fully detached process.
+    #[cfg(unix)]
     #[arg(long, hide = true)]
     daemon_headless: bool,
 
@@ -208,6 +213,7 @@ enum SubCommand {
 
     /// Manage the background daemon (US-040), which keeps downloads alive
     /// even when the interactive UI is closed.
+    #[cfg(unix)]
     Daemon {
         #[command(subcommand)]
         cmd: DaemonOpts,
@@ -218,6 +224,7 @@ enum SubCommand {
     Update,
 }
 
+#[cfg(unix)]
 #[derive(clap::Subcommand)]
 enum DaemonOpts {
     /// Install the systemd user service (US-040) if not present (idempotent).
@@ -374,12 +381,14 @@ pub(crate) async fn fetch_latest_release() -> Option<String> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run(opts: Opts, multi: MultiProgress) -> anyhow::Result<()> {
     // US-040: modo internal do daemon headless (spawned por `daemon start`).
+    #[cfg(unix)]
     if opts.daemon_headless {
         return daemon::run_headless(&opts).await;
     }
 
     match opts.subcommand {
         Some(SubCommand::Add(add)) => run_add(add, multi).await,
+        #[cfg(unix)]
         Some(SubCommand::Daemon { cmd }) => daemon::run_command(&cmd).await,
         Some(SubCommand::Update) => update::run_update().await,
         // US-009/US-010: without a subcommand, open the interactive session UI.
@@ -398,15 +407,32 @@ async fn run_interactive() -> anyhow::Result<()> {
     // US-040: a sessão vive em um daemon de background. Na primeira execução
     // instala o systemd user service (idempotente, sem systemd → no-op) e
     // inicia o daemon se não estiver rodando; a TUI renderiza via snapshot IPC.
-    daemon::install_service()?;
-    if !daemon::is_running()? {
-        daemon::start()?;
-        wait_for_daemon().await?;
+    #[cfg(unix)]
+    {
+        daemon::install_service()?;
+        if !daemon::is_running()? {
+            daemon::start()?;
+            wait_for_daemon().await?;
+        }
+        session_ui::run_interactive(None, output_folder).await
     }
-    session_ui::run_interactive(None, output_folder).await
+    // Windows (sem socket Unix/systemd): a TUI roda em modo local, com a
+    // sessão do librqbit no próprio processo (comportamento pré-US-040).
+    #[cfg(not(unix))]
+    {
+        let session_opts = SessionOptions {
+            trackers: fallback_trackers(),
+            ..Default::default()
+        };
+        let session = Session::new_with_opts(output_folder.clone(), session_opts)
+            .await
+            .context("error initializing session")?;
+        session_ui::run_interactive(Some(session), output_folder).await
+    }
 }
 
 /// Aguarda o daemon abrir o socket após o spawn (poll curto, US-040).
+#[cfg(unix)]
 async fn wait_for_daemon() -> anyhow::Result<()> {
     for _ in 0..50 {
         if daemon::is_running()? {
@@ -860,6 +886,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn config_folder_is_opentorrent_under_config_dir() {
         // US-038: %APPDATA%\opentorrent no Windows / ~/.config/opentorrent no Unix.
         let folder = config_folder().expect("diretório de configuração resolvido");

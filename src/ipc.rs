@@ -112,11 +112,14 @@ pub fn decode_message<T: for<'de> Deserialize<'de>>(payload: &[u8]) -> io::Resul
 }
 
 /// Cliente IPC do daemon (US-040): conecta ao socket Unix, envia uma
-/// `DaemonRequest` e aguarda a resposta correspondente.
+/// `DaemonRequest` e aguarda a resposta correspondente. Unix-only (socket
+/// Unix não existe no Windows — a TUI lá roda em modo local).
+#[cfg(unix)]
 pub struct DaemonClient {
     stream: tokio::net::UnixStream,
 }
 
+#[cfg(unix)]
 impl DaemonClient {
     /// Conecta ao socket do daemon. Retorna `Err` se o daemon não estiver
     /// rodando (ou o socket estiver stale).

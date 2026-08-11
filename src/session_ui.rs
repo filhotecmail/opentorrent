@@ -19,12 +19,10 @@ use crossterm::{
 use librqbit::{AddTorrent, ManagedTorrent, Session, TorrentStatsState};
 use tokio::sync::mpsc;
 
-use crate::{
-    daemon,
-    downloads::{format_completed_row, history_header, list_completed_downloads},
-    ipc::{DaemonRequest, DaemonResponse, DaemonState},
-    ui_bottom::{self, BottomStyle},
-};
+use crate::downloads::{format_completed_row, history_header, list_completed_downloads};
+use crate::ui_bottom::{self, BottomStyle};
+#[cfg(unix)]
+use crate::{daemon, ipc::DaemonRequest, ipc::DaemonResponse, ipc::DaemonState};
 
 /// Comandos do menu flutuante (US-031): comando e descrição funcional.
 const COMMANDS: [(&str, &str); 6] = [
@@ -71,8 +69,10 @@ const HISTORY_REFRESH: Duration = Duration::from_secs(2);
 /// throttle, a TUI reconectava ao socket e transferia o estado completo a cada
 /// frame (~30 FPS), o que congelava a TUI ao rolar o mouse sobre o Card de
 /// processamento. 200 ms ≈ 5 FPS de atualização do progresso — suave e barato.
+#[cfg(unix)]
 const SNAPSHOT_REFRESH: Duration = Duration::from_millis(200);
 /// Timeout do IPC de snapshot: um daemon lento/ocupado nunca pode travar a TUI.
+#[cfg(unix)]
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Estilo da área inferior da TUI (US-041). Para voltar à UI anterior, troque
@@ -534,9 +534,11 @@ pub(crate) struct Tui {
     /// Sessão local do librqbit — `None` no modo daemon (US-040), quando a
     /// fila é renderizada a partir do snapshot ocasional do socket Unix.
     session: Option<Arc<Session>>,
-    /// Último snapshot da fila recebido do daemon (modo daemon).
+    /// Último snapshot da fila recebido do daemon (modo daemon, Unix-only).
+    #[cfg(unix)]
     snapshot: DaemonState,
     /// Momento do último snapshot recebido do daemon (throttle, US-040).
+    #[cfg(unix)]
     last_snapshot_at: Option<Instant>,
     output_folder: PathBuf,
     view: View,
@@ -602,7 +604,9 @@ impl Tui {
     ) -> Self {
         Self {
             session: Some(session),
+            #[cfg(unix)]
             snapshot: DaemonState::default(),
+            #[cfg(unix)]
             last_snapshot_at: None,
             output_folder,
             view: View::Home,
@@ -631,7 +635,8 @@ impl Tui {
     }
 
     /// Constrói a TUI no modo daemon (US-040): sem sessão local, renderizando
-    /// a partir do snapshot recebido via socket Unix.
+    /// a partir do snapshot recebido via socket Unix. Unix-only.
+    #[cfg(unix)]
     fn new_daemon(output_folder: PathBuf, keys: mpsc::UnboundedReceiver<Event>) -> Self {
         Self {
             session: None,
@@ -1267,8 +1272,9 @@ impl Tui {
     }
 
     fn session_rows(&self) -> Vec<SessionRow> {
-        // US-040: modo daemon → fila a partir do snapshot vinda do socket.
         let rows = match &self.session {
+            // US-040: modo daemon → fila a partir do snapshot vinda do socket.
+            #[cfg(unix)]
             None => self
                 .snapshot
                 .torrents
@@ -1324,6 +1330,9 @@ impl Tui {
                 });
                 rows.into_inner()
             }
+            // Windows: modo daemon não existe — a sessão é sempre local.
+            #[cfg(not(unix))]
+            None => Vec::new(),
         };
         // US-042: ordenação automática do grid — torrents em processamento no
         // topo e, dentro de cada grupo, o mais recente inserido primeiro.
@@ -1336,7 +1345,8 @@ impl Tui {
     /// O throttle (`SNAPSHOT_REFRESH`) evita reconectar ao socket e transferir
     /// o estado completo a cada frame — o que congelava a TUI ao rolar o mouse
     /// sobre o progresso. Um timeout (`SNAPSHOT_TIMEOUT`) garante que um daemon
-    /// lento/ocupado nunca bloqueie o render.
+    /// lento/ocupado nunca bloqueie o render. Unix-only.
+    #[cfg(unix)]
     async fn refresh_snapshot(&mut self) {
         if self.session.is_some() {
             return;
@@ -1358,7 +1368,8 @@ impl Tui {
     }
 
     /// Envia uma ação ao daemon (modo daemon, US-040) e retorna a mensagem de
-    /// sucesso ou o erro em `DaemonResponse::Error`.
+    /// sucesso ou o erro em `DaemonResponse::Error`. Unix-only.
+    #[cfg(unix)]
     async fn daemon_action(&mut self, req: DaemonRequest) -> anyhow::Result<Option<String>> {
         let mut client = daemon::connect_client().await?;
         match client.request(req).await? {
@@ -1378,10 +1389,13 @@ impl Tui {
                         session.pause(handle).await?;
                     }
                 }
+                #[cfg(unix)]
                 None => {
                     self.daemon_action(DaemonRequest::Pause { id: row.id })
                         .await?;
                 }
+                #[cfg(not(unix))]
+                None => unreachable!("modo daemon não existe no Windows"),
             }
             self.notice = Some(format!("pausado: {}", row.name));
         } else {
@@ -1400,10 +1414,13 @@ impl Tui {
                         session.clone().unpause(handle).await?;
                     }
                 }
+                #[cfg(unix)]
                 None => {
                     self.daemon_action(DaemonRequest::Resume { id: row.id })
                         .await?;
                 }
+                #[cfg(not(unix))]
+                None => unreachable!("modo daemon não existe no Windows"),
             }
             self.notice = Some(format!("retomado: {}", row.name));
         } else {
@@ -1421,10 +1438,13 @@ impl Tui {
                         .delete(librqbit::api::TorrentIdOrHash::Id(row.id), false)
                         .await?;
                 }
+                #[cfg(unix)]
                 None => {
                     self.daemon_action(DaemonRequest::Stop { id: row.id })
                         .await?;
                 }
+                #[cfg(not(unix))]
+                None => unreachable!("modo daemon não existe no Windows"),
             }
             self.notice = Some(format!("removido da fila: {}", row.name));
         } else {
@@ -1479,10 +1499,13 @@ impl Tui {
                             .delete(librqbit::api::TorrentIdOrHash::Id(id), true)
                             .await
                     }
+                    #[cfg(unix)]
                     None => match self.daemon_action(DaemonRequest::Delete { id }).await {
                         Ok(_) => Ok(()),
                         Err(err) => Err(anyhow::anyhow!(format!("{err:#}"))),
                     },
+                    #[cfg(not(unix))]
+                    None => unreachable!("modo daemon não existe no Windows"),
                 };
                 if let Err(err) = result {
                     self.notice = Some(format!("falha ao excluir: {err:#}"));
@@ -2706,7 +2729,8 @@ fn progress_color(state: TorrentStatsState, finished: bool, down_speed_mbps: Opt
 
 /// Reconstrói `TorrentStatsState` a partir do `Display` serializado no
 /// snapshot do daemon (US-040). Valores desconhecidos caem para `Initializing`
-/// (renderização conservadora, sem panics).
+/// (renderização conservadora, sem panics). Unix-only.
+#[cfg(unix)]
 fn state_from_display(s: &str) -> TorrentStatsState {
     match s {
         "live" => TorrentStatsState::Live,
@@ -2905,6 +2929,8 @@ async fn add_torrent_background(
             _ => unreachable!("add_torrent sem list_only só retorna Added ou AlreadyManaged"),
         },
         // Modo daemon (US-040): delega ao daemon — dedup decidido por lá.
+        // Unix-only.
+        #[cfg(unix)]
         None => {
             let mut client = daemon::connect_client().await?;
             match client.request(DaemonRequest::Add { source }).await? {
@@ -2914,6 +2940,9 @@ async fn add_torrent_background(
                 other => anyhow::bail!("resposta inesperada do daemon: {other:?}"),
             }
         }
+        // Windows: sem daemon — origem sempre adicionada localmente.
+        #[cfg(not(unix))]
+        None => unreachable!("modo daemon não existe no Windows"),
     }
 }
 
@@ -3002,7 +3031,10 @@ pub async fn run_interactive(
 
     let mut tui = match session {
         Some(session) => Tui::new(session, output_folder, rx),
+        #[cfg(unix)]
         None => Tui::new_daemon(output_folder, rx),
+        #[cfg(not(unix))]
+        None => unreachable!("modo daemon não existe no Windows"),
     };
     // Primeiro frame é desenhado imediatamente (sem esperar o orçamento).
     tui.render(&mut stdout)?;
@@ -3053,6 +3085,7 @@ pub async fn run_interactive(
         if dirty || last_frame.elapsed() >= FRAME_BUDGET {
             // US-040 (modo daemon): atualiza o snapshot da fila antes de
             // renderizar, mantendo o progresso ao vivo mesmo com a TUI aberta.
+            #[cfg(unix)]
             if tui.session.is_none() {
                 tui.refresh_snapshot().await;
             }
