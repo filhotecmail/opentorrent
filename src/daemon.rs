@@ -6,15 +6,15 @@
 
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
 };
 
 use anyhow::{Context, bail};
 use librqbit::{
-    AddTorrentResponse, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
-    api::TorrentIdOrHash,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ByteBufOwned, ManagedTorrent, Session,
+    SessionOptions, SessionPersistenceConfig, api::TorrentIdOrHash,
 };
 use tokio::net::UnixListener;
 
@@ -24,6 +24,7 @@ use crate::{
         self, DaemonClient, DaemonPaths, DaemonRequest, DaemonResponse, DaemonState,
         TorrentSnapshot,
     },
+    webseed::{WebseedProgress, WebseedRegistry, WebseedState, WebseedTask},
 };
 
 /// Nome do systemd user service do daemon (US-040).
@@ -257,23 +258,33 @@ pub(crate) async fn run_headless(_opts: &Opts) -> anyhow::Result<()> {
         trackers: fallback_trackers(),
         ..Default::default()
     };
-    let session = Session::new_with_opts(output_folder, session_opts)
+    let session = Session::new_with_opts(output_folder.clone(), session_opts)
         .await
         .context("error initializing session (daemon)")?;
+
+    // Registro compartilhado das tarefas webseed (US-049).
+    let webseed = crate::webseed::new_registry();
 
     // Pidfile para `status`.
     fs::write(&paths.pid, std::process::id().to_string())
         .context("falha ao gravar pidfile do daemon")?;
 
-    serve(&paths, session).await.map_err(|err| {
-        eprintln!("daemon error: {err}");
-        err
-    })?;
+    serve(&paths, session, output_folder, webseed)
+        .await
+        .map_err(|err| {
+            eprintln!("daemon error: {err}");
+            err
+        })?;
     Ok(())
 }
 
 /// Serve o socket Unix: aceita conexões e despacha cada `DaemonRequest`.
-async fn serve(paths: &DaemonPaths, session: Arc<Session>) -> anyhow::Result<()> {
+async fn serve(
+    paths: &DaemonPaths,
+    session: Arc<Session>,
+    base_folder: PathBuf,
+    webseed: WebseedRegistry,
+) -> anyhow::Result<()> {
     // Remove socket stale (daemon anterior morto sem limpeza) e liga o novo.
     if paths.socket.exists() {
         let _ = fs::remove_file(&paths.socket);
@@ -294,8 +305,12 @@ async fn serve(paths: &DaemonPaths, session: Arc<Session>) -> anyhow::Result<()>
                 let (stream, _) = accepted.context("falha ao aceitar conexão IPC")?;
                 let session = session.clone();
                 let shutdown = shutdown.clone();
+                let webseed = webseed.clone();
+                let base_folder = base_folder.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, &session, &shutdown).await {
+                    if let Err(err) =
+                        handle_connection(stream, &session, &base_folder, &webseed, &shutdown).await
+                    {
                         eprintln!("ipc error: {err}");
                     }
                 });
@@ -315,6 +330,8 @@ async fn serve(paths: &DaemonPaths, session: Arc<Session>) -> anyhow::Result<()>
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     session: &Arc<Session>,
+    base_folder: &Path,
+    webseed: &WebseedRegistry,
     shutdown: &Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -338,7 +355,7 @@ async fn handle_connection(
                 },
                 true,
             ),
-            other => (dispatch(session, other).await, false),
+            other => (dispatch(session, base_folder, webseed, other).await, false),
         };
 
         let mut out = Vec::with_capacity(64);
@@ -374,7 +391,12 @@ async fn read_frame_header(
 }
 
 /// Aplica uma `DaemonRequest` de ação sobre a sessão e produz a resposta.
-async fn dispatch(session: &Arc<Session>, req: DaemonRequest) -> DaemonResponse {
+async fn dispatch(
+    session: &Arc<Session>,
+    base_folder: &Path,
+    webseed: &WebseedRegistry,
+    req: DaemonRequest,
+) -> DaemonResponse {
     match req {
         DaemonRequest::Add { source } => {
             // Dedup por infohash: `add_torrent` retorna `AlreadyManaged` se o
@@ -390,6 +412,21 @@ async fn dispatch(session: &Arc<Session>, req: DaemonRequest) -> DaemonResponse 
                     };
                 }
             };
+            // US-049: `.torrent` com `url-list` GetRight → download webseed em
+            // background e só então o torrent entra na sessão.
+            if let crate::resolve::ResolvedSource::TorrentBytes(bytes) = &resolved {
+                if let Some(bases) = crate::webseed::extract_url_list(bytes) {
+                    return start_webseed(
+                        webseed,
+                        base_folder,
+                        session,
+                        source,
+                        bytes.clone(),
+                        bases,
+                    )
+                    .await;
+                }
+            }
             let add = match resolved.into_add_torrent() {
                 Ok(a) => a,
                 Err(err) => {
@@ -434,9 +471,145 @@ async fn dispatch(session: &Arc<Session>, req: DaemonRequest) -> DaemonResponse 
             .await
         }
         DaemonRequest::GetState => DaemonResponse::State {
-            snapshot: Some(build_state(session).await),
+            snapshot: Some(build_state(session, webseed).await),
         },
         DaemonRequest::Shutdown => unreachable!("Shutdown tratado em handle_connection"),
+    }
+}
+
+/// Inicia o download webseed de um `.torrent` com `url-list` em background
+/// (US-049): registra a tarefa no snapshot, baixa os arquivos no layout final
+/// do motor e, ao concluir, entrega o `.torrent` à sessão — o `initial_check`
+/// do `librqbit` valida as peças por SHA1 e o restante segue por peers.
+async fn start_webseed(
+    webseed: &WebseedRegistry,
+    base_folder: &Path,
+    session: &Arc<Session>,
+    source: String,
+    bytes: bytes::Bytes,
+    bases: Vec<String>,
+) -> DaemonResponse {
+    let parsed = match librqbit::torrent_from_bytes_ext::<ByteBufOwned>(&bytes) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return DaemonResponse::Error {
+                message: err.to_string(),
+            };
+        }
+    };
+    let info = parsed.meta.info;
+    let Some(name) = info.name.as_ref() else {
+        return DaemonResponse::Error {
+            message: "torrent sem nome".to_string(),
+        };
+    };
+    let name = String::from_utf8_lossy(name.as_ref()).into_owned();
+    let config = crate::webseed::WebseedConfig {
+        bases,
+        name: name.clone(),
+    };
+    let files = match crate::webseed::build_webseed_files(&info, None) {
+        Ok(files) => files,
+        Err(err) => {
+            return DaemonResponse::Error {
+                message: err.to_string(),
+            };
+        }
+    };
+    // Layout do motor: single-file grava `base_dir/nome`; multi-file usa
+    // `base_dir/nome/subcaminho` (o `relative_path` dos arquivos já é o
+    // subcaminho interno sem o `info.name`).
+    let mut folder = base_folder.to_path_buf();
+    if info.files.is_some() {
+        folder = folder.join(&name);
+    }
+    let id = {
+        let mut tasks = webseed.lock().unwrap_or_else(|p| p.into_inner());
+        let id = tasks.iter().map(|t| t.id).max().map_or(0, |max| max + 1);
+        let total_bytes = files
+            .iter()
+            .filter(|f| !f.is_padding)
+            .map(|f| f.length)
+            .sum();
+        let total_files = files.iter().filter(|f| !f.is_padding).count();
+        tasks.push(WebseedTask {
+            id,
+            source: source.clone(),
+            name: name.clone(),
+            progress: WebseedProgress {
+                total_bytes,
+                downloaded_bytes: 0,
+                total_files,
+                done_files: 0,
+                state: WebseedState::Downloading,
+            },
+        });
+        id
+    };
+    let task_session = session.clone();
+    let task_webseed = webseed.clone();
+    tokio::spawn(async move {
+        let cb_webseed = task_webseed.clone();
+        let result =
+            crate::webseed::download_webseed(&config, files, &folder, 4, move |progress| {
+                if let Ok(mut tasks) = cb_webseed.lock() {
+                    if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
+                        task.progress = progress.clone();
+                    }
+                }
+            })
+            .await;
+        {
+            let mut tasks = task_webseed.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
+                task.progress.state = match &result {
+                    Ok(progress) => progress.state.clone(),
+                    Err(err) => WebseedState::Error(format!("{err:#}")),
+                };
+            }
+        }
+        let ok_to_add = match &result {
+            Ok(progress) => matches!(progress.state, WebseedState::Done),
+            Err(_) => false,
+        };
+        if !ok_to_add {
+            // Download incompleto: tarefa mantida com `state=Error` (permite
+            // re-add); o torrent não entra na sessão com arquivos faltando.
+            let msg = match &result {
+                Ok(progress) => format!("{}", progress.state),
+                Err(err) => format!("{err:#}"),
+            };
+            eprintln!("webseed #{id} ({name}) incompleto: {msg}");
+            return;
+        }
+        // Entrega o `.torrent` ao motor; `initial_check` valida as peças.
+        // `overwrite` permite o motor assumir os arquivos já gravados pelo
+        // webseed (mesmo conteúdo, verificável por hash) — sem isso o
+        // `add_torrent` recusa arquivo existente no disco.
+        match task_session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(bytes),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(_) => {
+                let mut tasks = task_webseed.lock().unwrap_or_else(|p| p.into_inner());
+                tasks.retain(|t| t.id != id);
+            }
+            Err(err) => {
+                let mut tasks = task_webseed.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
+                    task.progress.state = WebseedState::Error(format!("{err:#}"));
+                }
+            }
+        }
+    });
+    DaemonResponse::Ok {
+        message: "adicionando via webseed".to_string(),
     }
 }
 
@@ -474,7 +647,7 @@ where
 }
 
 /// Constrói o snapshot da fila para a TUI renderizar (US-040).
-async fn build_state(session: &Arc<Session>) -> DaemonState {
+async fn build_state(session: &Arc<Session>, webseed: &WebseedRegistry) -> DaemonState {
     let rows = std::cell::RefCell::new(Vec::new());
     let finished = std::cell::RefCell::new(0usize);
     let downloaded = std::cell::RefCell::new(0u64);
@@ -517,6 +690,10 @@ async fn build_state(session: &Arc<Session>) -> DaemonState {
         torrents: rows,
         finished: finished.into_inner(),
         downloaded_total: downloaded.into_inner(),
+        webseed: webseed
+            .lock()
+            .map(|tasks| tasks.iter().map(WebseedTask::snapshot).collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -601,9 +778,15 @@ mod tests {
         let listener = UnixListener::bind(&paths.socket).unwrap();
         let session_clone = session.clone();
         let shutdown = Arc::new(tokio::sync::Notify::new());
+        let webseed = crate::webseed::new_registry();
+        let base_folder = paths
+            .socket
+            .parent()
+            .expect("socket tem parent")
+            .to_path_buf();
         let handle = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, &session_clone, &shutdown)
+            handle_connection(stream, &session_clone, &base_folder, &webseed, &shutdown)
                 .await
                 .unwrap();
         });
@@ -666,5 +849,250 @@ mod tests {
             // aqui (teste aceita e não panica).
             Err(_) => {}
         }
+    }
+
+    // --- US-049 webseed: integração do `dispatch(Add)` com servidor HTTP ---
+
+    /// Emite um string bencode (`<len>:<bytes>`) para o writer.
+    fn push_bstr(out: &mut Vec<u8>, s: &[u8]) {
+        out.extend_from_slice(format!("{}:", s.len()).as_bytes());
+        out.extend_from_slice(s);
+    }
+
+    fn push_len(out: &mut Vec<u8>, val: u64) {
+        out.extend_from_slice(format!("i{val}e").as_bytes());
+    }
+
+    /// Gera um `.torrent` single-file válido (peças SHA1 reais do conteúdo),
+    /// com `url-list` opcional — para o caminho webseed (US-049).
+    fn single_file_torrent(name: &str, data: &[u8], url_list: Option<&str>) -> Vec<u8> {
+        use sha1::Digest;
+        let mut pieces = Vec::new();
+        for chunk in data.chunks(256 * 1024) {
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(chunk);
+            pieces.extend_from_slice(hasher.finalize().as_slice());
+        }
+        let mut out = Vec::new();
+        out.push(b'd');
+        push_bstr(&mut out, b"announce");
+        push_bstr(&mut out, b"udp://tracker.invalid:80");
+        push_bstr(&mut out, b"info");
+        out.push(b'd');
+        push_bstr(&mut out, b"length");
+        push_len(&mut out, data.len() as u64);
+        push_bstr(&mut out, b"name");
+        push_bstr(&mut out, name.as_bytes());
+        push_bstr(&mut out, b"piece length");
+        push_len(&mut out, 256 * 1024);
+        push_bstr(&mut out, b"pieces");
+        push_bstr(&mut out, &pieces);
+        out.push(b'e');
+        if let Some(base) = url_list {
+            push_bstr(&mut out, b"url-list");
+            out.push(b'l');
+            push_bstr(&mut out, base.as_bytes());
+            out.push(b'e');
+        }
+        out.push(b'e');
+        out
+    }
+
+    /// Servidor HTTP mínimo: serve respostas fixas por rota (200 com corpo,
+    /// ignorando Range — aceito pelo `download_webseed`).
+    struct MiniHttp {
+        addr: std::net::SocketAddr,
+        routes: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    }
+
+    impl MiniHttp {
+        fn start() -> Self {
+            let routes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                String,
+                Vec<u8>,
+            >::new()));
+            let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+            {
+                let routes = routes.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().expect("rt do MiniHttp");
+                    rt.block_on(async move {
+                        let listener =
+                            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                        let _ = addr_tx.send(listener.local_addr().expect("addr"));
+                        loop {
+                            let Ok((mut socket, _)) = listener.accept().await else {
+                                continue;
+                            };
+                            let routes = routes.clone();
+                            tokio::spawn(async move {
+                                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                let mut buf = [0u8; 4096];
+                                if socket.read(&mut buf).await.is_err() {
+                                    return;
+                                }
+                                let req = String::from_utf8_lossy(&buf);
+                                let Some(path) = req.split_whitespace().nth(1) else {
+                                    return;
+                                };
+                                let path = path.trim_start_matches('/').to_string();
+                                let body = routes.lock().unwrap().get(&path).cloned();
+                                match body {
+                                    Some(body) => {
+                                        let head = format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                            body.len()
+                                        );
+                                        let _ = socket.write_all(head.as_bytes()).await;
+                                        let _ = socket.write_all(&body).await;
+                                    }
+                                    None => {
+                                        let _ = socket
+                                            .write_all(
+                                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                            )
+                                            .await;
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
+            }
+            Self {
+                addr: addr_rx.recv().expect("endereço do MiniHttp"),
+                routes,
+            }
+        }
+
+        fn add(&self, path: &str, body: Vec<u8>) {
+            self.routes.lock().unwrap().insert(path.to_string(), body);
+        }
+    }
+
+    #[tokio::test]
+    async fn webseed_add_downloads_then_joins_session() {
+        // US-049 (T009): `dispatch(Add)` de `.torrent` com `url-list` responde
+        // rápido e o torrent entra na sessão após o download HTTP; sem
+        // `url-list` o add é direto. Gated: precisa de `Session` real + HTTP.
+        if std::env::var("RUN_SLOW_TESTS").is_err() {
+            eprintln!("RUN_SLOW_TESTS não definido — teste pulado");
+            return;
+        }
+        const NAME: &str = "arquivo.bin";
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+
+        let server = MiniHttp::start();
+        let base = format!("http://{}/", server.addr);
+        server.add(
+            "with.torrent",
+            single_file_torrent(NAME, &data, Some(&base)),
+        );
+        server.add(NAME, data.clone());
+
+        let dir = std::env::temp_dir().join(format!(
+            "opentorrent-webseed-join-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = Session::new_with_opts(
+            dir.clone(),
+            SessionOptions {
+                disable_dht: true,
+                disable_dht_persistence: true,
+                enable_upnp_port_forwarding: false,
+                fastresume: false,
+                listen_port_range: Some(0..1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let webseed = crate::webseed::new_registry();
+        let base_folder = dir.clone();
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let listener = UnixListener::bind(dir.join("daemon.sock")).unwrap();
+        let session_clone = session.clone();
+        let spawn_webseed = webseed.clone();
+        let spawn_folder = base_folder.clone();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(
+                stream,
+                &session_clone,
+                &spawn_folder,
+                &spawn_webseed,
+                &shutdown,
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = DaemonClient::connect(&base_folder.join("daemon.sock"))
+            .await
+            .unwrap();
+
+        // Com `url-list` → resposta imediata "adicionando via webseed".
+        let resp = client
+            .request(DaemonRequest::Add {
+                source: format!("http://{}/with.torrent", server.addr),
+            })
+            .await
+            .unwrap();
+        match resp {
+            DaemonResponse::Ok { message } => assert_eq!(message, "adicionando via webseed"),
+            other => panic!("esperava Ok(webseed), got {other:?}"),
+        }
+
+        // A task background baixa `arquivo.bin` e o torrent entra na sessão.
+        let mut in_session = false;
+        for _ in 0..60 {
+            let downloaded = std::fs::read(base_folder.join(NAME))
+                .map(|bytes| bytes == data)
+                .unwrap_or(false);
+            let present = downloaded && session.with_torrents(|iter| iter.count() > 0);
+            if present {
+                in_session = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(
+            in_session,
+            "torrent webseed não entrou na sessão após o download"
+        );
+        // Registro limpo após o torrent entrar na sessão (tarefa concluída).
+        let restantes = webseed.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert_eq!(
+            restantes, 0,
+            "tarefa webseed concluída deveria sair do registro"
+        );
+
+        // Sem `url-list` → add direto (não via webseed). Usa `info` distinto
+        // (nome/conteúdo diferentes) para não colidir com o infohash do `with`.
+        let plain_data: Vec<u8> = (0..100_000u32).map(|i| (i % 13) as u8).collect();
+        server.add(
+            "plain.torrent",
+            single_file_torrent("plain.bin", &plain_data, None),
+        );
+        let resp = client
+            .request(DaemonRequest::Add {
+                source: format!("http://{}/plain.torrent", server.addr),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, DaemonResponse::Ok { message } if message == "adicionado"),
+            "esperava add direto, got {resp:?}"
+        );
+
+        drop(client);
+        handle.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

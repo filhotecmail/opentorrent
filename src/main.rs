@@ -40,6 +40,7 @@ mod resolve;
 mod session_ui;
 mod ui_bottom;
 mod update;
+mod webseed;
 
 const MSG_WIDTH: u16 = 40;
 const BAR_WIDTH: u16 = 20;
@@ -570,33 +571,116 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
             continue;
         }
 
-        // Smart resume: only start a download when the target files are missing
-        // or incomplete. Fully downloaded torrents are reported and skipped.
-        let existing = existing_state(&output_folder, &info, only_files.as_deref())?;
-        let overwrite = match existing {
-            ExistingState::Complete if opts.overwrite => true,
-            ExistingState::Complete => {
-                print_line(
-                    &multi,
-                    &format!(
-                        "torrent already fully downloaded in {}",
-                        output_folder.display()
-                    ),
-                );
-                any_handled = true;
-                continue;
+        // US-049: `.torrent` com `url-list` GetRight → a fonte primária é o
+        // HTTP (webseed); baixamos tudo aqui e deixamos o `initial_check` do
+        // re-add validar as peças por SHA1 — sem depender de seeds no boot.
+        let mut webseed_downloaded = false;
+        if let Some(bases) = crate::webseed::extract_url_list(&torrent_bytes) {
+            let name = info
+                .name
+                .as_ref()
+                .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
+                .unwrap_or_else(|| "torrent".to_string());
+            let files = crate::webseed::build_webseed_files(&info, only_files.as_deref())
+                .with_context(|| format!("error building webseed files for {name}"))?;
+            let config = crate::webseed::WebseedConfig {
+                bases,
+                name: name.clone(),
+            };
+            let total: u64 = files
+                .iter()
+                .filter(|f| !f.is_padding)
+                .map(|f| f.length)
+                .sum();
+            let total_files = files.iter().filter(|f| !f.is_padding).count();
+            print_line(
+                &multi,
+                &format!("webseed: {name} tem url-list, baixando via HTTP"),
+            );
+            let bar = multi.add(ProgressBar::new(total.max(1)));
+            bar.set_style(
+                ProgressStyle::with_template("{msg:<34!} [{bar:32.cyan/blue}] {percent}%")
+                    .unwrap()
+                    .progress_chars("=>-"),
+            );
+            let cb_name = name.clone();
+            let cb_bar = bar.clone();
+            let result = crate::webseed::download_webseed(
+                &config,
+                files,
+                &output_folder,
+                4,
+                move |progress| {
+                    cb_bar.set_position(progress.downloaded_bytes);
+                    cb_bar.set_message(format!(
+                        "webseed {cb_name} ({}/{} arquivos)",
+                        progress.done_files, progress.total_files
+                    ));
+                },
+            )
+            .await;
+            bar.finish_and_clear();
+            match result {
+                Ok(progress) if matches!(progress.state, crate::webseed::WebseedState::Done) => {
+                    webseed_downloaded = true;
+                    print_line(
+                        &multi,
+                        &format!(
+                            "webseed: {name} baixado ({total_files} arquivos, {})",
+                            SF::new(total)
+                        ),
+                    );
+                }
+                Ok(progress) => {
+                    // Falha parcial: o progresso carrega a mensagem do erro.
+                    print_line(
+                        &multi,
+                        &format!("webseed: falhou em {name}: {}", progress.state),
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    print_line(&multi, &format!("webseed: falhou em {name}: {err:#}"));
+                    continue;
+                }
             }
-            ExistingState::Partial => {
-                print_line(
-                    &multi,
-                    &format!(
-                        "partial files found in {}, resuming download",
-                        output_folder.display()
-                    ),
-                );
-                true
+        }
+
+        let overwrite = if webseed_downloaded {
+            // Webseed já gravou os arquivos no layout do motor; o re-add entra
+            // com `overwrite` para o `initial_check` assumir (validar por hash)
+            // arquivos existentes — sem depender da rede para o primeiro boot.
+            true
+        } else {
+            // Smart resume: only start a download when the target files are
+            // missing or incomplete. Fully downloaded torrents are reported
+            // and skipped.
+            let existing = existing_state(&output_folder, &info, only_files.as_deref())?;
+            match existing {
+                ExistingState::Complete if opts.overwrite => true,
+                ExistingState::Complete => {
+                    print_line(
+                        &multi,
+                        &format!(
+                            "torrent already fully downloaded in {}",
+                            output_folder.display()
+                        ),
+                    );
+                    any_handled = true;
+                    continue;
+                }
+                ExistingState::Partial => {
+                    print_line(
+                        &multi,
+                        &format!(
+                            "partial files found in {}, resuming download",
+                            output_folder.display()
+                        ),
+                    );
+                    true
+                }
+                ExistingState::Missing => opts.overwrite,
             }
-            ExistingState::Missing => opts.overwrite,
         };
 
         // Re-add using the already-resolved torrent bytes, so magnets are not

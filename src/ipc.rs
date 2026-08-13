@@ -57,6 +57,10 @@ pub struct DaemonState {
     pub finished: usize,
     /// Bytes totais baixados na sessão.
     pub downloaded_total: u64,
+    /// Downloads webseed em andamento (US-049). Vazio quando nenhum ativo;
+    /// `#[serde(default)]` mantém compatibilidade evolutiva do protocolo.
+    #[serde(default)]
+    pub webseed: Vec<WebseedSnapshot>,
 }
 
 /// Linha serializável de um torrent na fila (US-040). Espelha os campos que a
@@ -74,6 +78,21 @@ pub struct TorrentSnapshot {
     pub up_speed_mbps: Option<f64>,
     pub eta_seconds: Option<u64>,
     pub uploaded_bytes: u64,
+}
+
+/// Linha serializável de um download webseed em andamento (US-049). Os campos
+/// espelham `WebseedProgress` do módulo `webseed`; `state` é um texto de domínio
+/// (`Downloading`, `Done` ou mensagem de `Error`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebseedSnapshot {
+    pub id: usize,
+    pub source: String,
+    pub name: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub done_files: usize,
+    pub total_files: usize,
+    pub state: String,
 }
 
 /// Serializa um frame (u32 LE + payload) em `buf`.
@@ -214,6 +233,16 @@ mod tests {
                 }],
                 finished: 0,
                 downloaded_total: 42,
+                webseed: vec![WebseedSnapshot {
+                    id: 0,
+                    source: "https://archive.org/download/x/x.torrent".to_string(),
+                    name: "x".to_string(),
+                    downloaded_bytes: 10,
+                    total_bytes: 100,
+                    done_files: 1,
+                    total_files: 3,
+                    state: "Downloading".to_string(),
+                }],
             }),
         };
         let mut buf = Vec::new();
