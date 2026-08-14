@@ -143,13 +143,11 @@ pub(crate) fn extract_url_list(bytes: &[u8]) -> Option<Vec<String>> {
         UrlListValue::Many(urls) => urls,
         UrlListValue::One(url) => vec![url],
     };
-    let mut bases: Vec<String> = Vec::with_capacity(urls.len());
-    for url in urls {
-        if url.ends_with('/') {
-            bases.push(url);
-        }
-    }
-    if bases.is_empty() { None } else { Some(bases) }
+    // Mantém todas as entradas: bases GetRight (terminam em `/`, viram base +
+    // caminho) e URLs completas de arquivo (usadas direto quando o último
+    // segmento casa com o nome do arquivo). Filtro de aplicabilidade é do
+    // `file_candidate_url`, por arquivo.
+    if urls.is_empty() { None } else { Some(urls) }
 }
 
 /// Monta a lista de arquivos a partir do metainfo, filtrando por `only_files`
@@ -200,6 +198,32 @@ pub(crate) fn file_url(
         .map_err(|_| anyhow::anyhow!("base webseed sem path válido"))?
         .extend(path_text.split('/'));
     Ok(url)
+}
+
+/// URL candidata para um arquivo a partir de uma entrada do `url-list`:
+/// - entrada terminando em `/` → base GetRight: `file_url` (base + caminho);
+/// - entrada sem `/` final → URL completa de um arquivo: usada direto quando o
+///   último segmento do path casa com o nome do arquivo; `None` caso contrário
+///   (a entrada aponta para outro arquivo do mesmo torrent).
+fn file_candidate_url(
+    base: &str,
+    config: &WebseedConfig,
+    file: &WebseedFile,
+) -> anyhow::Result<Option<url::Url>> {
+    if base.ends_with('/') {
+        return Ok(Some(file_url(base, config, file)?));
+    }
+    let parsed = url::Url::parse(base).context("base webseed inválida")?;
+    let last = parsed
+        .path_segments()
+        .and_then(|mut segs| segs.next_back())
+        .map(str::to_string);
+    let fname = file.relative_path.file_name().and_then(|n| n.to_str());
+    if last.as_deref() == fname {
+        Ok(Some(parsed))
+    } else {
+        Ok(None)
+    }
 }
 
 /// true quando o torrent é single-file (sem subfolder): o caminho do arquivo é
@@ -407,7 +431,10 @@ async fn download_file(
     };
     let mut last_err: Option<anyhow::Error> = None;
     for base in bases {
-        match download_file_from_base(base, &config, file, &dest).await {
+        let Some(url) = file_candidate_url(base, &config, file)? else {
+            continue;
+        };
+        match download_file_from_url(&url, file, &dest).await {
             Ok(()) => return Ok(()),
             Err(err) => last_err = Some(err),
         }
@@ -415,18 +442,17 @@ async fn download_file(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("nenhuma base webseed disponível")))
 }
 
-/// Baixa um arquivo de uma única base, gravando em streaming (`part` + rename)
-/// para não segurar bytes grandes em memória, e valida o tamanho total.
-async fn download_file_from_base(
-    base: &str,
-    config: &WebseedConfig,
+/// Baixa um arquivo de uma única URL (base GetRight já expandida ou URL
+/// completa de arquivo), gravando em streaming (`part` + rename) para não
+/// segurar bytes grandes em memória, e valida o tamanho total.
+async fn download_file_from_url(
+    url: &url::Url,
     file: &WebseedFile,
     dest: &Path,
 ) -> anyhow::Result<()> {
     use futures::stream::StreamExt as _;
     use tokio::io::AsyncWriteExt as _;
 
-    let url = file_url(base, config, file)?;
     let range_end = file.length.saturating_sub(1);
     let range = format!("bytes=0-{range_end}");
     let response = crate::resolve::http_client()
@@ -715,10 +741,47 @@ mod tests {
     }
 
     #[test]
-    fn extract_url_list_filters_non_getright_bases() {
-        // URL sem barra final → não é base GetRight → None (peers).
+    fn extract_url_list_preserves_full_file_urls() {
+        // URL sem barra final → URL completa de arquivo é preservada (o
+        // matching por arquivo acontece no `file_candidate_url`).
         let bytes = bencode_for_urls(&["https://a.com/file.iso"]);
-        assert_eq!(extract_url_list(&bytes), None);
+        assert_eq!(
+            extract_url_list(&bytes),
+            Some(vec!["https://a.com/file.iso".to_string()])
+        );
+    }
+
+    #[test]
+    fn file_candidate_url_matches_full_file_url_by_name() {
+        let config = WebseedConfig {
+            bases: vec![
+                "https://a.com/dir/".to_string(),
+                "https://a.com/direct/disk.iso".to_string(),
+                "https://a.com/direct/other.bin".to_string(),
+            ],
+            name: "disk.iso".to_string(),
+        };
+        let file = WebseedFile {
+            relative_path: PathBuf::from("disk.iso"),
+            length: 10,
+            is_padding: false,
+        };
+        // Base GetRight → base + name.
+        let got = file_candidate_url(&config.bases[0], &config, &file)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.as_str(), "https://a.com/dir/disk.iso");
+        // URL completa que casa com o arquivo → usada direto.
+        let got = file_candidate_url(&config.bases[1], &config, &file)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.as_str(), "https://a.com/direct/disk.iso");
+        // URL completa de outro arquivo → None (não aplica a este arquivo).
+        assert!(
+            file_candidate_url(&config.bases[2], &config, &file)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

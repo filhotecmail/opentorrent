@@ -424,6 +424,9 @@ async fn run_interactive() -> anyhow::Result<()> {
     {
         let session_opts = SessionOptions {
             trackers: fallback_trackers(),
+            // US-049: sessão local/standalone usa porta DHT aleatória para não
+            // conflitar com o daemon (que mantém a config persistida, ex. 37387).
+            disable_dht_persistence: true,
             ..Default::default()
         };
         let session = Session::new_with_opts(output_folder.clone(), session_opts)
@@ -468,6 +471,9 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
     let session_opts = SessionOptions {
         // US-039: no Windows, trackers públicos de fallback (DHT bloqueado).
         trackers: fallback_trackers(),
+        // US-049: sessão local/standalone usa porta DHT aleatória para não
+        // conflitar com o daemon (que mantém a config persistida, ex. 37387).
+        disable_dht_persistence: true,
         ..Default::default()
     };
 
@@ -481,9 +487,10 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
         &multi,
         &format!("output folder: {}", output_folder.display()),
     );
-    let session = Session::new_with_opts(output_folder, session_opts)
-        .await
-        .context("error initializing session")?;
+    let session = match Session::new_with_opts(output_folder, session_opts).await {
+        Ok(session) => session,
+        Err(err) => bail!("error initializing session: {err:#}"),
+    };
 
     let (mouse_tx, mouse_rx) = mpsc::unbounded_channel();
     if std::io::stdin().is_terminal() {
@@ -633,15 +640,15 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
                 }
                 Ok(progress) => {
                     // Falha parcial: o progresso carrega a mensagem do erro.
+                    // Torrent híbrido → cai no P2P (trackers/peers) em vez de
+                    // abortar; `webseed_downloaded` permanece false.
                     print_line(
                         &multi,
                         &format!("webseed: falhou em {name}: {}", progress.state),
                     );
-                    continue;
                 }
                 Err(err) => {
                     print_line(&multi, &format!("webseed: falhou em {name}: {err:#}"));
-                    continue;
                 }
             }
         }
