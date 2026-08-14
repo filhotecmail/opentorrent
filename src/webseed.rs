@@ -22,6 +22,11 @@ use librqbit::{ByteBufOwned, TorrentMetaV1Info};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
+/// Timeout ocioso das operações HTTP do webseed (resposta e chunks): uma base
+/// que aceita a conexão mas nunca responde é abandonada em 30s, e o download
+/// tenta a próxima base. Não limita o tempo total de um arquivo grande.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Raiz mínima do metainfo parseada só para extrair `url-list` (BEP 19). Os
 /// demais campos do dicionário são ignorados pelo serde.
 #[derive(Deserialize)]
@@ -297,7 +302,7 @@ where
         let name = config.name.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("semáforo não fechado");
-            match download_file(&name, &file, &bases, &output_folder).await {
+            match download_file(&name, &file, &bases, &output_folder, &state).await {
                 Ok(()) => state.mark_done(&file, None),
                 Err(err) => state.mark_done(&file, Some(format!("{err:#}"))),
             }
@@ -368,6 +373,15 @@ impl SharedProgress {
         }
     }
 
+    /// Soma bytes efetivamente gravados no disco (progresso por chunk).
+    fn add_bytes(&self, n: u64) {
+        if n > 0 {
+            let _ = self
+                .downloaded
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn all_done(&self) -> bool {
         self.done_files.load(std::sync::atomic::Ordering::Relaxed) >= self.total_files
     }
@@ -391,19 +405,23 @@ impl SharedProgress {
 }
 
 /// Baixa um único arquivo via HTTP com Range, tentando as bases em ordem.
+/// `progress` reporta bytes gravados em disco (chunks + arquivos já completos).
 async fn download_file(
     name: &str,
     file: &WebseedFile,
     bases: &[String],
     output_folder: &Path,
+    progress: &SharedProgress,
 ) -> anyhow::Result<()> {
     let dest = output_folder.join(&file.relative_path);
 
-    // Arquivo já completo no disco → pulado (idempotência por peça).
+    // Arquivo já completo no disco → pulado (idempotência por peça); conta os
+    // bytes no progresso.
     if !file.is_padding
         && let Ok(meta) = tokio::fs::metadata(&dest).await
         && meta.len() == file.length
     {
+        progress.add_bytes(file.length);
         return Ok(());
     }
 
@@ -434,7 +452,7 @@ async fn download_file(
         let Some(url) = file_candidate_url(base, &config, file)? else {
             continue;
         };
-        match download_file_from_url(&url, file, &dest).await {
+        match download_file_from_url(&url, file, &dest, progress).await {
             Ok(()) => return Ok(()),
             Err(err) => last_err = Some(err),
         }
@@ -449,20 +467,29 @@ async fn download_file_from_url(
     url: &url::Url,
     file: &WebseedFile,
     dest: &Path,
+    progress: &SharedProgress,
 ) -> anyhow::Result<()> {
     use futures::stream::StreamExt as _;
     use tokio::io::AsyncWriteExt as _;
 
     let range_end = file.length.saturating_sub(1);
     let range = format!("bytes=0-{range_end}");
-    let response = crate::resolve::http_client()
-        .get(url.clone())
-        .header(reqwest::header::RANGE, range)
-        .send()
-        .await
-        .with_context(|| format!("falha ao baixar {url}"))?
-        .error_for_status()
-        .with_context(|| format!("{url} respondeu erro HTTP"))?;
+    // Timeout de resposta (headers): conexão aceita mas servidor não responde
+    // (ex.: mirror morto) não pode segurar o download para sempre. O corpo é
+    // rate-limited por `READ_IDLE_TIMEOUT` por chunk, sem limite total — ISOs
+    // grandes continuam baixando desde que os chunks cheguem.
+    let response = tokio::time::timeout(
+        READ_IDLE_TIMEOUT,
+        crate::resolve::http_client()
+            .get(url.clone())
+            .header(reqwest::header::RANGE, range)
+            .send(),
+    )
+    .await
+    .with_context(|| format!("falha ao baixar {url}"))?
+    .with_context(|| format!("falha ao baixar {url}"))?
+    .error_for_status()
+    .with_context(|| format!("{url} respondeu erro HTTP"))?;
 
     let status = response.status();
     if status == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -508,12 +535,16 @@ async fn download_file_from_url(
         .with_context(|| format!("falha ao criar {}", tmp.display()))?;
     let mut stream = response.bytes_stream();
     let mut written: u64 = 0;
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next())
+        .await
+        .with_context(|| format!("falha ao ler corpo de {url}"))?
+    {
         let chunk = chunk.with_context(|| format!("falha ao ler corpo de {url}"))?;
         out.write_all(&chunk)
             .await
             .with_context(|| format!("falha ao gravar {}", tmp.display()))?;
         written += chunk.len() as u64;
+        progress.add_bytes(chunk.len() as u64);
     }
     if written != file.length {
         bail!(
@@ -1066,6 +1097,103 @@ mod tests {
     }
 
     #[test]
+    fn download_webseed_reports_incremental_bytes() {
+        // Regressão "0.00%": o progresso deve crescer por chunk durante o
+        // download (um arquivo grande não pode ficar preso em 0% até o fim).
+        // Servidor envia o corpo em 3 chunks de 100ms; o publisher (200ms)
+        // precisa observar valores intermediários 0 < n < total.
+        let body_len = 9000usize;
+        let addr = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async move {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let _ = tx.send(listener.local_addr().unwrap());
+                    loop {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        tokio::spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let mut buf = Vec::new();
+                            let mut tmp = [0u8; 1024];
+                            loop {
+                                match socket.read(&mut tmp).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        buf.extend_from_slice(&tmp[..n]);
+                                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            let resp = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+                                body_len,
+                                body_len - 1,
+                                body_len
+                            );
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                            let chunk = vec![0u8; body_len / 3];
+                            for _ in 0..3 {
+                                let _ = socket.write_all(&chunk).await;
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                            }
+                        });
+                    }
+                });
+            });
+            rx.recv().unwrap()
+        };
+        let cfg = config(format!("http://{addr}/"));
+        let dir = test_output_folder("chunk-progress");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let out = dir.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        rt.block_on(async move {
+            crate::webseed::download_webseed(
+                &cfg,
+                vec![file("d.bin", body_len as u64)],
+                &out,
+                4,
+                move |p| s.lock().unwrap().push(p.downloaded_bytes),
+            )
+            .await
+            .expect("download webseed");
+        });
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|&b| b > 0 && (b as usize) < body_len),
+            "progresso por chunk não observado: {seen:?}"
+        );
+        let written = std::fs::read(dir.join("d.bin")).unwrap();
+        assert_eq!(written.len(), body_len);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_content_range_total_extracts_total() {
+        assert_eq!(parse_content_range_total("bytes 0-1023/4096"), Some(4096));
+        assert_eq!(parse_content_range_total("bytes */4096"), Some(4096));
+        assert_eq!(parse_content_range_total("bytes 0-1"), None);
+    }
+
+    #[test]
+    fn download_webseed_empty_files_list_completes() {
+        let cfg = config("http://127.0.0.1:9/".to_string());
+        let dir = test_output_folder("empty");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let out = dir.clone();
+        rt.block_on(async move {
+            crate::webseed::download_webseed(&cfg, vec![], &out, 4, |_| {})
+                .await
+                .unwrap();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn download_webseed_rejects_divergent_content_length() {
         let server = TestServer::start([("/linuxmint-collection/e.bin", SAMPLE.to_vec())]);
         let cfg = config(format!("http://{}/", server.addr));
@@ -1088,27 +1216,6 @@ mod tests {
         assert!(!dir.join("e.bin").exists());
         let p = progress.lock().unwrap();
         assert!(matches!(p.state, WebseedState::Error(_)));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_content_range_total_extracts_total() {
-        assert_eq!(parse_content_range_total("bytes 0-1023/4096"), Some(4096));
-        assert_eq!(parse_content_range_total("bytes */4096"), Some(4096));
-        assert_eq!(parse_content_range_total("bytes 0-1"), None);
-    }
-
-    #[test]
-    fn download_webseed_empty_files_list_completes() {
-        let cfg = config("http://127.0.0.1:9/".to_string());
-        let dir = test_output_folder("empty");
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let out = dir.clone();
-        rt.block_on(async move {
-            crate::webseed::download_webseed(&cfg, vec![], &out, 4, |_| {})
-                .await
-                .unwrap();
-        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
