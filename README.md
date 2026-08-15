@@ -19,6 +19,9 @@ Um cliente BitTorrent de **linha de comando (CLI)** para **Linux/Ubuntu e
 Windows** que baixa **torrents** e **magnet links** diretamente do terminal,
 sem interface gráfica.
 
+<img width="1280" height="655" alt="image" src="https://github.com/user-attachments/assets/4dce6b70-5667-4d63-bb1e-b208f9c9abf2" />
+
+
 ## O que é este projeto?
 
 O **OpenTorrent** é um programa em Rust que:
