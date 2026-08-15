@@ -149,6 +149,11 @@ struct SessionRow {
     /// Handle do torrent na sessão local (modo sem daemon/testes); `None` no
     /// modo daemon (a TUI atua por `id` via IPC).
     handle: Option<Arc<ManagedTorrent>>,
+    /// Linha de um download webseed em andamento (US-049): `Some` marca a linha
+    /// como webseed e carrega o estado do snapshot (`Downloading`, `Done` ou a
+    /// mensagem de erro da falha da task — exibida no nome). Linhas de
+    /// torrents da sessão sempre são `None`.
+    webseed: Option<String>,
 }
 
 /// Status de uma origem adicionada em segundo plano (US-014).
@@ -1275,24 +1280,53 @@ impl Tui {
         let rows = match &self.session {
             // US-040: modo daemon → fila a partir do snapshot vinda do socket.
             #[cfg(unix)]
-            None => self
-                .snapshot
-                .torrents
-                .iter()
-                .map(|t| SessionRow {
-                    id: t.id,
-                    name: t.name.clone(),
-                    state: state_from_display(&t.state),
-                    progress_bytes: t.progress_bytes,
-                    total_bytes: t.total_bytes,
-                    finished: t.finished,
-                    down_speed_mbps: t.down_speed_mbps,
-                    up_speed_mbps: t.up_speed_mbps,
-                    eta_seconds: t.eta_seconds,
-                    uploaded_bytes: t.uploaded_bytes,
-                    handle: None,
-                })
-                .collect(),
+            None => {
+                // US-049: além dos torrents da fila, os downloads webseed em
+                // andamento ganham linhas de progresso próprias (com `id`
+                // reservado, sem colidir com torrents); ao concluir, a tarefa
+                // sai do snapshot e o torrent passa a ocupar a linha dele.
+                let mut rows: Vec<SessionRow> = self
+                    .snapshot
+                    .torrents
+                    .iter()
+                    .map(|t| SessionRow {
+                        id: t.id,
+                        name: t.name.clone(),
+                        state: state_from_display(&t.state),
+                        progress_bytes: t.progress_bytes,
+                        total_bytes: t.total_bytes,
+                        finished: t.finished,
+                        down_speed_mbps: t.down_speed_mbps,
+                        up_speed_mbps: t.up_speed_mbps,
+                        eta_seconds: t.eta_seconds,
+                        uploaded_bytes: t.uploaded_bytes,
+                        handle: None,
+                        webseed: None,
+                    })
+                    .collect();
+                for (idx, w) in self.snapshot.webseed.iter().enumerate() {
+                    rows.push(SessionRow {
+                        // Faixa reservada para linhas webseed (transitórias),
+                        // fora do namespace de ids dos torrents.
+                        id: usize::MAX - idx,
+                        name: w.name.clone(),
+                        state: match w.state.as_str() {
+                            "Downloading" | "Done" => TorrentStatsState::Live,
+                            _ => TorrentStatsState::Error,
+                        },
+                        progress_bytes: w.downloaded_bytes,
+                        total_bytes: w.total_bytes,
+                        finished: matches!(w.state.as_str(), "Done"),
+                        down_speed_mbps: None,
+                        up_speed_mbps: None,
+                        eta_seconds: None,
+                        uploaded_bytes: 0,
+                        handle: None,
+                        webseed: Some(w.state.clone()),
+                    });
+                }
+                rows
+            }
             Some(session) => {
                 let rows = std::cell::RefCell::new(Vec::new());
                 session.with_torrents(|torrents| {
@@ -1325,6 +1359,7 @@ impl Tui {
                             eta_seconds,
                             uploaded_bytes: stats.uploaded_bytes,
                             handle: Some(handle.clone()),
+                            webseed: None,
                         });
                     }
                 });
@@ -1871,8 +1906,17 @@ impl Tui {
         } else {
             for (idx, row) in rows_data.iter().enumerate() {
                 let marker = if idx == self.row_index { "> " } else { "  " };
+                // US-049: linhas webseed mostram "webseed" (ou "erro" com a
+                // mensagem de domínio anexada ao nome); as demais seguem o
+                // estado normal.
                 let state = if row.finished {
                     "concluído"
+                } else if row.webseed.is_some() {
+                    if matches!(row.state, TorrentStatsState::Error) {
+                        "erro"
+                    } else {
+                        "webseed"
+                    }
                 } else {
                     match row.state {
                         TorrentStatsState::Live => "em andamento",
@@ -1880,6 +1924,12 @@ impl Tui {
                         TorrentStatsState::Error => "erro",
                         TorrentStatsState::Initializing => "inicializando",
                     }
+                };
+                let display_name = match &row.webseed {
+                    Some(msg) if !matches!(msg.as_str(), "Downloading" | "Done") => {
+                        format!("{} — {msg}", row.name)
+                    }
+                    _ => row.name.clone(),
                 };
                 let pct = if row.total_bytes == 0 {
                     0.0
@@ -1909,7 +1959,7 @@ impl Tui {
                     idx,
                     &bar,
                     state,
-                    &row.name,
+                    &display_name,
                     name_width,
                     metrics.as_deref(),
                 );
@@ -1919,7 +1969,7 @@ impl Tui {
                     bar: Some((bar, bar_color)),
                 });
                 map_rows.push(idx);
-                for chunk in wrap_text(&row.name, name_width).into_iter().skip(1) {
+                for chunk in wrap_text(&display_name, name_width).into_iter().skip(1) {
                     let cont = format!("{}{}", " ".repeat(name_col), chunk);
                     physical.push(PhysicalRow {
                         item_idx: idx,
@@ -3441,6 +3491,7 @@ mod tests {
             eta_seconds: None,
             uploaded_bytes: 0,
             handle: None,
+            webseed: None,
         };
         let mut rows = vec![
             row(1, TorrentStatsState::Paused, false),
@@ -3471,6 +3522,7 @@ mod tests {
             eta_seconds: None,
             uploaded_bytes: 0,
             handle: None,
+            webseed: None,
         };
         let mut rows = vec![row(10), row(20)];
         sort_rows_for_grid(&mut rows);
@@ -4713,5 +4765,64 @@ mod tests {
         let pending = tui.pending.lock().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].source, path_str);
+    }
+
+    fn daemon_tui() -> Tui {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Tui::new_daemon(std::env::temp_dir(), rx)
+    }
+
+    fn webseed_snapshot(state: &str) -> crate::ipc::WebseedSnapshot {
+        crate::ipc::WebseedSnapshot {
+            id: 3,
+            source: "http://example.invalid/a.torrent".to_string(),
+            name: "arquivo.bin".to_string(),
+            downloaded_bytes: 42,
+            total_bytes: 100,
+            done_files: 1,
+            total_files: 1,
+            state: state.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_rows_map_webseed_progress_in_reserved_id_range() {
+        // US-049 (T011): linhas webseed aparecem depois dos torrents, com
+        // estado Live e id na faixa reservada (não colide com torrents).
+        let mut tui = daemon_tui();
+        tui.snapshot.webseed.push(webseed_snapshot("Downloading"));
+        let rows = tui.session_rows();
+        let ws = rows.iter().find(|r| r.webseed.is_some()).unwrap();
+        assert_eq!(ws.name, "arquivo.bin");
+        assert_eq!(ws.id, usize::MAX);
+        assert!(matches!(ws.state, TorrentStatsState::Live));
+        assert_eq!(ws.progress_bytes, 42);
+        assert_eq!(ws.total_bytes, 100);
+        assert!(!ws.finished);
+    }
+
+    #[tokio::test]
+    async fn daemon_rows_webseed_error_carries_domain_message() {
+        // Falha da task (state=Error no snapshot) vira linha "erro" com a
+        // mensagem de domínio preservada para exibição.
+        let mut tui = daemon_tui();
+        tui.snapshot
+            .webseed
+            .push(webseed_snapshot("conexão recusada"));
+        let rows = tui.session_rows();
+        let ws = rows.iter().find(|r| r.webseed.is_some()).unwrap();
+        assert!(matches!(ws.state, TorrentStatsState::Error));
+        assert_eq!(ws.webseed.as_deref(), Some("conexão recusada"));
+    }
+
+    #[tokio::test]
+    async fn daemon_rows_webseed_done_disappears_from_rows() {
+        // Tarefa concluída sai junto (o snapshot já não a contém); a linha é
+        // "removida naturalmente" quando o torrent entra na sessão.
+        let mut tui = daemon_tui();
+        tui.snapshot.webseed.push(webseed_snapshot("Done"));
+        let rows = tui.session_rows();
+        let ws = rows.iter().find(|r| r.webseed.is_some()).unwrap();
+        assert!(ws.finished);
     }
 }

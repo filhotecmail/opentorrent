@@ -18,6 +18,9 @@ pub(crate) fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .user_agent("opentorrent")
+            // Hosts mortos/instáveis não podem segurar o pipeline para sempre
+            // (ex.: mirrors de webseed que aceitam TCP e não respondem).
+            .connect_timeout(std::time::Duration::from_secs(15))
             .build()
             .expect("falha ao criar o cliente HTTP")
     })
