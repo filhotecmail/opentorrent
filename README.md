@@ -1,5 +1,7 @@
 # OpenTorrent
 
+![OpenTorrent](img/opentorrent.jpg)
+
 <!-- BADGES_START -->
 [![MSRV](https://img.shields.io/badge/MSRV-1.85+-orange?logo=rust)](https://github.com/filhotecmail/opentorrent/blob/master/Cargo.toml)
 [![Plataforma](https://img.shields.io/badge/plataforma-linux%20x86__64%20%7C%20windows%20x86__64-blue)](https://github.com/filhotecmail/opentorrent/releases/latest)
