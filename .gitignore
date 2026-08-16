@@ -1,49 +1,69 @@
-# Build do Rust
+# ============================================================
+# OpenTorrent — .gitignore
+# ============================================================
+
+# --- Engenharia de prompt / agentes de IA (não versionar) ---
+.opencode/
+.specify/
+.skill/
+AGENTS.md
+.claude/
+.cursor/
+.windsurf/
+.codex/
+.aider/
+
+# --- Build do Rust ---
 /target
 **/*.rs.bk
 
-# Pastas de download criadas pela aplicação
+# --- Dados da aplicação ---
 /downloads
-
-# Arquivos .torrent baixados/gerados
 *.torrent
 
-# Estado local do pipeline de US (US-017)
+# --- Estado local do pipeline de US (US-017) ---
 .us-pipeline.state
 
-# Chaves privadas e certificados de assinatura digital (US-018) — nunca versionar
+# --- Firma digital (US-018) — nunca versionar ---
 .signing/
 *.sig
 
-# Credenciais do Gemfury (tokens) — nunca versionar
+# --- Credenciais — nunca versionar ---
 gemfury.secrets.yaml
+.env
+.env.*
+!.env.example
 
-# Estado local e credenciais do opencode (Spec Kit)
-.opencode/
+# --- Dependências de JS/Node (tooling auxiliar) ---
+node_modules/
+package-lock.json
+bun.lock
+pnpm-lock.yaml
+yarn.lock
 
-# Spec Kit local (não versionar)
-.specify/
-
-# Instruções locais do agente (não versionar)
-AGENTS.md
-
-# Logs
+# --- Logs ---
 *.log
 
-# Cobertura (cargo tarpaulin) e profiling
+# --- Cobertura (cargo tarpaulin) e profiling ---
 /coverage/
 *.profraw
+*.profdata
 
-# Editores/IDEs
-.vscode/
-.idea/
+# --- Artefatos e temporários ---
+*.tmp
+*.bak
+*.orig
+*.old
 *.swp
 *.swo
+*~
 
-# Sistema operacional
+# --- Editores/IDEs ---
+.vscode/
+.idea/
+*.iml
+
+# --- Sistema operacional ---
 .DS_Store
 Thumbs.db
-.skill/
-.cursor/rules/skill-context.md
-.windsurf/rules/skill-context.md
-.claude/commands/
+.desktop.ini
