@@ -15,7 +15,6 @@
 [![Release](https://img.shields.io/badge/release-v0.1.43-blue)](https://github.com/filhotecmail/opentorrent/releases)
 [![Issues abertas](https://img.shields.io/github/issues/filhotecmail/opentorrent)](https://github.com/filhotecmail/opentorrent/issues)
 [![APT Package](https://img.shields.io/badge/Debian%2FAPT-.deb-A81D33?style=flat-square&logo=debian&logoColor=white)](https://github.com/filhotecmail/opentorrent/releases/latest)
-
 <!-- BADGES_END -->
 
 Um cliente BitTorrent de **linha de comando (CLI)** para **Linux/Ubuntu e
@@ -59,9 +58,9 @@ dependências externas de runtime.
 | Estado | Valor |
 | --- | --- |
 | Branch principal | `master` |
-| Última release | `v0.1.39` |
+| Última release | `v0.1.43` |
 | Milestone atual | v1.0 |
-| Issues abertas | 0 |
+| Issues abertas | 6 |
 | Labels do projeto | 19 |
 <!-- ESTADO_END -->
 
@@ -69,7 +68,7 @@ dependências externas de runtime.
 | Metadado | Valor |
 | --- | --- |
 | Pacote | `opentorrent` |
-| Versão | `0.1.43` |
+| Versão | `0.1.45` |
 | Edição Rust | 2024 |
 <!-- CARGO_END -->
 
