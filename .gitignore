@@ -24,6 +24,11 @@ AGENTS.md
 # --- Estado local do pipeline de US (US-017) ---
 .us-pipeline.state
 
+# --- Specs e configuração de ambiente do dev (não versionar) ---
+/specs/
+/.devcontainer/
+/.cargo/
+
 # --- Firma digital (US-018) — nunca versionar ---
 .signing/
 *.sig
