@@ -59,9 +59,9 @@ dependências externas de runtime.
 | Estado | Valor |
 | --- | --- |
 | Branch principal | `master` |
-| Última release | `v0.1.43` |
+| Última release | `v0.1.45` |
 | Milestone atual | v1.0 |
-| Issues abertas | 5 |
+| Issues abertas | 9 |
 | Labels do projeto | 19 |
 <!-- ESTADO_END -->
 
