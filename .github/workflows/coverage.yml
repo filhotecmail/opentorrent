@@ -10,6 +10,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -18,21 +21,21 @@ jobs:
     name: Cobertura de código (cargo llvm-cov)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # US-039/coverage: toolchain nightly para `#[coverage(off)]`
       # (`feature(coverage_attribute)`), ativado via cfg `coverage_nightly`.
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
         with:
           components: llvm-tools-preview
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Instalar dependências de sistema
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev mold
 
       - name: Instalar cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@51c9d223e46ef0189fd65bfe00a28e0de249282c # cargo-llvm-cov
 
       # `coverage_nightly` habilita `#[coverage(off)]` nos entrypoints de
       # rede/TUI (src/main.rs, src/session_ui.rs) — excluídos da medição pois
@@ -45,14 +48,14 @@ jobs:
           cargo llvm-cov --all-targets --cobertura --output-path ./coverage/cobertura.xml
 
       - name: Subir relatório de cobertura (artefato)
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cobertura-xml
           path: ./coverage/cobertura.xml
           if-no-files-found: error
 
       - name: Publicar cobertura no Codecov
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7.0.0
         with:
           files: ./coverage/cobertura.xml
           fail_ci_if_error: false

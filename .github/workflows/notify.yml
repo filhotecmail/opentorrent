@@ -8,7 +8,7 @@ on:
   issue_comment:
     types: [created]
   pull_request:
-    types: [opened, closed, merged, reopened, edited]
+    types: [opened, closed, reopened, edited]
   discussion:
     types: [created, answered, category_changed, edited, labeled]
   workflow_run:
@@ -107,7 +107,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Enviar email
-        uses: dawidd6/action-send-mail@v18
+        uses: dawidd6/action-send-mail@94de994a9f6fffee200243214e17002e2920bb59 # v18
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
