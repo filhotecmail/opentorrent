@@ -855,6 +855,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "generic-array"
+version = "1.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab4e5aa225bc56696909483320f0ff9b600f1a971b52e07a17d70f3d9b43254b"
+dependencies = [
+ "rustversion",
+ "typenum",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1768,7 +1778,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures",
- "generic-array",
+ "generic-array 1.4.4",
  "indicatif",
  "librqbit",
  "librqbit-bencode",
@@ -2481,7 +2491,7 @@ version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ed5f6ab2122c6dec69dca18c72fa4590a27e581ad20d44960fe74c032a0b23b"
 dependencies = [
- "generic-array",
+ "generic-array 0.12.4",
  "num",
 ]
 
