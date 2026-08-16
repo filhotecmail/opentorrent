@@ -26,7 +26,6 @@ use librqbit::{
     ManagedTorrent, Session, SessionOptions, TorrentMetaV1Info, TorrentStatsState,
     api::TorrentIdOrHash,
 };
-use size_format::SizeFormatterBinary as SF;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -41,6 +40,8 @@ mod session_ui;
 mod ui_bottom;
 mod update;
 mod webseed;
+
+use crate::downloads::format_size;
 
 const MSG_WIDTH: u16 = 40;
 const BAR_WIDTH: u16 = 20;
@@ -570,7 +571,7 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
                     &format!(
                         "[{idx}] {:?} ({}){}",
                         file.filename,
-                        SF::new(file.len),
+                        format_size(file.len),
                         if included { "" } else { ", will skip" }
                     ),
                 );
@@ -634,7 +635,7 @@ async fn run_add(opts: AddOpts, multi: MultiProgress) -> anyhow::Result<()> {
                         &multi,
                         &format!(
                             "webseed: {name} baixado ({total_files} arquivos, {})",
-                            SF::new(total)
+                            format_size(total)
                         ),
                     );
                 }
