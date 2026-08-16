@@ -61,7 +61,7 @@ dependências externas de runtime.
 | Branch principal | `master` |
 | Última release | `v0.1.45` |
 | Milestone atual | v1.0 |
-| Issues abertas | 10 |
+| Issues abertas | 12 |
 | Labels do projeto | 19 |
 <!-- ESTADO_END -->
 
