@@ -5,7 +5,32 @@ use std::{
 
 use anyhow::Context;
 use chrono::{DateTime, Local};
-use size_format::SizeFormatterBinary as SF;
+use generic_array::{GenericArray, typenum::U9};
+use size_format::{PointSeparated, PrefixType, SizeFormatter};
+
+/// Prefixos decimais com "K" maiúsculo (KB/MB/GB), base 1000 — como exibem
+/// clientes BitTorrent — em vez do binário (Ki/Mi/Gi) do `SizeFormatterBinary`.
+pub struct DecimalPrefixes;
+
+impl PrefixType for DecimalPrefixes {
+    type N = U9;
+
+    const PREFIX_SIZE: u32 = 1000;
+
+    fn prefixes() -> GenericArray<&'static str, Self::N> {
+        ["", "K", "M", "G", "T", "P", "E", "Z", "Y"].into()
+    }
+}
+
+/// Formata um tamanho em bytes com unidades decimais de `size_format`.
+type DecimalBytes = SizeFormatter<u64, DecimalPrefixes, PointSeparated>;
+
+/// Formata um tamanho em bytes para exibição com unidades decimais (US-045):
+/// `734.0MB`, `1.0GB`, `512.0KB`. O `SizeFormatter` não inclui o "B" — é
+/// adicionado aqui.
+pub fn format_size(bytes: u64) -> String {
+    format!("{}B", DecimalBytes::new(bytes))
+}
 
 /// A completed download found in the default output folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,9 +117,9 @@ pub fn format_completed_row(item: &CompletedItem, name_w: usize) -> String {
     let modified: DateTime<Local> = item.modified.into();
     let date = modified.format("%d/%m/%Y %H:%M");
     let name = truncate(&item.name, name_w);
-    // `SizeFormatterBinary` ignora o width do format (não respeita `{:>n}`),
-    // então serializamos o tamanho para uma String antes de alinhar.
-    let size = SF::new(item.size).to_string();
+    // `SizeFormatter` ignora o width do format (não respeita `{:>n}`), então
+    // serializamos o tamanho para uma String antes de alinhar.
+    let size = format_size(item.size);
     format!(
         "{date:<HISTORY_DATE_W$} {:<name_w$} {:>HISTORY_SIZE_W$}",
         name, size
@@ -170,7 +195,18 @@ mod tests {
         let line = format_completed_row(&item, 40);
         assert!(line.contains("31/12/1969") || line.contains("01/01/1970"));
         assert!(line.contains("x.iso"));
-        assert!(line.contains("700"));
+        // Decimal com base 1000: 700 MiB = 734.0 MB.
+        assert!(line.contains("734.0MB"));
+    }
+
+    #[test]
+    fn format_size_uses_decimal_units_kb_mb_gb() {
+        assert_eq!(format_size(512), "512B");
+        assert_eq!(format_size(999), "999B");
+        assert_eq!(format_size(1_000), "1.0KB");
+        assert_eq!(format_size(1_500_000), "1.5MB");
+        assert_eq!(format_size(3_000_000_000), "3.0GB");
+        assert_eq!(format_size(12_000_000_000_000), "12.0TB");
     }
 
     #[test]

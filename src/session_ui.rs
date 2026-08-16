@@ -60,6 +60,11 @@ const ROW_FIXED_W: usize = ROW_PREFIX_W + PROGRESS_COL_W + 1 + STATE_W + 1;
 /// cada lateral. O topo/base é 1 linha, embutido nos painéis.
 const LAYOUT_MARGIN_COLS: u16 = 2;
 
+/// Respiro à direita dos cards (Histórico e Biblioteca): coluna da scrollbar +
+/// 2 colunas de margem em branco, para a última coluna de dados (ex.: TAMANHO)
+/// nunca encostar na margem direita do terminal.
+const CARD_RIGHT_GAP: u16 = 3;
+
 /// Intervalo de validade do cache do Histórico (US-045): a lista de completos
 /// só é re-escaneada do disco após este período, evitando re-ordenar/re-desenhar
 /// a cada frame.
@@ -1849,9 +1854,11 @@ impl Tui {
             );
         }
 
-        // Área de conteúdo: 1 coluna de acento + margem + scrollbar à direita.
+        // Área de conteúdo: 1 coluna de acento + margem + scrollbar e respiro à
+        // direita (`CARD_RIGHT_GAP`), alinhado com o card do Histórico.
         let content_left = 3u16;
-        let content_w = (cols as usize).saturating_sub(content_left as usize + 1);
+        let content_w =
+            (cols as usize).saturating_sub(content_left as usize + CARD_RIGHT_GAP as usize);
 
         // Colunas responsivas (US-047): as métricas aparecem só quando sobra
         // espaço; a barra de progresso é compacta (`LIB_BAR_W`) e encolhe
@@ -2133,13 +2140,20 @@ impl Tui {
             );
         }
 
-        // Área de conteúdo: reserva 1 coluna à direita para a scrollbar.
+        // Área de conteúdo: reserva `CARD_RIGHT_GAP` colunas à direita (scrollbar +
+        // 2 de respiro), para a coluna TAMANHO não encostar na margem.
         let content_left = 3u16;
-        let content_w = (cols as usize).saturating_sub(content_left as usize + 1);
+        let content_w =
+            (cols as usize).saturating_sub(content_left as usize + CARD_RIGHT_GAP as usize);
         // Colunas do grid (US-045): DATA CRIAÇÃO | NOME | TAMANHO. A data e o
-        // tamanho têm largura fixa; o nome absorve o restante.
+        // tamanho têm largura fixa; o nome absorve o restante. O formato do
+        // grid usa DOIS separadores entre as colunas (`HISTORY_DATE_W + 1 +
+        // name_w + 1 + HISTORY_SIZE_W`); subtrair apenas 1 deixava name_w 1
+        // char maior e o cabeçalho/linhas acabavam 1 char mais largos que a
+        // área de conteúdo, fazendo a coluna TAMANHO ultrapassar a margem
+        // direita (e ser truncada quando havia scrollbar).
         let name_w = content_w.saturating_sub(
-            crate::downloads::HISTORY_DATE_W + 1 + crate::downloads::HISTORY_SIZE_W,
+            crate::downloads::HISTORY_DATE_W + 2 + crate::downloads::HISTORY_SIZE_W,
         );
 
         // Título + cabeçalho do grid.
@@ -4432,6 +4446,34 @@ mod tests {
         // 10 itens > 3 linhas visíveis → scrollbar presente (thumb no topo).
         assert_eq!(frame.cell(8, 79).ch(), '█');
         assert_eq!(tui.history_region, Some((8, 6)));
+    }
+
+    #[tokio::test]
+    async fn history_card_respects_right_margin_and_size_stays_intact() {
+        let (mut tui, _session, _dir) = test_tui_async().await;
+        // 1 item e altura p/ 3 linhas → sem scrollbar: as 3 colunas da margem
+        // direita devem permanecer vazias em todas as linhas do card.
+        tui.history_cache = Some((std::time::Instant::now(), history_items(1)));
+        let mut frame = Frame::new(80, 20);
+        tui.render_history_card(&mut frame, 80, 8, 6);
+        for r in 8..13 {
+            for c in 77..80 {
+                assert_eq!(
+                    frame.cell(r, c).ch(),
+                    ' ',
+                    "linha {r} coluna {c} deve respeitar a margem direita"
+                );
+            }
+        }
+        // Cabeçalho com a coluna TAMANHO por extenso (sem cortes na borda).
+        let header: String = (3..77).map(|c| frame.cell(9, c).ch()).collect();
+        assert!(header.ends_with("TAMANHO"), "cabeçalho íntegro: {header}");
+        // Linha de dados sem perder o último caractere da coluna TAMANHO.
+        let row: String = (3..77).map(|c| frame.cell(10, c).ch()).collect();
+        assert!(
+            row.ends_with("1.0MB"),
+            "coluna TAMANHO íntegra e decimal (sem truncamento à direita): {row}"
+        );
     }
 
     #[tokio::test]
