@@ -1,6 +1,6 @@
 [package]
 name = "opentorrent"
-version = "0.1.46"
+version = "0.1.47"
 edition = "2024"
 rust-version = "1.85"
 description = "Terminal CLI to download torrents and magnet links"
